@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""Scan a flat RV32I binary for real jalr instructions.
+
+Flags words with opcode=0x67 AND f3=0 (the only valid jalr encoding).
+Filters out ASCII-looking data (e.g. "gp\0\0" in register tables).
+Exits non-zero if any suspected jalr is found.
+"""
+import sys
+
+def scan(path):
+    with open(path,'rb') as f: b=f.read()
+    hits=[]
+    for i in range(0, len(b)-3, 4):
+        w = b[i] | (b[i+1]<<8) | (b[i+2]<<16) | (b[i+3]<<24)
+        if (w & 0x7f) != 0x67:
+            continue
+        f3 = (w >> 12) & 7
+        if f3 != 0:
+            continue      # not a valid jalr encoding
+        # Filter trivial ASCII data: all 4 bytes printable or null.
+        if all(x == 0 or 32 <= x < 127 for x in b[i:i+4]):
+            # Extra sanity: if it decodes to valid jalr registers
+            rd  = (w >> 7) & 0x1f
+            rs1 = (w >> 15) & 0x1f
+            if rd == 0 and rs1 == 0:
+                continue   # "jalr x0, x0, ?" — almost certainly data
+        hits.append((i, w))
+    return hits
+
+status = 0
+for p in sys.argv[1:]:
+    h = scan(p)
+    if h:
+        status = 1
+        print(f"{p}: {len(h)} jalr instance(s)")
+        for off,w in h: print(f"  {off:#08x}: {w:#010x}")
+    else:
+        print(f"{p}: clean")
+sys.exit(status)
