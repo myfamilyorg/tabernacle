@@ -21,18 +21,26 @@
 # SOFTWARE.
 
 # ──────────────────────────────────────────────────────────────────────────────
-# file: fam0.S - first stage bootstrap tool (188 bytes compiled - GNU as src)
+# file: fam0.S - first stage bootstrap tool (168 bytes compiled - GNU as src)
 # RISC-V 32-bit Hex-to-Binary Converter (Bootstrapping Seed)
+#
+# Runs only in a known environment (QEMU virt bare-metal, -bios none). Takes
+# advantage of two environment guarantees:
+#   1. GPRs are zeroed at reset, so s3 (nibble toggle) and s4 (comment flag)
+#      don't need explicit init.
+#   2. Load address is 0x80000000, so the output buffer can live at a fixed
+#      absolute address (0x80100000) instead of a PC-relative one.
 # ──────────────────────────────────────────────────────────────────────────────
 
 _start:
 	li	s6, 10			# Constant: (\n) and Hex limit (10)
 	li	s5, 0x10000000		# Constant: UART base address
-	auipc	s1, 0x0			# Get current Program Counter
-	addi	s1, s1, 256		# s1 = Start of bin output (PC + 256)
-	mv	s2, s1			# s2 = High-water mark pointer (itt)
-	li	s4, 0			# s4 = In-comment flag (0 = false)
-	li 	s3, 1			# s3 = toggle (1 = waiting for high)
+	lui	s1, 0x80100		# s1 = 0x80100000 = start of output buffer
+	mv	s2, s1			# s2 = high-water mark (starts == s1)
+	# s4 (comment flag, want 0)       — rely on GPR reset = 0
+	# s3 (nibble toggle, want "high") — rely on GPR reset = 0; the store
+	#   block uses beqz-after-xor so s3 = 0 correctly means "expecting
+	#   high nibble next" on the first iteration.
 
 	# Main input processing loop
 loop:
@@ -52,17 +60,16 @@ not_backn:
 skip_start_comment:
 
 	# Logic: Check for End of Transmission (ASCII 4)
-	li	t3, 4 		
-	beq	t1, t3, end_loop	 # Exit input loop if EOT received
+	li	t3, 4
+	beq	t1, t3, end_loop	# Exit input loop if EOT received
 
 	# If currently inside a comment, ignore all characters
 	bnez	s4, loop
 
-	# Logic: Skip whitespace and control codes
-	li	t3, 33			# ASCII 32 is space
-	blt	t1, t3, loop		# Ignore if <= space
-
-	# Logic: ASCII Hex to Binary Nibble conversion
+	# Logic: ASCII Hex to Binary Nibble conversion. Whitespace and control
+	# codes (< '0') naturally fall through the two bltu checks to `j loop`
+	# because `addi t1,-48` makes them wrap large-unsigned; no explicit
+	# whitespace filter is needed.
 	addi	t1, t1, -48 		# Normalize '0' to 0
 	bltu	t1, s6, store	 	# If 0-9, it's a valid hex digit
 	addi	t1, t1, -7		# Normalize 'A'-'F' (55-48=7 offset)
@@ -71,9 +78,11 @@ skip_start_comment:
 	j	loop			# Otherwise, skip invalid hex char
 
 	# Logic: Pack two 4-bit nibbles into one 8-bit byte
+	# Invariant: after each xor, s3=1 → just parsed high nibble;
+	#            s3=0 → just parsed low nibble (and must emit the byte).
 store:
 	xori	s3, s3, 1		# Toggle high/low state
-	bnez	s3, store_low		# If 1, just finished the low nibble
+	beqz	s3, store_low		# If 0, just finished the low nibble
 	slli	t4, t1, 4		# Store high nibble in t4
 	j	loop
 

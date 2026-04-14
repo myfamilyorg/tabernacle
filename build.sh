@@ -1,4 +1,4 @@
-#!/usr/bin/env sh
+#!/usr/bin/sh
 # Bootstrap build. Each stage compiles the next from source using only the
 # previous stage's binary. No external tools other than QEMU.
 set -e
