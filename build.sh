@@ -3,6 +3,7 @@
 # previous stage's binary. No external tools other than QEMU.
 set -e
 run() {
+	echo "Compiling $2" >&2;
 	(cat "$2"; printf '\004') | qemu-system-riscv32 \
 		-machine virt \
 		-cpu rv32,\

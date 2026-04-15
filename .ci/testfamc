@@ -1786,6 +1786,24 @@ test_error "missing ';' after multi-line input" \
 test_error "column tracking on same line" \
 	"a = 5; b := 5 c := 0;" \
 	"Error:1:15 Expected ';' found 'c'"
+
+# ── FILE: directive for multi-file error reporting ──────────────────────────
+# A /* FILE: NAME */ (or // FILE: NAME) comment inside the input restarts
+# line counting at that comment's opening line and includes NAME in any
+# subsequent error message. Used to cat multiple source files through UART
+# while keeping error messages readable.
+test_error "FILE: block comment reports filename" \
+	"$(printf '/* FILE: stdlib.fam */\nx = ;')" \
+	"Error: stdlib.fam:2:5 Expected expression found ';'"
+test_error "FILE: line comment reports filename" \
+	"$(printf '// FILE: prelude.fam\ny = ;')" \
+	"Error: prelude.fam:2:5 Expected expression found ';'"
+test_error "FILE: restarts line numbering at comment's opening line" \
+	"$(printf 'x = 1;\ny = 2;\n/* FILE: next.fam */\nz = ;')" \
+	"Error: next.fam:2:5 Expected expression found ';'"
+test_error "FILE: later directive wins" \
+	"$(printf '/* FILE: a.fam */\nx = 1;\n/* FILE: b.fam */\nz = ;')" \
+	"Error: b.fam:2:5 Expected expression found ';'"
 # Missing ')'.
 test_error "missing ')' at EOF" \
 	"@0x10000000 = (1 + 2" \
