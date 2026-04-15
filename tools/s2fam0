@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Convert a RISC-V .S file to fam0 hex format.
+
+Assembles the .S with GNU as, then formats the binary as hex bytes with
+comments from objdump disassembly and source-line comments from the listing.
+
+Output format per 4-byte word:
+    XX XX XX XX    # disassembly ; source comment
+
+Usage: s2fam0 input.S [output.fam0]
+       If output is omitted, writes to stdout.
+"""
+
+import subprocess, sys, os, tempfile, re
+
+AS = "riscv64-linux-gnu-as"
+LD = "riscv64-linux-gnu-ld"
+OBJCOPY = "riscv64-linux-gnu-objcopy"
+OBJDUMP = "riscv64-linux-gnu-objdump"
+
+MARCH = "rv32i"
+MABI = "ilp32"
+LDEMU = "elf32lriscv"
+TEXT_ADDR = "0x80000000"
+
+# Listing: "  60 0000 130BA000 		li	s6, 10		# comment"
+LISTING_RE = re.compile(
+    r"^\s*(\d+)\s+"
+    r"(?:([0-9a-fA-F]{4})\s+"        # offset (4 hex)
+    r"([0-9a-fA-F]{2,8}))?"          # data bytes (2-8 hex chars)
+    r"\s*(.*)"
+)
+
+
+def run(cmd):
+    r = subprocess.run(cmd, capture_output=True, encoding="utf-8",
+                        errors="replace")
+    if r.returncode != 0:
+        err = "\n".join(
+            l for l in r.stderr.splitlines()
+            if "cannot find entry symbol _start" not in l
+        ).strip()
+        if err:
+            print(f"Error running {cmd[0]}:\n{err}", file=sys.stderr)
+            sys.exit(1)
+    return r
+
+
+def build(src):
+    """Assemble .S → listing text, objdump text, raw binary."""
+    with tempfile.TemporaryDirectory() as tmp:
+        obj = os.path.join(tmp, "out.o")
+        elf = os.path.join(tmp, "out.elf")
+        raw = os.path.join(tmp, "out.bin")
+
+        listing_r = run([AS, f"-march={MARCH}", f"-mabi={MABI}",
+                         "-al", src, "-o", obj])
+        run([LD, "-m", LDEMU, f"-Ttext={TEXT_ADDR}", obj, "-o", elf])
+        run([OBJCOPY, "-O", "binary", elf, raw])
+
+        with open(raw, "rb") as f:
+            binary = f.read()
+
+        disasm_r = run([OBJDUMP, "-d", "-M", "no-aliases", elf])
+
+        return listing_r.stdout, disasm_r.stdout, binary
+
+
+def parse_objdump(text):
+    """Parse objdump → {offset: disasm_text}."""
+    base = int(TEXT_ADDR, 16)
+    insns = {}
+    for line in text.splitlines():
+        m = re.match(r"\s*([0-9a-f]+):\s+([0-9a-f ]+?)\s{2,}(.+)", line)
+        if m:
+            offset = int(m.group(1), 16) - base
+            dis = m.group(3).strip()
+            dis = re.sub(r"\s*#\s*[0-9a-f]+\s+<[^>]+>", "", dis)
+            dis = re.sub(r"[0-9a-f]+\s+<(\w+)(?:\+0x[0-9a-f]+)?>", r"\1", dis)
+            insns[offset] = dis
+    return insns
+
+
+def parse_listing_annotations(text):
+    """Parse listing → {offset: source_comment}, labels, header lines.
+
+    Returns (source_comments, labels, header_lines) where:
+      - source_comments: {offset: comment_string}
+      - labels: {offset: label_name}
+      - header_lines: [lines before first code]
+    """
+    source_comments = {}
+    labels = {}
+    header_lines = []
+    seen_code = False
+    non_code_lines = []  # accumulate between code lines
+
+    for line in text.splitlines():
+        if line.startswith("GAS LISTING") or line.strip() == "" or '\f' in line:
+            continue
+
+        m = LISTING_RE.match(line)
+        if not m:
+            continue
+
+        offset_hex = m.group(2)
+        data_hex = m.group(3)
+        source = m.group(4)
+
+        if data_hex and offset_hex:
+            offset = int(offset_hex, 16)
+            seen_code = True
+
+            # Extract source comment
+            cm = re.search(r"[\t ]#\s*(.*)", source)
+            if cm:
+                comment = cm.group(1).strip()
+                if comment:
+                    source_comments[offset] = comment
+
+            # Check accumulated non-code lines for labels/section headers
+            for nc in non_code_lines:
+                nc_fmt = nc.replace("\t", " ")
+                nc_fmt = re.sub(r"  +", " ", nc_fmt).strip()
+                if nc_fmt.endswith(":"):
+                    labels[offset] = nc_fmt
+                elif nc_fmt.startswith("#"):
+                    # Section comment — attach to this offset
+                    if offset not in labels:
+                        labels[offset] = nc_fmt
+                    else:
+                        labels[offset] = nc_fmt + "\n" + labels[offset]
+            non_code_lines = []
+        elif not data_hex:
+            src = source.strip() if source else ""
+            if not seen_code:
+                raw = source.rstrip() if source else ""
+                if raw and not raw.lstrip().startswith("#"):
+                    raw = f"# {raw.lstrip()}"
+                header_lines.append(raw)
+            elif src:
+                non_code_lines.append(source)
+
+    return source_comments, labels, header_lines
+
+
+def convert(listing_text, disasm_text, binary):
+    """Combine listing + objdump + binary → fam0 hex output."""
+    insns = parse_objdump(disasm_text)
+    source_comments, labels, header_lines = parse_listing_annotations(listing_text)
+
+    out = list(header_lines)
+
+    for offset in range(0, len(binary), 4):
+        chunk = binary[offset:offset + 4]
+        hx = " ".join(f"{b:02X}" for b in chunk)
+
+        # Labels / section headers
+        if offset in labels:
+            if out and out[-1] != "":
+                out.append("")
+            for lbl_line in labels[offset].split("\n"):
+                out.append(lbl_line if lbl_line.startswith("#") else f"# {lbl_line}")
+
+        # Build comment
+        dis = insns.get(offset, "")
+        src = source_comments.get(offset, "")
+
+        if dis and src:
+            out.append(f"{hx}\t# {dis} ; {src}")
+        elif dis:
+            out.append(f"{hx}\t# {dis}")
+        elif src:
+            out.append(f"{hx}\t# {src}")
+        else:
+            out.append(hx)
+
+    while out and out[-1] == "":
+        out.pop()
+
+    return "\n".join(out) + "\n"
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} input.S [output.fam0]", file=sys.stderr)
+        sys.exit(1)
+
+    src = sys.argv[1]
+    listing, disasm, binary = build(src)
+    output = convert(listing, disasm, binary)
+
+    if len(sys.argv) >= 3:
+        with open(sys.argv[2], "w") as f:
+            f.write(output)
+    else:
+        sys.stdout.write(output)
+
+
+if __name__ == "__main__":
+    main()

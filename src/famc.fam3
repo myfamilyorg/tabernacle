@@ -1130,16 +1130,74 @@ sw_line_comment:
 	# '//' ... '\n' (or EOF). Consume opening '//' then everything up to
 	# and including the newline (the main ws loop will eat the '\n'
 	# naturally, so we just stop at it).
+	# t5 = position of the '/' that opens this comment — used if a
+	# FILE: directive is found inside to reset the line-count base.
+	addi	t5, s2, 0
 	addi	s2, s2, 2
 sw_lc_loop:
 	bge	s2, s3, sw_loop
 	lbu	t0, 0(s2)
 	addi	t1, zero, 10
 	beq	t0, t1, sw_loop
+	addi	t1, zero, 'F'
+	beq	t0, t1, sw_lc_file_chk
+sw_lc_adv:
 	addi	s2, s2, 1
+	j	sw_lc_loop
+sw_lc_file_chk:
+	# Check for "FILE: " starting at s2 (6 chars).
+	addi	t2, s2, 6
+	bgt	t2, s3, sw_lc_adv
+	lbu	t0, 1(s2)
+	addi	t1, zero, 'I'
+	bne	t0, t1, sw_lc_adv
+	lbu	t0, 2(s2)
+	addi	t1, zero, 'L'
+	bne	t0, t1, sw_lc_adv
+	lbu	t0, 3(s2)
+	addi	t1, zero, 'E'
+	bne	t0, t1, sw_lc_adv
+	lbu	t0, 4(s2)
+	addi	t1, zero, ':'
+	bne	t0, t1, sw_lc_adv
+	lbu	t0, 5(s2)
+	addi	t1, zero, ' '
+	bne	t0, t1, sw_lc_adv
+	# Match — read filename until newline or EOF.
+	addi	s2, s2, 6		# skip "FILE: "
+	addi	t2, s2, 0		# name start
+sw_lc_file_read:
+	bge	s2, s3, sw_lc_file_done
+	lbu	t0, 0(s2)
+	addi	t1, zero, 10
+	beq	t0, t1, sw_lc_file_done
+	addi	s2, s2, 1
+	j	sw_lc_file_read
+sw_lc_file_done:
+	# Trim trailing whitespace (< 33) from t2..s2 → name end in t3.
+	addi	t3, s2, 0
+sw_lc_file_trim:
+	beq	t3, t2, sw_lc_file_store
+	addi	t1, t3, -1
+	lbu	t0, 0(t1)
+	addi	t6, zero, 33
+	bge	t0, t6, sw_lc_file_store
+	addi	t3, t1, 0
+	j	sw_lc_file_trim
+sw_lc_file_store:
+	lla	t0, file_name_ptr
+	sw	t2, 0(t0)
+	sub	t0, t3, t2
+	lla	t1, file_name_len
+	sw	t0, 0(t1)
+	lla	t0, file_line_base
+	sw	t5, 0(t0)
 	j	sw_lc_loop
 sw_block_comment:
 	# '/*' ... '*/'. Nestable: track depth in t4.
+	# t5 = position of the '/' that opens this comment — used if a
+	# FILE: directive is found inside to reset the line-count base.
+	addi	t5, s2, 0
 	addi	s2, s2, 2
 	addi	t4, zero, 1
 sw_bc_loop:
@@ -1150,7 +1208,62 @@ sw_bc_loop:
 	beq	t0, t1, sw_bc_slash
 	addi	t1, zero, '*'
 	beq	t0, t1, sw_bc_star
+	addi	t1, zero, 'F'
+	beq	t0, t1, sw_bc_file_chk
+sw_bc_adv:
 	addi	s2, s2, 1
+	j	sw_bc_loop
+sw_bc_file_chk:
+	# Check for "FILE: " starting at s2 (6 chars).
+	addi	t2, s2, 6
+	bgt	t2, s3, sw_bc_adv
+	lbu	t0, 1(s2)
+	addi	t1, zero, 'I'
+	bne	t0, t1, sw_bc_adv
+	lbu	t0, 2(s2)
+	addi	t1, zero, 'L'
+	bne	t0, t1, sw_bc_adv
+	lbu	t0, 3(s2)
+	addi	t1, zero, 'E'
+	bne	t0, t1, sw_bc_adv
+	lbu	t0, 4(s2)
+	addi	t1, zero, ':'
+	bne	t0, t1, sw_bc_adv
+	lbu	t0, 5(s2)
+	addi	t1, zero, ' '
+	bne	t0, t1, sw_bc_adv
+	# Match — read filename until newline, '*' (possibly start of */),
+	# or EOF.
+	addi	s2, s2, 6
+	addi	t2, s2, 0
+sw_bc_file_read:
+	bge	s2, s3, sw_bc_file_done
+	lbu	t0, 0(s2)
+	addi	t1, zero, 10
+	beq	t0, t1, sw_bc_file_done
+	addi	t1, zero, '*'
+	beq	t0, t1, sw_bc_file_done
+	addi	s2, s2, 1
+	j	sw_bc_file_read
+sw_bc_file_done:
+	# Trim trailing whitespace.
+	addi	t3, s2, 0
+sw_bc_file_trim:
+	beq	t3, t2, sw_bc_file_store
+	addi	t1, t3, -1
+	lbu	t0, 0(t1)
+	addi	t6, zero, 33
+	bge	t0, t6, sw_bc_file_store
+	addi	t3, t1, 0
+	j	sw_bc_file_trim
+sw_bc_file_store:
+	lla	t0, file_name_ptr
+	sw	t2, 0(t0)
+	sub	t0, t3, t2
+	lla	t1, file_name_len
+	sw	t0, 0(t1)
+	lla	t0, file_line_base
+	sw	t5, 0(t0)
 	j	sw_bc_loop
 sw_bc_slash:
 	# Possible nested '/*' open.
@@ -16370,7 +16483,19 @@ ee_d10:
 	bnez	gp, ee_d11
 	j	re_after_raw_text
 ee_d11:
+	addi	gp, gp, -1
+	bnez	gp, ee_d12
 	j	re_after_raw_nl
+ee_d12:
+	addi	gp, gp, -1
+	bnez	gp, ee_d13
+	j	re_after_fname_space
+ee_d13:
+	addi	gp, gp, -1
+	bnez	gp, ee_d14
+	j	re_after_fname
+ee_d14:
+	j	re_after_fname_colon
 
 # ── emit_dec — emit unsigned a0 as decimal digits, return via gp dispatch ────
 # Uses a stack buffer to reverse digits, then calls ee_str to print them.
@@ -16422,8 +16547,14 @@ report_err:
 	addi	sp, sp, -16
 	sw	a0, 0(sp)		# [0]: err_code
 
-	# Walk s1..s2 counting newlines to compute line/col.
+	# Walk (file_line_base or s1) .. s2 counting newlines to compute
+	# line/col. Using file_line_base makes the line count restart at
+	# the most recent FILE: directive's comment opener.
+	lla	t2, file_line_base
+	lw	t2, 0(t2)
+	bnez	t2, lc_have_base
 	addi	t2, s1, 0
+lc_have_base:
 	addi	t3, zero, 1		# line
 	addi	t4, zero, 1		# col
 lc_loop:
@@ -16449,6 +16580,29 @@ lc_done:
 	addi	gp, zero, 1		# ee_str site 1
 	j	ee_str
 re_after_error:
+	# If a FILE: directive set a filename, emit " NAME:" between
+	# "Error:" and the line number.
+	lla	t0, file_name_len
+	lw	a1, 0(t0)
+	beqz	a1, re_skip_fname
+	lla	a0, es_space
+	addi	a1, zero, 1
+	addi	gp, zero, 12		# ee_str site 12 = re_after_fname_space
+	j	ee_str
+re_after_fname_space:
+	lla	t0, file_name_len
+	lw	a1, 0(t0)
+	lla	t0, file_name_ptr
+	lw	a0, 0(t0)
+	addi	gp, zero, 13		# ee_str site 13 = re_after_fname
+	j	ee_str
+re_after_fname:
+	lla	a0, es_colon
+	addi	a1, zero, 1
+	addi	gp, zero, 14		# ee_str site 14 = re_after_fname_colon
+	j	ee_str
+re_after_fname_colon:
+re_skip_fname:
 	# Emit line number.
 	lw	a0, 4(sp)
 	addi	gp, zero, 0		# emit_dec site 0
@@ -16565,6 +16719,28 @@ lv_slot:
 # parse_ident entry so that an "undefined variable" error can rewind s2 and
 # report the column at the identifier's start rather than one past it.
 ident_start:
+	.word	0
+
+# ── FILE: directive state ───────────────────────────────────────────────
+# Lets multiple source files be concatenated through the UART with error
+# reporting that references the original file name and line number.
+#
+# When skip_ws encounters a comment containing the directive "FILE: NAME"
+# (block- or line-comment), it stores:
+#   file_name_ptr / file_name_len: where in the input buffer the filename
+#                                  text lives (pointer + length).
+#   file_line_base:               pointer to the '/' that opened the
+#                                  comment containing the directive; this
+#                                  becomes the "start of line 1" for
+#                                  subsequent error reporting.
+# report_err uses file_line_base (if non-zero) instead of s1 as the start
+# of the newline walk, so the computed line number is relative to the
+# last FILE: directive. It also prints "NAME:" before "Error:".
+file_name_ptr:
+	.word	0
+file_name_len:
+	.word	0
+file_line_base:
 	.word	0
 
 # Pointer to the most recent symtab entry returned by lookup/lookup_or_alloc.

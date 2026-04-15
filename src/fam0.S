@@ -30,6 +30,23 @@
 #      don't need explicit init.
 #   2. Load address is 0x80000000, so the output buffer can live at a fixed
 #      absolute address (0x80100000) instead of a PC-relative one.
+#
+# ── Porting note (reset state) ───────────────────────────────────────────────
+# Assumption #1 is a QEMU convention, NOT a RISC-V architectural guarantee.
+# The privileged spec leaves GPR contents at reset unspecified. Real RISC-V
+# hardware (e.g., SiFive HiFive1/FE310) typically runs through a ROM
+# bootloader (ZSBL) before user code, which leaves GPRs in an arbitrary
+# state. The same applies to QEMU runs that use a BIOS such as OpenSBI.
+#
+# If porting fam0 to real hardware or any environment with a bootloader,
+# add back explicit initialization for s3 and s4 after the `mv s2, s1` line:
+#
+#     li  s4, 0        # comment flag = false
+#     li  s3, 1        # nibble toggle = "expecting high"
+#
+# and invert `beqz s3, store_low` back to `bnez s3, store_low` below.
+# This grows fam0 to 176 bytes (44 instructions) but makes it
+# reset-state-independent. The tradeoff is 8 bytes for robustness.
 # ──────────────────────────────────────────────────────────────────────────────
 
 _start:

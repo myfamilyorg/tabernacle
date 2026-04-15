@@ -1,0 +1,80 @@
+#!/bin/sh
+# Compile a source file using the famc compiler.
+# Usage: famc [-nostdlib] <source> [output]
+# If output is omitted, replaces extension with .bin
+# With -nostdlib, the standard library is not prepended.
+# Flag and positional args may appear in any order.
+
+USE_STDLIB=1
+POS=""
+for arg in "$@"; do
+	if [ "$arg" = "-nostdlib" ]; then
+		USE_STDLIB=0
+	else
+		POS="$POS $arg"
+	fi
+done
+# shellcheck disable=SC2086
+set -- $POS
+
+if [ $# -lt 1 ]; then
+	echo "Usage: $0 [-nostdlib] <source> [output]"
+	echo "Example: $0 tmp/test.famc tmp/test.bin"
+	exit 1
+fi
+
+SELF="$0"
+[ -L "$SELF" ] && SELF="$(readlink -f "$SELF")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+ASM="$ROOT_DIR/bin/famc"
+SRC="$1"
+STDLIB="$ROOT_DIR/lib/stdlib.fam"
+
+if [ ! -e "$ASM" ]; then
+	echo "Error: $ASM not found"
+	exit 1
+fi
+if [ ! -e "$SRC" ]; then
+	echo "Error: $SRC not found"
+	exit 1
+fi
+if [ "$USE_STDLIB" = "1" ] && [ ! -e "$STDLIB" ]; then
+	echo "Error: $STDLIB not found (use -nostdlib to skip)"
+	exit 1
+fi
+
+if [ -n "$2" ]; then
+	OUT="$2"
+else
+	OUT="${SRC%.*}.bin"
+fi
+
+if [ "$USE_STDLIB" = "1" ]; then
+	INPUT_CMD="cat $STDLIB $SRC"
+else
+	INPUT_CMD="cat $SRC"
+fi
+
+($INPUT_CMD; printf '\004') | qemu-system-riscv32 \
+	-machine virt \
+	-cpu rv32,m=false,a=false,f=false,d=false,c=false,zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,zcd=false,zcf=false,zcmp=false,zcmt=false,zicsr=false,zifencei=false \
+	-nographic \
+	-bios none \
+	-device loader,file="$ASM",addr=0x80000000 \
+	-serial mon:stdio 2>/dev/null > "$OUT"
+
+if [ ! -s "$OUT" ]; then
+	echo "Error: compiler produced no output"
+	rm -f "$OUT"
+	exit 1
+fi
+
+MAGIC=$(head -c 4 "$OUT" | xxd -p)
+if [ "$MAGIC" != "13000000" ]; then
+	cat "$OUT"
+	rm -f "$OUT"
+	exit 1
+fi
+
+echo "$OUT ($(wc -c < "$OUT") bytes)"

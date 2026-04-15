@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""Convert a gas .S file (RV32I subset) to fam2 source syntax.
+
+fam2 syntax differs from gas in that it:
+  - has no directives: .section/.globl/.balign/.equ/.ascii/.byte/.word/.zero
+  - has no arithmetic in operands (only integer literals / names / regs)
+  - accepts a smaller set of mnemonics — no jalr/ret/bltz/bgt etc.
+  - supports "XX" hex passthrough to emit raw bytes
+
+So we:
+  - strip .section/.globl/.balign
+  - inline .equ constants (by textual substitution, then fold trivial arithmetic)
+  - emit .ascii/.byte/.word/.zero as hex passthrough
+  - expand bltz rs,L  →  blt rs, zero, L
+  - expand bgt rs,rt,L → blt rt, rs, L
+  - emit ret / jr / jalr as raw 4-byte hex passthrough (fam2 no longer accepts
+    these mnemonics). ret→jalr zero,ra,0. jr rs→jalr zero,rs,0.
+  - pass through everything else (labels, comments, blank lines, instructions)
+
+Usage: s2fam2 input.S [output.fam2]
+"""
+
+import re
+import sys
+
+
+def parse_ascii(s):
+    """Parse a gas .ascii operand (one "..." string) into bytes."""
+    m = re.match(r'^\s*"(.*)"\s*$', s)
+    if not m:
+        raise ValueError(f"bad .ascii operand: {s!r}")
+    text = m.group(1)
+    out = bytearray()
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\":
+            i += 1
+            esc = text[i]
+            if esc == "0":
+                out.append(0)
+            elif esc == "n":
+                out.append(0x0A)
+            elif esc == "t":
+                out.append(0x09)
+            elif esc == "r":
+                out.append(0x0D)
+            elif esc == "\\":
+                out.append(0x5C)
+            elif esc == '"':
+                out.append(0x22)
+            else:
+                raise ValueError(f"unknown escape \\{esc} in {s!r}")
+            i += 1
+        else:
+            out.append(ord(c))
+            i += 1
+    return bytes(out)
+
+
+# Safe names for eval: only digits, +, -, *, /, parens, whitespace, and 0x
+_SAFE_EXPR_RE = re.compile(r"^[\s\d+\-*/()x]+$")
+
+
+def substitute_equs(text, equs):
+    """Replace word-bounded identifiers in text with equs[name] if defined."""
+    def repl(m):
+        name = m.group(0)
+        if name in equs:
+            return str(equs[name])
+        return name
+    return re.sub(r"\b[A-Za-z_][A-Za-z_0-9]*\b", repl, text)
+
+
+def eval_int(expr, equs):
+    """Evaluate an integer expression, resolving equs. Raises on failure."""
+    s = replace_char_literals(expr)
+    s = substitute_equs(s, equs).strip()
+    if not _SAFE_EXPR_RE.match(s):
+        raise ValueError(f"cannot evaluate {expr!r} (got {s!r})")
+    return int(eval(s, {"__builtins__": {}}, {}))
+
+
+_ARITH_RE = re.compile(r"(-?\d+)\s*([+\-])\s*(\d+)")
+
+
+def fold_arith(s):
+    """Collapse occurrences of `INT op INT` (op in +/-) to single ints.
+    Idempotent; runs until fixpoint."""
+    while True:
+        m = _ARITH_RE.search(s)
+        if not m:
+            return s
+        a = int(m.group(1))
+        b = int(m.group(3))
+        op = m.group(2)
+        result = a + b if op == "+" else a - b
+        s = s[:m.start()] + str(result) + s[m.end():]
+
+
+def split_code_comment(line):
+    """Split a line at the first '#' not inside a string or char literal."""
+    in_dq = False  # double-quoted string
+    in_sq = False  # single-quoted char literal
+    esc = False
+    for i, c in enumerate(line):
+        if in_dq or in_sq:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"' and in_dq:
+                in_dq = False
+            elif c == "'" and in_sq:
+                in_sq = False
+        else:
+            if c == '"':
+                in_dq = True
+            elif c == "'":
+                in_sq = True
+            elif c == "#":
+                return line[:i], line[i:]
+    return line, ""
+
+
+_CHAR_ESC = {
+    "n": 0x0A, "t": 0x09, "r": 0x0D, "0": 0x00,
+    "\\": 0x5C, "'": 0x27, '"': 0x22,
+}
+
+_CHAR_LIT_RE = re.compile(r"'([^'\\])'|'\\(.)'")
+
+
+def replace_char_literals(s):
+    """Replace gas char literals 'c' / '\\c' with their decimal value."""
+    def repl(m):
+        if m.group(1) is not None:
+            return str(ord(m.group(1)))
+        esc = m.group(2)
+        if esc in _CHAR_ESC:
+            return str(_CHAR_ESC[esc])
+        raise ValueError(f"unknown char escape: \\{esc}")
+    return _CHAR_LIT_RE.sub(repl, s)
+
+
+def emit_hex_bytes(b, comment=""):
+    """Format bytes as space-separated hex with an optional trailing comment."""
+    hx = " ".join(f"{x:02X}" for x in b)
+    if comment:
+        return f"{hx}\t# {comment}"
+    return hx
+
+
+# Hex encoding of instructions we're replacing with raw bytes
+def encode_ret():
+    # jalr zero, 0(ra)   = 0x00008067
+    return bytes([0x67, 0x80, 0x00, 0x00])
+
+
+def process(lines):
+    out = []
+    equs = {}
+
+    # Pass 1: collect .equ definitions (in order; later equs can reference earlier)
+    for line in lines:
+        code, _ = split_code_comment(line)
+        m = re.match(r"^\s*\.equ\s+(\w+)\s*,\s*(.+?)\s*$", code)
+        if m:
+            name = m.group(1)
+            val = eval_int(m.group(2), equs)
+            equs[name] = val
+
+    # Pass 2: transform
+    for lineno, line in enumerate(lines, start=1):
+        raw = line.rstrip("\n")
+        code, comment = split_code_comment(raw)
+        code_stripped = code.strip()
+
+        # Strip directives that have no fam2 equivalent / are handled inline
+        if re.match(r"^\s*\.(section|globl|balign|equ)\b", code):
+            # Drop the line; keep any trailing comment? Drop it too.
+            continue
+
+        # Blank line or pure comment
+        if code_stripped == "":
+            out.append(raw)
+            continue
+
+        # Data directives → hex passthrough
+        m = re.match(r"^\s*\.byte\s+(.+?)\s*$", code)
+        if m:
+            parts = [p.strip() for p in m.group(1).split(",")]
+            values = [eval_int(p, equs) & 0xFF for p in parts]
+            out.append(emit_hex_bytes(bytes(values),
+                                      f".byte {m.group(1)}{(' '+comment) if comment else ''}"))
+            continue
+
+        m = re.match(r"^\s*\.word\s+(.+?)\s*$", code)
+        if m:
+            parts = [p.strip() for p in m.group(1).split(",")]
+            buf = bytearray()
+            for p in parts:
+                v = eval_int(p, equs) & 0xFFFFFFFF
+                buf += v.to_bytes(4, "little")
+            out.append(emit_hex_bytes(bytes(buf),
+                                      f".word {m.group(1)}{(' '+comment) if comment else ''}"))
+            continue
+
+        m = re.match(r'^\s*\.ascii\s+("(?:[^"\\]|\\.)*")\s*$', code)
+        if m:
+            b = parse_ascii(m.group(1))
+            out.append(emit_hex_bytes(b,
+                                      f".ascii {m.group(1)}{(' '+comment) if comment else ''}"))
+            continue
+
+        m = re.match(r"^\s*\.zero\s+(.+?)\s*$", code)
+        if m:
+            n = eval_int(m.group(1), equs)
+            out.append(emit_hex_bytes(bytes(n),
+                                      f".zero {m.group(1)}{(' '+comment) if comment else ''}"))
+            continue
+
+        # ret → raw hex (fam2 no longer supports ret mnemonic)
+        m = re.match(r"^(\s*)ret\s*$", code)
+        if m:
+            indent = m.group(1)
+            tail = f"\t{comment}" if comment else ""
+            out.append(
+                f"{indent}{emit_hex_bytes(encode_ret(), 'jalr zero, 0(ra)')}{tail}")
+            continue
+
+        # bltz rs, L  →  blt rs, zero, L
+        m = re.match(r"^(\s*)bltz\s+(\w+)\s*,\s*(\S+)\s*$", code)
+        if m:
+            indent, rs, label = m.groups()
+            tail = f"\t{comment}" if comment else ""
+            out.append(f"{indent}blt\t{rs}, zero, {label}{tail}")
+            continue
+
+        # bgt rs, rt, L  →  blt rt, rs, L
+        m = re.match(r"^(\s*)bgt\s+(\w+)\s*,\s*(\w+)\s*,\s*(\S+)\s*$", code)
+        if m:
+            indent, rs, rt, label = m.groups()
+            tail = f"\t{comment}" if comment else ""
+            out.append(f"{indent}blt\t{rt}, {rs}, {label}{tail}")
+            continue
+
+        # Regular instruction / label line: replace char literals, substitute
+        # .equ names, fold trivial arithmetic.
+        new_code = replace_char_literals(code)
+        new_code = substitute_equs(new_code, equs)
+        new_code = fold_arith(new_code)
+        out.append(new_code + comment)
+
+    return "\n".join(out) + "\n"
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} input.S [output.fam2]", file=sys.stderr)
+        sys.exit(1)
+
+    with open(sys.argv[1]) as f:
+        lines = f.readlines()
+
+    result = process(lines)
+
+    if len(sys.argv) >= 3:
+        with open(sys.argv[2], "w") as f:
+            f.write(result)
+    else:
+        sys.stdout.write(result)
+
+
+if __name__ == "__main__":
+    main()
