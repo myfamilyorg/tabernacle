@@ -1,0 +1,212 @@
+# gimli_permute_test.fam3
+#
+# Standalone test for the Gimli-384 permutation (24 rounds, SP-box +
+# small/big swaps + round constants).
+#
+# This test reads a 48-byte input state from UART, runs gimli_permute
+# once, then writes the 48-byte result back over UART and halts.
+# The driver (.ci/testnode) compares the output against the Python
+# reference for multiple test inputs.
+
+.equ	UART_BASE,	0x10000000
+.equ	UART_LSR,	5
+.equ	UART_RX_READY,	0x01
+.equ	UART_TX_READY,	0x20
+.equ	SHUTDOWN_ADDR,	0x00100000
+.equ	SHUTDOWN_VAL,	0x5555
+
+_start:
+	# Stack at top of RAM (1 MiB in).
+	li	sp, 0x80100000
+	addi	sp, sp, -48
+	mv	s0, sp			# s0 = state ptr (preserved)
+
+	# ── Read 48 input bytes from UART into state[] ──
+	li	s8, UART_BASE
+	mv	s9, s0			# write ptr
+	li	s10, 48			# remaining bytes
+in_byte:
+	beqz	s10, in_done
+in_wait:
+	lbu	t0, UART_LSR(s8)
+	andi	t0, t0, UART_RX_READY
+	beqz	t0, in_wait
+	lbu	t0, 0(s8)
+	sb	t0, 0(s9)
+	addi	s9, s9, 1
+	addi	s10, s10, -1
+	j	in_byte
+in_done:
+
+	# Run gimli_permute(s0). gp=0 → return to gpr_test.
+	mv	a0, s0
+	li	gp, 0
+	j	gimli_permute
+gpr_test:
+
+	# ── Write 48 output bytes over UART ──
+	mv	t3, s0			# read ptr
+	li	t4, 48			# remaining bytes
+	li	t5, UART_BASE
+out_byte:
+	beqz	t4, done
+out_wait:
+	lbu	t0, UART_LSR(t5)
+	andi	t0, t0, UART_TX_READY
+	beqz	t0, out_wait
+	lbu	t0, 0(t3)
+	sb	t0, 0(t5)
+	addi	t3, t3, 1
+	addi	t4, t4, -1
+	j	out_byte
+
+done:
+	# SiFive test finisher poweroff.
+	li	t0, SHUTDOWN_ADDR
+	li	t1, SHUTDOWN_VAL
+	sw	t1, 0(t0)
+hang:
+	wfi
+	j	hang
+
+# ══════════════════════════════════════════════════════════════════════════════
+# gimli_permute: 24-round Gimli-384 permutation, in place.
+#   Input:  a0 = pointer to 12 × u32 state (48 bytes)
+#   Output: state modified in place
+#   Return: gp-indexed dispatch via gimli_permute_disp
+#
+# Algorithm (per round, round counter r decreasing from 24 to 1):
+#   for col in 0..3:
+#     x = rotl(state[col],  24)
+#     y = rotl(state[col+4], 9)
+#     z =       state[col+8]
+#     state[col+8] = x ⊕ (z<<1) ⊕ ((y∧z)<<2)
+#     state[col+4] = y ⊕ x     ⊕ ((x∨z)<<1)
+#     state[col]   = z ⊕ y     ⊕ ((x∧y)<<3)
+#   if r & 3 == 0:
+#     swap(state[0], state[1]);  swap(state[2], state[3])
+#     state[0] ⊕= 0x9e377900 | r
+#   elif r & 3 == 2:
+#     swap(state[0], state[2]);  swap(state[1], state[3])
+# ══════════════════════════════════════════════════════════════════════════════
+gimli_permute:
+	# Save clobbered s-regs (we use s1-s6).
+	addi	sp, sp, -32
+	sw	s1, 0(sp)
+	sw	s2, 4(sp)
+	sw	s3, 8(sp)
+	sw	s4, 12(sp)
+	sw	s5, 16(sp)
+	sw	s6, 20(sp)
+
+	li	s1, 24			# s1 = round counter (24..1)
+
+gp_round:
+	li	s2, 0			# s2 = column counter (0..3)
+
+gp_col:
+	# s3 = &state[col]
+	slli	s3, s2, 2
+	add	s3, s3, a0
+
+	# Load column words.
+	lw	s4, 0(s3)		# s4 = state[col]
+	lw	s5, 16(s3)		# s5 = state[col+4]
+	lw	s6, 32(s3)		# s6 = state[col+8]  (=z directly)
+
+	# x = rotl(s4, 24) = (s4 << 24) | (s4 >> 8)
+	slli	t0, s4, 24
+	srli	t1, s4, 8
+	or	t0, t0, t1		# t0 = x
+
+	# y = rotl(s5, 9) = (s5 << 9) | (s5 >> 23)
+	slli	t1, s5, 9
+	srli	t2, s5, 23
+	or	t1, t1, t2		# t1 = y
+
+	# z already in s6.
+
+	# state[col+8] = x ⊕ (z<<1) ⊕ ((y∧z)<<2)
+	slli	t2, s6, 1		# z<<1
+	and	t3, t1, s6		# y∧z
+	slli	t3, t3, 2		# (y∧z)<<2
+	xor	t2, t2, t0		# x ⊕ (z<<1)
+	xor	t2, t2, t3		# ⊕ ((y∧z)<<2)
+	sw	t2, 32(s3)
+
+	# state[col+4] = y ⊕ x ⊕ ((x∨z)<<1)
+	or	t2, t0, s6		# x∨z
+	slli	t2, t2, 1		# (x∨z)<<1
+	xor	t2, t2, t1		# y ⊕ ...
+	xor	t2, t2, t0		# ⊕ x
+	sw	t2, 16(s3)
+
+	# state[col] = z ⊕ y ⊕ ((x∧y)<<3)
+	and	t2, t0, t1		# x∧y
+	slli	t2, t2, 3		# (x∧y)<<3
+	xor	t2, t2, s6		# z ⊕ ...
+	xor	t2, t2, t1		# ⊕ y
+	sw	t2, 0(s3)
+
+	# Next column.
+	addi	s2, s2, 1
+	li	t0, 4
+	blt	s2, t0, gp_col
+
+	# Linear layer selector.
+	andi	t0, s1, 3
+	beqz	t0, gp_small_swap
+	li	t1, 2
+	beq	t0, t1, gp_big_swap
+	j	gp_round_end
+
+gp_small_swap:
+	# swap state[0] ↔ state[1]
+	lw	t0, 0(a0)
+	lw	t1, 4(a0)
+	sw	t1, 0(a0)
+	sw	t0, 4(a0)
+	# swap state[2] ↔ state[3]
+	lw	t0, 8(a0)
+	lw	t1, 12(a0)
+	sw	t1, 8(a0)
+	sw	t0, 12(a0)
+	# state[0] ⊕= 0x9e377900 | round
+	li	t0, 0x9e377900
+	or	t0, t0, s1
+	lw	t1, 0(a0)
+	xor	t1, t1, t0
+	sw	t1, 0(a0)
+	j	gp_round_end
+
+gp_big_swap:
+	# swap state[0] ↔ state[2]
+	lw	t0, 0(a0)
+	lw	t1, 8(a0)
+	sw	t1, 0(a0)
+	sw	t0, 8(a0)
+	# swap state[1] ↔ state[3]
+	lw	t0, 4(a0)
+	lw	t1, 12(a0)
+	sw	t1, 4(a0)
+	sw	t0, 12(a0)
+
+gp_round_end:
+	addi	s1, s1, -1
+	bnez	s1, gp_round
+
+	# Restore saved s-regs.
+	lw	s1, 0(sp)
+	lw	s2, 4(sp)
+	lw	s3, 8(sp)
+	lw	s4, 12(sp)
+	lw	s5, 16(sp)
+	lw	s6, 20(sp)
+	addi	sp, sp, 32
+
+	# gp-indexed dispatch back to caller.
+gimli_permute_disp:
+	beqz	gp, gpr_test
+	# No other call sites yet — if we're here, something is wrong.
+hang_disp:
+	j	hang_disp

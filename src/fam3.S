@@ -506,10 +506,23 @@ poweroff_hang:
 #   E12 duplicate label          E13 symtab overflow
 #   E14 fixup overflow           E15 output overflow
 #   E17 unresolved symbol        E18 unknown fixup type
+#   E19 I/S imm12 range          E20 U-type imm20 range
 #   E21 B-type range             E22 J-type range
 #   E24 bad string literal       E25 bad prologue
 #   E26 bad epilogue
 
+imm_range_i:
+	li	a0, 19			# E19 = I/S-type immediate out of range
+	j	halt_err
+imm_range_u:
+	li	a0, 20			# E20 = U-type immediate out of range
+	j	halt_err
+imm_range_b:
+	li	a0, 21			# E21 = B-type offset out of range / odd
+	j	halt_err
+imm_range_j:
+	li	a0, 22			# E22 = J-type offset out of range / odd
+	j	halt_err
 halt_err:
 	mv	a1, a0
 	li	t0, 'E'
@@ -2403,6 +2416,28 @@ emit_word_d9:
 	j	emit_word_rs9
 
 emit_u_inst:
+	# Range check: lui/auipc imm20 (in a2) must fit in either
+	# 20-bit unsigned (0..0xFFFFF) or 20-bit signed
+	# (-0x80000..0x7FFFF).  Their union is -0x80000..0xFFFFF.
+	# Halts with E20 on overflow.
+	addi	sp, sp, -4
+	sw	t2, 0(sp)
+	li	t2, 1048575		# 0xFFFFF
+	bge	a2, t2, eui_chk_hi
+	j	eui_chk_lo
+eui_chk_hi:
+	beq	a2, t2, eui_ok
+	j	eui_err
+eui_chk_lo:
+	li	t2, -524288		# -0x80000
+	bge	a2, t2, eui_ok
+eui_err:
+	lw	t2, 0(sp)
+	addi	sp, sp, 4
+	j	imm_range_u
+eui_ok:
+	lw	t2, 0(sp)
+	addi	sp, sp, 4
 	slli	t0, a2, 12
 	andi	t1, a1, 0x1F
 	slli	t1, t1, 7
@@ -2443,6 +2478,51 @@ emit_u_inst_d5:
 	j	error_halt
 
 emit_i_inst:
+	# Range check: imm (a4) must fit in the instruction's immediate
+	# field.  addi / slti / sltiu (f3 bit 2 = 0) require -2048..2047.
+	# xori / ori / andi (f3 bit 2 = 1) sign-extend the imm in hardware,
+	# but source code conventionally writes the raw 12-bit bit pattern
+	# (e.g. `andi x, y, 0xFFF` = mask to -1), so for those we accept
+	# the wider range -2048..4095.
+	#
+	# NOTE: we use explicit `li bound; bge/ble; j imm_range_i`
+	# sequences rather than `bne reg,reg,label` to dodge a
+	# branch-relaxation quirk that was observed to mis-resolve
+	# long-distance B-type label branches in earlier attempts.
+	addi	sp, sp, -4
+	sw	t2, 0(sp)		# save t2 (scratch)
+	andi	t2, a3, 4
+	bnez	t2, eii_bitwise
+	# ── arith path: -2048 ≤ a4 ≤ 2047 ──
+	li	t2, 2047
+	bge	a4, t2, eii_chk_arith_hi	# a4 >= 2047 → check equal
+	j	eii_chk_arith_lo
+eii_chk_arith_hi:
+	beq	a4, t2, eii_range_ok		# a4 == 2047 → ok
+	j	imm_range_err
+eii_chk_arith_lo:
+	li	t2, -2048
+	bge	a4, t2, eii_range_ok		# a4 >= -2048 → ok
+	j	imm_range_err
+eii_bitwise:
+	# ── bitwise path: -2048 ≤ a4 ≤ 4095 ──
+	li	t2, 4095
+	bge	a4, t2, eii_chk_bw_hi
+	j	eii_chk_bw_lo
+eii_chk_bw_hi:
+	beq	a4, t2, eii_range_ok
+	j	imm_range_err
+eii_chk_bw_lo:
+	li	t2, -2048
+	bge	a4, t2, eii_range_ok
+	j	imm_range_err
+imm_range_err:
+	lw	t2, 0(sp)
+	addi	sp, sp, 4
+	j	imm_range_i
+eii_range_ok:
+	lw	t2, 0(sp)
+	addi	sp, sp, 4
 	slli	t0, a4, 20
 	andi	t1, a2, 0x1F
 	slli	t1, t1, 15
@@ -2579,6 +2659,26 @@ emit_r_inst_d4:
 	j	emit_r_inst_rs4
 
 emit_s_inst:
+	# Range check: offset (a4) must fit in 12-bit signed (-2048..2047).
+	# Store offsets are always signed, never bitwise.
+	addi	sp, sp, -4
+	sw	t2, 0(sp)
+	li	t2, 2047
+	bge	a4, t2, esi_chk_hi
+	j	esi_chk_lo
+esi_chk_hi:
+	beq	a4, t2, esi_ok
+	j	esi_err
+esi_chk_lo:
+	li	t2, -2048
+	bge	a4, t2, esi_ok
+esi_err:
+	lw	t2, 0(sp)
+	addi	sp, sp, 4
+	j	imm_range_i
+esi_ok:
+	lw	t2, 0(sp)
+	addi	sp, sp, 4
 	srli	t1, a4, 5
 	andi	t1, t1, 0x7F
 	slli	t0, t1, 25
@@ -2618,6 +2718,30 @@ emit_s_inst_d2:
 	j	emit_s_inst_rs2
 
 emit_b_inst:
+	# Range check: B-type offset (in a4) must fit in 13-bit signed
+	# (-4096..4094) AND be even.  Halts with E21 on overflow.
+	addi	sp, sp, -4
+	sw	t2, 0(sp)
+	# even check
+	andi	t2, a4, 1
+	bnez	t2, ebi_err
+	# upper bound: a4 ≤ 4094
+	li	t2, 4094
+	bge	a4, t2, ebi_chk_hi
+	j	ebi_chk_lo
+ebi_chk_hi:
+	beq	a4, t2, ebi_ok
+	j	ebi_err
+ebi_chk_lo:
+	li	t2, -4096
+	bge	a4, t2, ebi_ok
+ebi_err:
+	lw	t2, 0(sp)
+	addi	sp, sp, 4
+	j	imm_range_b
+ebi_ok:
+	lw	t2, 0(sp)
+	addi	sp, sp, 4
 	srli	t0, a4, 12
 	andi	t0, t0, 1
 	slli	t0, t0, 31
@@ -2658,6 +2782,29 @@ emit_b_inst_disp:
 	j	emit_b_inst_rs0
 
 emit_j_inst:
+	# Range check: J-type offset (in a2) must fit in 21-bit signed
+	# (-1048576..1048574) AND be even.  Halts with E22 on overflow.
+	addi	sp, sp, -4
+	sw	t2, 0(sp)
+	# even check
+	andi	t2, a2, 1
+	bnez	t2, eji_err
+	li	t2, 1048574		# 0xFFFFE
+	bge	a2, t2, eji_chk_hi
+	j	eji_chk_lo
+eji_chk_hi:
+	beq	a2, t2, eji_ok
+	j	eji_err
+eji_chk_lo:
+	li	t2, -1048576		# -0x100000
+	bge	a2, t2, eji_ok
+eji_err:
+	lw	t2, 0(sp)
+	addi	sp, sp, 4
+	j	imm_range_j
+eji_ok:
+	lw	t2, 0(sp)
+	addi	sp, sp, 4
 	srli	t0, a2, 20
 	andi	t0, t0, 1
 	slli	t0, t0, 31

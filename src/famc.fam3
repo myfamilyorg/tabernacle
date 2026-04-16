@@ -3026,7 +3026,7 @@ emit_lw_sp:
 	# a0 = byte offset (positive). If it fits in 12-bit signed (0..2047),
 	# emit a single `lw a0, off(fp)`. Otherwise emit a 4-instruction
 	# sequence using t0 as scratch to support any 32-bit offset.
-	addi	t0, zero, 2048
+	li	t0, 2048
 	bgeu	a0, t0, elws_big
 	# Small path: single lw a0, off(fp)
 	slli	t0, a0, 20
@@ -3183,7 +3183,7 @@ emit_sw_sp:
 	sw	gp, 0(sp)
 	# a0 = byte offset (positive). Same pattern as emit_lw_sp: single
 	# instruction for small offsets, multi-instruction sequence for large.
-	addi	t0, zero, 2048
+	li	t0, 2048
 	bgeu	a0, t0, esws_big
 	# Default sw word base: rs2=a0, 0x00A42023 (= `sw a0, 0(fp)`).
 	lui	t0, 0xA42
@@ -8612,32 +8612,28 @@ ew_cs_fn_sv3:
 	lw	t5, 24(sp)
 	addi	t6, zero, 4
 	beq	t5, t6, cs_fn_params_saved
-	lui	a0, 0xE42
-	addi	a0, a0, 0x823
+	li	a0, 0x00e42823		# sw a4, 16(fp)
 	addi	gp, zero, 54		# emit_word site 54 = ew_cs_fn_sv4
 	j	emit_word
 ew_cs_fn_sv4:
 	lw	t5, 24(sp)
 	addi	t6, zero, 5
 	beq	t5, t6, cs_fn_params_saved
-	lui	a0, 0xF42
-	addi	a0, a0, 0xA23
+	li	a0, 0x00f42a23		# sw a5, 20(fp)
 	addi	gp, zero, 55		# emit_word site 55 = ew_cs_fn_sv5
 	j	emit_word
 ew_cs_fn_sv5:
 	lw	t5, 24(sp)
 	addi	t6, zero, 6
 	beq	t5, t6, cs_fn_params_saved
-	lui	a0, 0x1042
-	addi	a0, a0, 0xC23
+	li	a0, 0x01042c23		# sw a6, 24(fp)
 	addi	gp, zero, 56		# emit_word site 56 = ew_cs_fn_sv6
 	j	emit_word
 ew_cs_fn_sv6:
 	lw	t5, 24(sp)
 	addi	t6, zero, 7
 	beq	t5, t6, cs_fn_params_saved
-	lui	a0, 0x1142
-	addi	a0, a0, 0xE23
+	li	a0, 0x01142e23		# sw a7, 28(fp)
 	addi	gp, zero, 57		# emit_word site 57 = ew_cs_fn_sv7
 	j	emit_word
 ew_cs_fn_sv7:
@@ -15847,7 +15843,7 @@ la_cs_decl:
 	# `addi a0, fp, imm`. For larger offsets, use a 3-instruction sequence
 	# `lui t0, hi20; addi t0, t0, lo12; add a0, fp, t0`.
 	lw	t3, 12(sp)		# block offset
-	addi	t4, zero, 2048
+	li	t4, 2048
 	bge	t3, t4, cad_emit_big
 	# Small: single addi a0, fp, imm (word 0x00040513 | imm<<20)
 	lui	a0, 0x40

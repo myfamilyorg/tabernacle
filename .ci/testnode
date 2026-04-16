@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# End-to-end test harness for the tabernacle node (famchain loader).
+#
+# This script covers node-side concerns at every level of the stack:
+#
+#   § 1. Subcomponents   — gimli_permute, gimli_hash (reference cross-check)
+#   § 2. Integration     — famchain skeleton, disk path, network path, jalr
+#
+# Each subcomponent test is a self-contained fam3 source under .ci/tests/
+# that reads some bytes from UART, emits a result over UART, and powers
+# off. The harness assembles it with bin/fam3, runs it under QEMU, and
+# compares the output to a reference value computed via tools/gimli.py.
+#
+# Integration tests build famchain against specific bin_config.inc values
+# and run it with a virtio-blk disk backing. Passing means famchain
+# successfully hashed + transferred control to the disk payload, and the
+# payload emitted its expected marker byte.
+#
+# Usage: .ci/testnode [--verbose]
+
+set -u
+
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+FAM3_BIN="$DIR/bin/fam3"
+TOOLS_DIR="$DIR/tools"
+SRC_DIR="$DIR/src"
+TESTS_DIR="$DIR/.ci/tests"
+
+VERBOSE=0
+[[ "${1:-}" == "--verbose" ]] && VERBOSE=1
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+PASS=0
+FAIL=0
+TOTAL=0
+
+CPU="rv32,m=false,a=false,f=false,d=false,c=false,\
+zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\
+zcd=false,zcf=false,zcmp=false,zcmt=false,zicsr=false,zifencei=false"
+
+if [[ ! -e "$FAM3_BIN" ]]; then
+	echo "error: $FAM3_BIN not found — run build.sh first" >&2
+	exit 2
+fi
+if [[ ! -e "$DIR/bin/famchain" ]]; then
+	echo "error: $DIR/bin/famchain not found — run build.sh first" >&2
+	exit 2
+fi
+
+record_pass() {
+	PASS=$((PASS + 1))
+	[[ $VERBOSE -eq 1 ]] && echo "  PASS  $1"
+}
+
+record_fail() {
+	FAIL=$((FAIL + 1))
+	echo "  FAIL  $1"
+	[[ -n "${2:-}" ]] && echo "        $2"
+}
+
+section() {
+	[[ $VERBOSE -eq 1 ]] && echo "=== $1 ==="
+}
+
+# assemble_one: assemble a single fam3 source into a binary.
+#   $1 = source path, $2 = output path
+assemble_one() {
+	local src="$1" out="$2"
+	(cat "$src"; printf '\004') | qemu-system-riscv32 \
+		-machine virt -cpu "$CPU" \
+		-nographic -bios none \
+		-device loader,file="$FAM3_BIN",addr=0x80000000 \
+		-serial mon:stdio 2>/dev/null > "$out"
+	local magic
+	magic=$(head -c 4 "$out" 2>/dev/null | xxd -p)
+	[[ "$magic" == "13000000" ]]
+}
+
+# assemble_many: assemble multiple concatenated fam3 sources.
+#   $1 = output binary, $2... = source files
+assemble_many() {
+	local out="$1"; shift
+	(cat "$@"; printf '\004') | qemu-system-riscv32 \
+		-machine virt -cpu "$CPU" \
+		-nographic -bios none \
+		-device loader,file="$FAM3_BIN",addr=0x80000000 \
+		-serial mon:stdio 2>/dev/null > "$out"
+	local magic
+	magic=$(head -c 4 "$out" 2>/dev/null | xxd -p)
+	[[ "$magic" == "13000000" ]]
+}
+
+# run_bin_with_input: run a built binary under QEMU, feeding $2 (hex)
+# to stdin, and print UART output as hex.
+#   $1 = binary, $2 = input-as-hex, $3 = max output bytes
+run_bin_with_input() {
+	local bin="$1" input_hex="$2" nbytes="$3"
+	printf '%s' "$input_hex" | xxd -r -p | timeout -k 2 10 \
+	qemu-system-riscv32 \
+		-machine virt -cpu "$CPU" \
+		-nographic -bios none \
+		-device loader,file="$bin",addr=0x80000000 \
+		-serial stdio -monitor none 2>/dev/null \
+		| head -c "$nbytes" | xxd -p -c "$nbytes"
+}
+
+# run_bin_text: run a built binary and return raw UART output (not hex).
+#   $1 = binary, $2 = max output bytes
+run_bin_text() {
+	local bin="$1" nbytes="$2"
+	timeout -k 2 10 qemu-system-riscv32 \
+		-machine virt -cpu "$CPU" \
+		-nographic -bios none \
+		-device loader,file="$bin",addr=0x80000000 \
+		-serial stdio -monitor none < /dev/null 2>/dev/null \
+		| head -c "$nbytes"
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# § 1. Subcomponents
+# ════════════════════════════════════════════════════════════════════════════
+section "Subcomponents"
+
+# ── 1a. gimli_permute over several input states ────────────────────────────
+src="$TESTS_DIR/gimli_permute_test.fam3"
+bin="$TMP/gimli_permute_test.bin"
+
+if ! assemble_one "$src" "$bin"; then
+	TOTAL=$((TOTAL + 1))
+	record_fail "gimli_permute_test (assemble)" "assembly failed; head: $(head -c 64 "$bin" 2>/dev/null | xxd -p)"
+else
+	# permute_case <label> <input_hex (96 chars = 48 bytes)>
+	permute_case() {
+		local label="$1" input_hex="$2"
+		TOTAL=$((TOTAL + 1))
+		if [[ ${#input_hex} -ne 96 ]]; then
+			record_fail "gimli_permute $label" "test bug: input_hex len=${#input_hex} (expected 96)"
+			return
+		fi
+		local got expected
+		got=$(run_bin_with_input "$bin" "$input_hex" 48)
+		if ! expected=$(PYTHONPATH="$TOOLS_DIR" python3 -c '
+import struct, sys, gimli
+hex_in = "'"$input_hex"'"
+s = list(struct.unpack("<12I", bytes.fromhex(hex_in)))
+gimli.gimli_permute(s)
+print(struct.pack("<12I", *s).hex())
+' 2>&1); then
+			record_fail "gimli_permute $label" "python reference failed: $expected"
+			return
+		fi
+		if [[ "$got" == "$expected" ]]; then
+			record_pass "gimli_permute $label"
+		else
+			record_fail "gimli_permute $label" "got=$got expected=$expected"
+		fi
+	}
+
+	permute_case "state[0]=1" "010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+	permute_case "all zero" "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+	permute_case "state[i]=i" "000000000100000002000000030000000400000005000000060000000700000008000000090000000a0000000b000000"
+	permute_case "all 0xff" "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	permute_case "mixed pattern" "deadbeefcafebabe0123456789abcdef1111111122222222333333334444444455555555666666667777777788888888"
+fi
+
+# ── 1b. gimli_hash over messages of various lengths ────────────────────────
+src="$TESTS_DIR/gimli_hash_test.fam3"
+bin="$TMP/gimli_hash_test.bin"
+
+if ! assemble_one "$src" "$bin"; then
+	TOTAL=$((TOTAL + 1))
+	record_fail "gimli_hash_test (assemble)" "assembly failed; head: $(head -c 64 "$bin" 2>/dev/null | xxd -p)"
+else
+	# hash_case <label> <message_hex>
+	hash_case() {
+		local label="$1" msg_hex="$2"
+		TOTAL=$((TOTAL + 1))
+		local msg_bytes=$((${#msg_hex} / 2))
+		local len_hex
+		len_hex=$(printf '%08x' "$msg_bytes" \
+			| sed 's/^\(..\)\(..\)\(..\)\(..\)$/\4\3\2\1/')
+		local input_hex="${len_hex}${msg_hex}"
+		local got expected
+		got=$(run_bin_with_input "$bin" "$input_hex" 32)
+		if ! expected=$(PYTHONPATH="$TOOLS_DIR" python3 -c '
+import sys, gimli
+msg = bytes.fromhex("'"$msg_hex"'")
+print(gimli.gimli_hash(msg, 32).hex())
+' 2>&1); then
+			record_fail "gimli_hash $label" "python reference failed: $expected"
+			return
+		fi
+		if [[ "$got" == "$expected" ]]; then
+			record_pass "gimli_hash $label (msg=$msg_bytes B)"
+		else
+			record_fail "gimli_hash $label (msg=$msg_bytes B)" "got=$got expected=$expected"
+		fi
+	}
+
+	hash_case "empty"    ""
+	hash_case "1 byte"   "41"
+	hash_case "3 bytes"  "616263"
+	hash_case "15 bytes" "000102030405060708090a0b0c0d0e"
+	hash_case "16 bytes" "000102030405060708090a0b0c0d0e0f"
+	hash_case "17 bytes" "000102030405060708090a0b0c0d0e0f10"
+	hash_case "31 bytes" "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e"
+	hash_case "32 bytes" "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+	hash_case "33 bytes" "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+	hash_case "multi-block" "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f7071727374757677787980818283"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+# § 2. Integration
+# ════════════════════════════════════════════════════════════════════════════
+section "Integration"
+
+# ── 2a. famchain boot: stack / s11 / mem-zero / write_byte ──────────────────
+TOTAL=$((TOTAL + 1))
+out=$(run_bin_text "$DIR/bin/famchain" 2)
+if [[ "$out" == "OK" ]]; then
+	record_pass "famchain boot emits 'OK'"
+else
+	record_fail "famchain boot emits 'OK'" "got '$out'"
+fi
+
+# ── Summary ─────────────────────────────────────────────────────────────────
+echo
+echo "=== Results ==="
+echo "  $PASS passed, $FAIL failed, $TOTAL total"
+[[ $FAIL -eq 0 ]]

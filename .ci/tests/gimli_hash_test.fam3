@@ -1,0 +1,331 @@
+# gimli_hash_test.fam3
+#
+# Standalone test for Gimli-Hash (sponge mode over Gimli-384).
+#
+# Protocol (UART stdin → UART stdout):
+#   in:   <u32 LE length> <length bytes of message>
+#   out:  <32-byte hash>
+#
+# The driver (.ci/testnode) feeds arbitrary messages and compares the
+# 32-byte output to the Python reference (tools/gimli.py).
+
+.equ	UART_BASE,	0x10000000
+.equ	UART_LSR,	5
+.equ	UART_RX_READY,	0x01
+.equ	UART_TX_READY,	0x20
+.equ	SHUTDOWN_ADDR,	0x00100000
+.equ	SHUTDOWN_VAL,	0x5555
+.equ	MSG_BUF,	0x80200000	# dedicated input message buffer
+
+_start:
+	# Stack and state allocation.
+	li	sp, 0x80180000
+	addi	sp, sp, -48
+	mv	s0, sp			# s0 = state ptr
+
+	# Zero state[0..11].
+	sw	zero, 0(s0)
+	sw	zero, 4(s0)
+	sw	zero, 8(s0)
+	sw	zero, 12(s0)
+	sw	zero, 16(s0)
+	sw	zero, 20(s0)
+	sw	zero, 24(s0)
+	sw	zero, 28(s0)
+	sw	zero, 32(s0)
+	sw	zero, 36(s0)
+	sw	zero, 40(s0)
+	sw	zero, 44(s0)
+
+	# ── Read 4-byte LE length into s2 ──
+	li	s8, UART_BASE
+	li	s2, 0			# accumulator
+	li	t4, 0			# shift amount
+	li	t6, 4			# bytes remaining
+rlen_loop:
+rlen_wait:
+	lbu	t0, UART_LSR(s8)
+	andi	t0, t0, UART_RX_READY
+	beqz	t0, rlen_wait
+	lbu	t0, 0(s8)
+	sll	t0, t0, t4
+	or	s2, s2, t0
+	addi	t4, t4, 8
+	addi	t6, t6, -1
+	bnez	t6, rlen_loop
+
+	# ── Read s2 bytes from UART into MSG_BUF ──
+	li	s1, MSG_BUF		# s1 = msg base
+	mv	t0, s1			# t0 = write ptr
+	mv	t1, s2			# t1 = remaining
+	beqz	t1, read_done
+read_loop:
+read_wait:
+	lbu	t2, UART_LSR(s8)
+	andi	t2, t2, UART_RX_READY
+	beqz	t2, read_wait
+	lbu	t2, 0(s8)
+	sb	t2, 0(t0)
+	addi	t0, t0, 1
+	addi	t1, t1, -1
+	bnez	t1, read_loop
+read_done:
+
+	# ── Absorb full 16-byte blocks ──
+	mv	s3, s1			# s3 = read ptr
+	mv	s4, s2			# s4 = remaining bytes
+absorb_loop:
+	li	t0, 16
+	blt	s4, t0, absorb_final
+
+	# XOR 16 bytes at s3 into state[0..3].
+	lw	t0, 0(s3)
+	lw	t1, 0(s0)
+	xor	t1, t1, t0
+	sw	t1, 0(s0)
+	lw	t0, 4(s3)
+	lw	t1, 4(s0)
+	xor	t1, t1, t0
+	sw	t1, 4(s0)
+	lw	t0, 8(s3)
+	lw	t1, 8(s0)
+	xor	t1, t1, t0
+	sw	t1, 8(s0)
+	lw	t0, 12(s3)
+	lw	t1, 12(s0)
+	xor	t1, t1, t0
+	sw	t1, 12(s0)
+
+	# Permute.  gp = 0 → return to gpr_absorb_loop
+	mv	a0, s0
+	li	gp, 0
+	j	gimli_permute
+gpr_absorb_loop:
+
+	addi	s3, s3, 16
+	addi	s4, s4, -16
+	j	absorb_loop
+
+absorb_final:
+	# s4 = remaining bytes (0..15). Build a padded 16-byte block in a
+	# stack scratch buffer, then XOR into state[0..3] and permute.
+	addi	sp, sp, -16
+	mv	t0, sp			# scratch ptr
+
+	# Zero scratch.
+	sw	zero, 0(t0)
+	sw	zero, 4(t0)
+	sw	zero, 8(t0)
+	sw	zero, 12(t0)
+
+	# Copy remaining bytes from s3 into scratch.
+	mv	t1, s3			# src
+	mv	t2, t0			# dst
+	mv	t3, s4			# count
+	beqz	t3, copy_done
+copy_rem:
+	lbu	t4, 0(t1)
+	sb	t4, 0(t2)
+	addi	t1, t1, 1
+	addi	t2, t2, 1
+	addi	t3, t3, -1
+	bnez	t3, copy_rem
+copy_done:
+
+	# Set scratch[s4] ^= 0x01 (domain-separation byte).
+	add	t1, t0, s4
+	lbu	t2, 0(t1)
+	xori	t2, t2, 0x01
+	sb	t2, 0(t1)
+
+	# Set scratch[15] ^= 0x80 (final-block marker).
+	lbu	t2, 15(t0)
+	xori	t2, t2, 0x80
+	sb	t2, 15(t0)
+
+	# XOR scratch into state[0..3].
+	lw	t1, 0(t0)
+	lw	t2, 0(s0)
+	xor	t2, t2, t1
+	sw	t2, 0(s0)
+	lw	t1, 4(t0)
+	lw	t2, 4(s0)
+	xor	t2, t2, t1
+	sw	t2, 4(s0)
+	lw	t1, 8(t0)
+	lw	t2, 8(s0)
+	xor	t2, t2, t1
+	sw	t2, 8(s0)
+	lw	t1, 12(t0)
+	lw	t2, 12(s0)
+	xor	t2, t2, t1
+	sw	t2, 12(s0)
+
+	# Release scratch.
+	addi	sp, sp, 16
+
+	# Permute. gp = 1 → return to gpr_absorb_final
+	mv	a0, s0
+	li	gp, 1
+	j	gimli_permute
+gpr_absorb_final:
+
+	# ── Squeeze first 16 bytes (state[0..3]) ──
+	mv	t3, s0
+	li	t4, 16
+	li	t5, UART_BASE
+sq1_loop:
+	beqz	t4, sq_permute
+sq1_wait:
+	lbu	t0, UART_LSR(t5)
+	andi	t0, t0, UART_TX_READY
+	beqz	t0, sq1_wait
+	lbu	t0, 0(t3)
+	sb	t0, 0(t5)
+	addi	t3, t3, 1
+	addi	t4, t4, -1
+	j	sq1_loop
+
+sq_permute:
+	mv	a0, s0
+	li	gp, 2
+	j	gimli_permute
+gpr_sq:
+
+	# ── Squeeze second 16 bytes (state[0..3] after permute) ──
+	mv	t3, s0
+	li	t4, 16
+	li	t5, UART_BASE
+sq2_loop:
+	beqz	t4, done
+sq2_wait:
+	lbu	t0, UART_LSR(t5)
+	andi	t0, t0, UART_TX_READY
+	beqz	t0, sq2_wait
+	lbu	t0, 0(t3)
+	sb	t0, 0(t5)
+	addi	t3, t3, 1
+	addi	t4, t4, -1
+	j	sq2_loop
+
+done:
+	li	t0, SHUTDOWN_ADDR
+	li	t1, SHUTDOWN_VAL
+	sw	t1, 0(t0)
+hang:
+	wfi
+	j	hang
+
+# ══════════════════════════════════════════════════════════════════════════════
+# gimli_permute: 24-round Gimli-384 permutation (see gimli_permute_test.fam3).
+# ══════════════════════════════════════════════════════════════════════════════
+gimli_permute:
+	addi	sp, sp, -32
+	sw	s1, 0(sp)
+	sw	s2, 4(sp)
+	sw	s3, 8(sp)
+	sw	s4, 12(sp)
+	sw	s5, 16(sp)
+	sw	s6, 20(sp)
+
+	li	s1, 24
+
+gp_round:
+	li	s2, 0
+
+gp_col:
+	slli	s3, s2, 2
+	add	s3, s3, a0
+
+	lw	s4, 0(s3)
+	lw	s5, 16(s3)
+	lw	s6, 32(s3)
+
+	# x = rotl(s4, 24)
+	slli	t0, s4, 24
+	srli	t1, s4, 8
+	or	t0, t0, t1
+
+	# y = rotl(s5, 9)
+	slli	t1, s5, 9
+	srli	t2, s5, 23
+	or	t1, t1, t2
+
+	# state[col+8] = x ^ (z<<1) ^ ((y&z)<<2)
+	slli	t2, s6, 1
+	and	t3, t1, s6
+	slli	t3, t3, 2
+	xor	t2, t2, t0
+	xor	t2, t2, t3
+	sw	t2, 32(s3)
+
+	# state[col+4] = y ^ x ^ ((x|z)<<1)
+	or	t2, t0, s6
+	slli	t2, t2, 1
+	xor	t2, t2, t1
+	xor	t2, t2, t0
+	sw	t2, 16(s3)
+
+	# state[col] = z ^ y ^ ((x&y)<<3)
+	and	t2, t0, t1
+	slli	t2, t2, 3
+	xor	t2, t2, s6
+	xor	t2, t2, t1
+	sw	t2, 0(s3)
+
+	addi	s2, s2, 1
+	li	t0, 4
+	blt	s2, t0, gp_col
+
+	andi	t0, s1, 3
+	beqz	t0, gp_small_swap
+	li	t1, 2
+	beq	t0, t1, gp_big_swap
+	j	gp_round_end
+
+gp_small_swap:
+	lw	t0, 0(a0)
+	lw	t1, 4(a0)
+	sw	t1, 0(a0)
+	sw	t0, 4(a0)
+	lw	t0, 8(a0)
+	lw	t1, 12(a0)
+	sw	t1, 8(a0)
+	sw	t0, 12(a0)
+	li	t0, 0x9e377900
+	or	t0, t0, s1
+	lw	t1, 0(a0)
+	xor	t1, t1, t0
+	sw	t1, 0(a0)
+	j	gp_round_end
+
+gp_big_swap:
+	lw	t0, 0(a0)
+	lw	t1, 8(a0)
+	sw	t1, 0(a0)
+	sw	t0, 8(a0)
+	lw	t0, 4(a0)
+	lw	t1, 12(a0)
+	sw	t1, 4(a0)
+	sw	t0, 12(a0)
+
+gp_round_end:
+	addi	s1, s1, -1
+	bnez	s1, gp_round
+
+	lw	s1, 0(sp)
+	lw	s2, 4(sp)
+	lw	s3, 8(sp)
+	lw	s4, 12(sp)
+	lw	s5, 16(sp)
+	lw	s6, 20(sp)
+	addi	sp, sp, 32
+
+gimli_permute_disp:
+	beqz	gp, gpr_absorb_loop
+	li	t0, 1
+	beq	gp, t0, gpr_absorb_final
+	li	t0, 2
+	beq	gp, t0, gpr_sq
+hang_disp:
+	j	hang_disp
