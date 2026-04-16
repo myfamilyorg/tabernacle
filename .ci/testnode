@@ -282,15 +282,19 @@ else
 	if ! assemble_many "$test_famchain_net" "$test_config_net" "$SRC_DIR/famchain.fam3"; then
 		record_fail "$name" "famchain re-assembly failed"
 	else
+		# Kill any stale server on port 3737.
+		pkill -f "server.py.*3737" 2>/dev/null
+		sleep 0.2
+
 		# Start server in background.
 		PYTHONPATH="$TOOLS_DIR" python3 "$TOOLS_DIR/server.py" \
-			"$test_node_bin" --port 3737 &
+			"$test_node_bin" 3737 &
 		SERVER_PID=$!
-		sleep 0.3
+		sleep 0.5
 
 		# Run famchain: no disk, virtio-net only.
 		# Seed list "10.0.2.2:3737" via UART stdin.
-		got=$(printf '10.0.2.2:3737\004' | timeout -k 2 15 \
+		got=$(printf '10.0.2.2:3737\004' | timeout -k 2 30 \
 			qemu-system-riscv32 \
 			-machine virt -cpu "$CPU" \
 			-nographic -bios none \
