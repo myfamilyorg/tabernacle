@@ -61,7 +61,15 @@ write_done:
 	li	a0, 'W'
 	j	emit_halt
 
+loaded_from_disk:
+	li	a0, 'L'
+	j	emit_halt
+
 main:
+	# a1 = boot source: 0 = disk, 1 = network.
+	# If loaded from disk, skip the write (already there).
+	beqz	a1, loaded_from_disk
+
 	# s0 = base address of this binary in memory.
 	# _start is 4 bytes past the NOP magic that fam3 prepends.
 	lla	s0, _start
@@ -128,17 +136,22 @@ found_blk:
 
 	# Write loop state:
 	#   s0 = binary base, s1 = scratch base, s2 = disk MMIO base
-	#   s3 = source ptr, s4 = sector number, s5 = sectors left, s6 = avail idx
+	#   s3 = source ptr, s4 = sector number, s5 = bytes left, s6 = avail idx
 	mv	s3, s0
 	li	s4, 0
-	li	t0, BIN_SIZE
-	addi	t0, t0, 511
-	srli	s5, t0, 9		# ceil(BIN_SIZE / 512)
+	li	s5, BIN_SIZE
 	li	s6, 0
 
 write_loop:
 	beqz	s5, write_done
 
+	# Block size: min(65536, round_up(s5, 512)).
+	li	s7, 65536
+	bge	s5, s7, wr_go
+	addi	s7, s5, 511
+	li	t0, -512
+	and	s7, s7, t0		# round up to sector boundary
+wr_go:
 	# Request header: type=1 (write), sector=s4.
 	li	t0, S_HEADER
 	add	t0, s1, t0
@@ -167,11 +180,10 @@ write_loop:
 	sh	t3, 12(t2)
 	sh	t3, 14(t2)
 
-	# desc[1]: data (512 B, flags=NEXT, next=2) -- device reads from buf
+	# desc[1]: data (s7 bytes, flags=NEXT, next=2) -- device reads from buf
 	sw	s3, 16(t2)
 	sw	zero, 20(t2)
-	li	t3, SECTOR_SIZE
-	sw	t3, 24(t2)
+	sw	s7, 24(t2)
 	li	t3, 1
 	sh	t3, 28(t2)
 	li	t3, 2
@@ -206,9 +218,14 @@ wr_poll:
 
 	bnez	t5, write_err
 
-	# Next sector.
-	addi	s3, s3, SECTOR_SIZE
-	addi	s4, s4, 1
-	addi	s5, s5, -1
+	# Advance by block size.
+	add	s3, s3, s7		# advance source
+	srli	t0, s7, 9		# sectors written
+	add	s4, s4, t0		# advance sector
+	# Consume min(s7, s5) bytes.
+	bge	s5, s7, wr_full
+	mv	s7, s5
+wr_full:
+	sub	s5, s5, s7
 	addi	s6, s6, 1
 	j	write_loop

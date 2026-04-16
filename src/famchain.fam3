@@ -277,6 +277,7 @@ gh_ret_disk:
 	j	check_hash
 ch_ret_disk:
 	addi	sp, sp, 32
+	li	a1, 0			# a1=0: loaded from disk
 	beqz	a0, exec_binary
 
 no_disk:
@@ -717,6 +718,7 @@ gh_ret_net:
 	j	check_hash
 ch_ret_net:
 	addi	sp, sp, 32
+	li	a1, 1			# a1=1: loaded from network
 	beqz	a0, exec_binary
 
 	# Hash mismatch after download -- print 'H', try next host.
