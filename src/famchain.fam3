@@ -56,10 +56,8 @@
 # RISC-V memory-mapped timer (CLINT mtime). Plain lw, no CSR needed.
 # QEMU virt: 10 MHz. SiFive FE310: 32.768 kHz. Adjust per platform.
 .equ	MTIME_ADDR,		0x0200BFF8
-.equ	TIMEOUT_TICKS,		20000000	# 2 seconds at 10 MHz (initial wait)
-.equ	MIN_IDLE_TICKS,		500000		# 50 ms floor for idle timeout
-.equ	WINDOW_SIZE,		64		# chunks per REQ_RANGE
-.equ	MAX_IDLE_ROUNDS,	5		# retries with 0 new chunks before giving up
+.equ	TIMEOUT_TICKS,		50000000	# 5 s -- waiting for first response
+.equ	MAX_STALLS,		3		# zero-progress rounds before giving up
 
 # -- Memory layout (offsets from s11) -------------------------------------
 .equ	RX_QUEUE_OFFSET,	0
@@ -372,9 +370,34 @@ found_net:
 	addi	s4, t0, 1		# s4 = first host ptr
 	beqz	s5, all_hosts_failed
 
+	# Randomize starting host: offset = mtime % host_count.
+	li	t1, MTIME_ADDR
+	lw	t1, 0(t1)
+	andi	t1, t1, 0xFF		# low 8 bits
+host_mod:
+	blt	t1, s5, host_mod_done
+	sub	t1, t1, s5
+	j	host_mod
+host_mod_done:
+	# t1 = start index. Advance s4 by t1 * HOST_ENTRY_SZ.
+	li	t2, HOST_ENTRY_SZ
+host_advance:
+	beqz	t1, host_adv_done
+	add	s4, s4, t2
+	addi	t1, t1, -1
+	j	host_advance
+host_adv_done:
+	# Save list base and total count for wrap-around.
+	# s8 = list base ptr, s10 = total host count
+	li	t0, SEED_LIST_OFFSET
+	add	t0, s11, t0
+	addi	s8, t0, 1		# s8 = list base (first entry)
+	mv	s10, s5			# s10 = total host count
+
 	# s0 = net base (preserved)
 	# s1 = last_used_idx
 	# s3 = chunks_received
+	# s5 = hosts remaining to try
 	li	s1, 0
 	li	s3, 0
 
@@ -405,128 +428,58 @@ div_nc:
 div_nc_done:
 	addi	sp, sp, -8
 	sw	t2, 0(sp)		# [sp+0] = NUM_CHUNKS
-	li	t0, MAX_IDLE_ROUNDS
-	sw	t0, 4(sp)		# [sp+4] = idle rounds remaining
+	li	t0, MAX_STALLS
+	sw	t0, 4(sp)		# [sp+4] = stall counter
 
-	# -- Initial bulk request: ask for all chunks at once --
-	li	a0, 0			# start = 0
+	# -- Request/receive loop --
+	# Strategy: request ALL chunks, receive what we can, repeat.
+	# Bitmap deduplicates. Idle timeout (3×RTT) detects burst end.
+	# TIMEOUT_TICKS is the hard give-up on this host.
+	li	s6, MTIME_ADDR
+
+send_all:
+	# Request all chunks from current host.
+	li	a0, 0
 	lw	a1, 0(sp)
-	addi	a1, a1, -1		# end = LAST_CHUNK
+	addi	a1, a1, -1		# LAST_CHUNK
 	mv	a2, s4			# host ptr
 	li	gp, 0
 	j	send_req_range
 srr_ret_try:
-	li	s6, MTIME_ADDR
-	li	s8, 0			# initial blast mode
-	j	poll_start
 
-	# -- Retry pass: scan bitmap, send ALL gap requests, then poll --
-retry_pass:
-	li	s6, MTIME_ADDR
-	li	s7, 0			# scan cursor
-	mv	s10, s3			# snapshot chunks_received
-
-	# Send re-requests for all gaps in one burst.
-scan_bitmap:
-	lw	t2, 0(sp)		# NUM_CHUNKS
-	bge	s7, t2, gaps_sent
-
-	# Find start of a gap.
-	srli	t0, s7, 5
-	slli	t0, t0, 2
-	add	t0, s2, t0
-	lw	t1, 0(t0)
-	andi	t3, s7, 31
-	li	t4, 1
-	sll	t4, t4, t3
-	and	t4, t1, t4
-	bnez	t4, scan_next		# have this chunk
-	# s7 is missing. Find end of gap.
-	mv	s9, s7
-find_gap_end:
-	addi	s9, s9, 1
-	lw	t2, 0(sp)
-	bge	s9, t2, gap_found
-	srli	t0, s9, 5
-	slli	t0, t0, 2
-	add	t0, s2, t0
-	lw	t1, 0(t0)
-	andi	t3, s9, 31
-	li	t4, 1
-	sll	t4, t4, t3
-	and	t4, t1, t4
-	beqz	t4, find_gap_end
-gap_found:
-	# Request gap_start(s7) .. gap_end-1(s9-1).
-	mv	a0, s7
-	addi	a1, s9, -1
-	mv	a2, s4			# host ptr
-	li	gp, 2
-	j	send_req_range
-srr_ret_gap:
-	mv	s7, s9			# continue scanning after gap
-	j	scan_bitmap
-
-scan_next:
-	addi	s7, s7, 1
-	j	scan_bitmap
-
-gaps_sent:
-	# All gap requests sent. Set retry flag, poll.
-	li	s8, 1			# retry mode (s10 = snapshot)
-	j	poll_start
-
-no_progress:
-	# No progress. Decrement idle counter.
-	lw	t0, 4(sp)
-	addi	t0, t0, -1
-	sw	t0, 4(sp)
-	bnez	t0, retry_pass
-
-	# Exhausted retries -- print 'T' + chunk count, try next host.
-	li	t0, UART_BASE
-to_t_wait:
-	lbu	t1, UART_LSR(t0)
-	andi	t1, t1, UART_TX_READY
-	beqz	t1, to_t_wait
-	li	t2, 'T'
-	sb	t2, 0(t0)
-	j	print_count_fail
-
-all_received:
-	addi	sp, sp, 8
-	j	do_hash_verify
-
-	# -- Single poll loop --
-	# s8: 0 = initial blast, nonzero = retry
-	# s7: 0 = no data yet (use TIMEOUT_TICKS), >0 = measured idle timeout (3×RTT)
-poll_start:
+	# Set up poll state.
 	li	t0, RX_QUEUE_OFFSET
 	add	t3, s11, t0
 	li	t0, 4096
-	add	t4, t3, t0
+	add	t4, t3, t0		# used ring base
 	lw	s9, 0(s6)		# timeout snapshot / send time
 	li	s7, 0			# no RTT measured yet
+	mv	s10, s3			# snapshot chunks at start of round
+
 poll_loop:
 	.word	0x0220000F
 	lhu	t5, 2(t4)		# used.idx
 	bne	t5, s1, got_packet
 	lw	t6, 0(s6)
 	sub	t6, t6, s9
-	# Use measured idle timeout if we have RTT, else initial timeout.
-	bnez	s7, poll_idle
+	# Idle timeout: 3×RTT if measured, else TIMEOUT_TICKS.
+	bnez	s7, poll_use_rtt
 	li	t0, TIMEOUT_TICKS
 	j	poll_check
-poll_idle:
-	mv	t0, s7			# s7 = 3 × RTT
+poll_use_rtt:
+	mv	t0, s7
 poll_check:
 	bltu	t6, t0, poll_loop
-	# Timed out. Check if complete.
+
+	# -- Timed out --
+	# Complete?
 	lw	t2, 0(sp)
 	beq	s3, t2, all_received
-	# Retry or initial?
-	bnez	s8, retry_timeout
-	# Initial blast timed out. Print 'R' + count, go to retry.
+	# Got any new data this round?
+	beq	s3, s10, stall_round
+	# Yes -- print 'R' + count, reset stall counter, re-request.
+	li	t0, MAX_STALLS
+	sw	t0, 4(sp)		# reset stall counter
 	li	t0, UART_BASE
 rp_wait:
 	lbu	t1, UART_LSR(t0)
@@ -534,23 +487,34 @@ rp_wait:
 	beqz	t1, rp_wait
 	li	t2, 'R'
 	sb	t2, 0(t0)
-	j	print_count_retry
+	j	print_count_and_retry
 
-retry_timeout:
-	# Did we make progress? Compare s3 to s10 (snapshot).
-	beq	s3, s10, no_progress
-	# Got new chunks -- print R+count, reset idle counter, retry.
+stall_round:
+	# Never got any data from this host? Fail immediately.
+	beqz	s3, host_failed
+	# Got data before but stalled. Decrement stall counter.
+	lw	t0, 4(sp)
+	addi	t0, t0, -1
+	sw	t0, 4(sp)
+	bnez	t0, send_all		# retry silently
+
+host_failed:
+	# Exhausted stall retries. Print 'T' + count.
 	li	t0, UART_BASE
-rr_wait:
+to_t_wait:
 	lbu	t1, UART_LSR(t0)
 	andi	t1, t1, UART_TX_READY
-	beqz	t1, rr_wait
-	li	t2, 'R'
+	beqz	t1, to_t_wait
+	li	t2, 'T'
 	sb	t2, 0(t0)
-	j	print_count_retry
+	j	print_count_and_fail
 
-	# -- Print s3 as hex4 then go to retry_pass --
-print_count_retry:
+all_received:
+	addi	sp, sp, 8
+	j	do_hash_verify
+
+	# -- Print s3 as hex4 then re-request everything --
+print_count_and_retry:
 	li	t0, UART_BASE
 	slli	t3, s3, 16
 	li	t4, 4
@@ -572,12 +536,10 @@ pr_wait:
 	sb	t5, 0(t0)
 	addi	t4, t4, -1
 	bnez	t4, pr_hex
-	li	t0, MAX_IDLE_ROUNDS
-	sw	t0, 4(sp)
-	j	retry_pass
+	j	send_all
 
-	# -- Print s3 as hex4 then fail to next host --
-print_count_fail:
+	# -- Print s3 as hex4 then try next host --
+print_count_and_fail:
 	li	t0, UART_BASE
 	slli	t3, s3, 16
 	li	t4, 4
@@ -600,9 +562,7 @@ pf_wait:
 	addi	t4, t4, -1
 	bnez	t4, pf_hex
 	addi	sp, sp, 8
-	addi	s4, s4, HOST_ENTRY_SZ
-	addi	s5, s5, -1
-	j	try_next_host
+	j	advance_host
 
 got_packet:
 	# Check ARP (ethertype 08:06 at t3+536, opcode 00:01 at t3+544)
@@ -730,10 +690,9 @@ chunk_copy_done:
 	sub	t0, t6, s9		# t0 = RTT sample
 	add	s7, t0, t0		# s7 = 2 × RTT
 	add	s7, s7, t0		# s7 = 3 × RTT
-	# Floor: at least MIN_IDLE_TICKS.
-	li	t0, MIN_IDLE_TICKS
-	bge	s7, t0, rtt_done
-	mv	s7, t0
+	# Guard: if RTT was 0 (localhost), use 1 tick so s7 is nonzero.
+	bnez	s7, rtt_done
+	li	s7, 1
 rtt_done:
 	mv	s9, t6			# reset timeout snapshot
 
@@ -766,9 +725,7 @@ hm_wait:
 	beqz	t1, hm_wait
 	li	t2, 'H'
 	sb	t2, 0(t0)
-	addi	s4, s4, HOST_ENTRY_SZ
-	addi	s5, s5, -1
-	j	try_next_host
+	j	advance_host
 
 repost_rx:
 	# Advance last_used_idx, re-post RX descriptor, kick.
@@ -792,6 +749,24 @@ exec_binary:
 	# THE ONE INDIRECT JUMP -- jalr x0, 0(t0)  =  0x00028067
 	# ===============================================================
 	.word	0x00028067
+
+	# -- Advance to next host with wrap-around --
+advance_host:
+	addi	s5, s5, -1
+	addi	s4, s4, HOST_ENTRY_SZ
+	# Wrap: if s4 >= s8 + s10 * HOST_ENTRY_SZ, reset to s8.
+	mv	t0, s10
+	mv	t1, s8
+ah_end:
+	beqz	t0, ah_check
+	addi	t1, t1, HOST_ENTRY_SZ
+	addi	t0, t0, -1
+	j	ah_end
+ah_check:
+	# t1 = s8 + s10 * HOST_ENTRY_SZ = one past last entry
+	blt	s4, t1, try_next_host
+	mv	s4, s8			# wrap to start
+	j	try_next_host
 
 all_hosts_failed:
 	li	a0, 'F'
@@ -1180,8 +1155,6 @@ tk_ret_req:
 	addi	sp, sp, 20
 send_req_range_disp:
 	beqz	gp, srr_ret_try
-	li	t0, 2
-	beq	gp, t0, srr_ret_gap
 	j	dispatch_error
 
 # ==========================================================================
