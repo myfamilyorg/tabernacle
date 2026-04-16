@@ -4,11 +4,11 @@
 #
 # Stages:
 #   fam0 → fam1 → fam2 → fam3 → famc    (compiler toolchain)
-#   famchain                             (node loader, assembled by fam3)
+#   tabernacle                             (node loader, assembled by fam3)
 #
 # Usage: run <assembler> <source...>
 # Multiple source files are concatenated before piping to the assembler.
-# This is how famchain gets bin_config.inc in scope without .include.
+# This is how tabernacle gets bin_config.inc in scope without .include.
 set -e
 
 CPU="rv32,m=false,a=false,f=false,d=false,c=false,\
@@ -31,6 +31,6 @@ run bin/fam0 src/fam1.fam0 > bin/fam1
 run bin/fam1 src/fam2.fam1 > bin/fam2
 run bin/fam2 src/fam3.fam2 > bin/fam3
 run bin/fam3 src/famc.fam3 > bin/famc
-run bin/fam3 src/bin_config.inc src/famchain.fam3 > bin/famchain
+run bin/fam3 src/bin_config.inc src/tabernacle.fam3 > bin/tabernacle
 
 echo "Success!"

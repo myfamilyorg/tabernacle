@@ -2,7 +2,7 @@
 """Generate bin_config.inc from a binary file.
 
 Hashes the target binary with Gimli-Hash (see tools/gimli.py) and emits
-the hash + size as fam3 `.equ` directives that famchain.fam3 includes
+the hash + size as fam3 `.equ` directives that tabernacle.fam3 includes
 (via a build-time concatenation, since fam3 has no .include).
 
 Usage: python3 tools/gen_bin_config.py <binary> [output_dir]

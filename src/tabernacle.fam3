@@ -1,4 +1,4 @@
-# famchain.fam3 -- node bootstrap loader
+# tabernacle.fam3 -- node bootstrap loader
 #
 # BIN_SIZE and BIN_HASH0..7 are defined in src/bin_config.inc and
 # concatenated onto the front of this file by build.sh.

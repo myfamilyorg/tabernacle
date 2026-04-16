@@ -1,4 +1,4 @@
-# test_node.fam3 — minimal payload for famchain disk-path testing.
+# test_node.fam3 — minimal payload for tabernacle disk-path testing.
 # Prints 'L' (= "Loaded successfully") to UART and halts.
 # Position-independent: uses only absolute MMIO addresses.
 

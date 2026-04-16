@@ -1,7 +1,7 @@
 #!/bin/sh
-# Build famchain from src/bin_config.inc + src/famchain.fam3.
+# Build tabernacle from src/bin_config.inc + src/tabernacle.fam3.
 # Usage: tools/build_node [output]
-# If output is omitted, writes to bin/famchain.
+# If output is omitted, writes to bin/tabernacle.
 
 SELF="$0"
 [ -L "$SELF" ] && SELF="$(readlink -f "$SELF")"
@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 ASM="$ROOT_DIR/bin/fam3"
 CONFIG="$ROOT_DIR/src/bin_config.inc"
-SRC="$ROOT_DIR/src/famchain.fam3"
+SRC="$ROOT_DIR/src/tabernacle.fam3"
 
 if [ ! -e "$ASM" ]; then
 	echo "Error: $ASM not found — run build.sh first"
@@ -35,7 +35,7 @@ fi
 if [ -n "$1" ]; then
 	OUT="$1"
 else
-	OUT="$ROOT_DIR/bin/famchain"
+	OUT="$ROOT_DIR/bin/tabernacle"
 fi
 
 (cat "$CONFIG" "$SRC"; printf '\004') | qemu-system-riscv32 \

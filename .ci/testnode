@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# End-to-end test harness for the tabernacle node (famchain loader).
+# End-to-end test harness for the tabernacle node (tabernacle loader).
 #
 # This script covers node-side concerns at every level of the stack:
 #
 #   § 1. Subcomponents   — gimli_permute, gimli_hash (reference cross-check)
-#   § 2. Integration     — famchain skeleton, disk path, network path, jalr
+#   § 2. Integration     — tabernacle skeleton, disk path, network path, jalr
 #
 # Each subcomponent test is a self-contained fam3 source under .ci/tests/
 # that reads some bytes from UART, emits a result over UART, and powers
 # off. The harness assembles it with bin/fam3, runs it under QEMU, and
 # compares the output to a reference value computed via tools/gimli.py.
 #
-# Integration tests build famchain against specific bin_config.inc values
-# and run it with a virtio-blk disk backing. Passing means famchain
+# Integration tests build tabernacle against specific bin_config.inc values
+# and run it with a virtio-blk disk backing. Passing means tabernacle
 # successfully hashed + transferred control to the disk payload, and the
 # payload emitted its expected marker byte.
 #
@@ -44,8 +44,8 @@ if [[ ! -e "$FAM3_BIN" ]]; then
 	echo "error: $FAM3_BIN not found — run build.sh first" >&2
 	exit 2
 fi
-if [[ ! -e "$DIR/bin/famchain" ]]; then
-	echo "error: $DIR/bin/famchain not found — run build.sh first" >&2
+if [[ ! -e "$DIR/bin/tabernacle" ]]; then
+	echo "error: $DIR/bin/tabernacle not found — run build.sh first" >&2
 	exit 2
 fi
 
@@ -216,16 +216,16 @@ fi
 # ════════════════════════════════════════════════════════════════════════════
 section "Integration"
 
-# ── 2a. famchain disk path: load, hash-verify, jump ─────────────────────────
-# Build a tiny test node binary, compute its gimli hash, rebuild famchain
-# with those constants, run famchain with the test node as a virtio-blk
-# disk, and verify famchain's UART output is 'L' (the test node's marker).
+# ── 2a. tabernacle disk path: load, hash-verify, jump ─────────────────────────
+# Build a tiny test node binary, compute its gimli hash, rebuild tabernacle
+# with those constants, run tabernacle with the test node as a virtio-blk
+# disk, and verify tabernacle's UART output is 'L' (the test node's marker).
 TOTAL=$((TOTAL + 1))
-name="famchain disk: load + hash + jump"
+name="tabernacle disk: load + hash + jump"
 test_node_src="$TESTS_DIR/test_node.fam3"
 test_node_bin="$TMP/test_node.bin"
 test_config="$TMP/bin_config.inc"
-test_famchain="$TMP/famchain.bin"
+test_tabernacle="$TMP/tabernacle.bin"
 
 # Step 1: build the test node binary.
 if ! assemble_one "$test_node_src" "$test_node_bin"; then
@@ -235,17 +235,17 @@ else
 	PYTHONPATH="$TOOLS_DIR" python3 "$TOOLS_DIR/gen_bin_config.py" \
 		"$test_node_bin" "$TMP" 2>/dev/null
 
-	# Step 3: rebuild famchain with test config.
-	if ! assemble_many "$test_famchain" "$test_config" "$SRC_DIR/famchain.fam3"; then
-		record_fail "$name" "famchain re-assembly failed"
+	# Step 3: rebuild tabernacle with test config.
+	if ! assemble_many "$test_tabernacle" "$test_config" "$SRC_DIR/tabernacle.fam3"; then
+		record_fail "$name" "tabernacle re-assembly failed"
 	else
-		# Step 4: run famchain with test node as virtio-blk disk.
+		# Step 4: run tabernacle with test node as virtio-blk disk.
 		# Feed EOT (0x04) as UART input so the seed-list parser completes
 		# immediately. The disk path runs after.
 		got=$(printf '\004' | timeout -k 2 10 qemu-system-riscv32 \
 			-machine virt -cpu "$CPU" \
 			-nographic -bios none \
-			-device loader,file="$test_famchain",addr=0x80000000 \
+			-device loader,file="$test_tabernacle",addr=0x80000000 \
 			-global virtio-mmio.force-legacy=true \
 			-drive file="$test_node_bin",format=raw,if=none,id=d0 \
 			-device virtio-blk-device,drive=d0 \
@@ -259,16 +259,16 @@ else
 	fi
 fi
 
-# -- 2b. famchain network path: download + hash + jump -----------------------
-# No disk device provided -> famchain falls through to network path.
-# server.py serves the test node binary over UDP.  famchain downloads it,
+# -- 2b. tabernacle network path: download + hash + jump -----------------------
+# No disk device provided -> tabernacle falls through to network path.
+# server.py serves the test node binary over UDP.  tabernacle downloads it,
 # hash-verifies, and jumps to it.  The test node prints 'L'.
 TOTAL=$((TOTAL + 1))
-name="famchain net: download + hash + jump"
+name="tabernacle net: download + hash + jump"
 test_node_src="$TESTS_DIR/test_node.fam3"
 test_node_bin="$TMP/test_node_net.bin"
 test_config_net="$TMP/bin_config_net.inc"
-test_famchain_net="$TMP/famchain_net.bin"
+test_tabernacle_net="$TMP/tabernacle_net.bin"
 
 if ! assemble_one "$test_node_src" "$test_node_bin"; then
 	record_fail "$name" "test_node assembly failed"
@@ -278,9 +278,9 @@ else
 		"$test_node_bin" "$TMP" 2>/dev/null
 	mv "$TMP/bin_config.inc" "$test_config_net"
 
-	# Rebuild famchain.
-	if ! assemble_many "$test_famchain_net" "$test_config_net" "$SRC_DIR/famchain.fam3"; then
-		record_fail "$name" "famchain re-assembly failed"
+	# Rebuild tabernacle.
+	if ! assemble_many "$test_tabernacle_net" "$test_config_net" "$SRC_DIR/tabernacle.fam3"; then
+		record_fail "$name" "tabernacle re-assembly failed"
 	else
 		# Kill any stale server on port 3737.
 		pkill -f "server.py.*3737" 2>/dev/null
@@ -292,13 +292,13 @@ else
 		SERVER_PID=$!
 		sleep 0.5
 
-		# Run famchain: no disk, virtio-net only.
+		# Run tabernacle: no disk, virtio-net only.
 		# Seed list "10.0.2.2:3737" via UART stdin.
 		got=$(printf '10.0.2.2:3737\004' | timeout -k 2 30 \
 			qemu-system-riscv32 \
 			-machine virt -cpu "$CPU" \
 			-nographic -bios none \
-			-device loader,file="$test_famchain_net",addr=0x80000000 \
+			-device loader,file="$test_tabernacle_net",addr=0x80000000 \
 			-global virtio-mmio.force-legacy=true \
 			-netdev user,id=n0 \
 			-device virtio-net-device,netdev=n0 \
