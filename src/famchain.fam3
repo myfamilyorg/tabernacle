@@ -440,8 +440,6 @@ div_nc_done:
 	li	s6, MTIME_ADDR
 	li	s7, 0			# cursor
 	lw	s10, 0(s6)		# last_progress_time
-	mv	ra, s3			# prev_chunks (for R print)
-
 	# Set up RX queue pointers (persist across loop).
 	li	t0, RX_QUEUE_OFFSET
 	add	t3, s11, t0
@@ -474,17 +472,7 @@ scan_wrap:
 	sub	t6, t6, s10
 	li	t0, TIMEOUT_TICKS
 	bge	t6, t0, host_failed
-	# Print R + count if we made progress since last print.
-	beq	s3, ra, no_print
-	li	t0, UART_BASE
-rp_wait:
-	lbu	t1, UART_LSR(t0)
-	andi	t1, t1, UART_TX_READY
-	beqz	t1, rp_wait
-	li	t2, 'R'
-	sb	t2, 0(t0)
-	j	print_count_and_continue
-no_print:
+	# Wrap cursor and continue.
 	li	s7, 0
 	j	slide_loop
 
@@ -526,76 +514,12 @@ poll_loop:
 	j	slide_loop
 
 host_failed:
-	li	t0, UART_BASE
-to_t_wait:
-	lbu	t1, UART_LSR(t0)
-	andi	t1, t1, UART_TX_READY
-	beqz	t1, to_t_wait
-	li	t2, 'T'
-	sb	t2, 0(t0)
-	j	print_count_and_fail
+	addi	sp, sp, 4
+	j	advance_host
 
 all_received:
 	addi	sp, sp, 4
 	j	do_hash_verify
-
-	# -- Print s3 as hex4 then continue sliding --
-print_count_and_continue:
-	li	t0, UART_BASE
-	slli	t3, s3, 16
-	li	t4, 4
-pc_hex:
-	srli	t5, t3, 28
-	andi	t5, t5, 0xF
-	slli	t3, t3, 4
-	li	t6, 10
-	blt	t5, t6, pc_dec
-	addi	t5, t5, 55
-	j	pc_put
-pc_dec:
-	addi	t5, t5, 48
-pc_put:
-pc_wait:
-	lbu	t1, UART_LSR(t0)
-	andi	t1, t1, UART_TX_READY
-	beqz	t1, pc_wait
-	sb	t5, 0(t0)
-	addi	t4, t4, -1
-	bnez	t4, pc_hex
-	mv	ra, s3			# update prev_chunks
-	li	s7, 0			# wrap cursor
-	# Restore t3/t4 (clobbered by print).
-	li	t0, RX_QUEUE_OFFSET
-	add	t3, s11, t0
-	li	t0, 4096
-	add	t4, t3, t0
-	j	slide_loop
-
-	# -- Print s3 as hex4 then try next host --
-print_count_and_fail:
-	li	t0, UART_BASE
-	slli	t3, s3, 16
-	li	t4, 4
-pf_hex:
-	srli	t5, t3, 28
-	andi	t5, t5, 0xF
-	slli	t3, t3, 4
-	li	t6, 10
-	blt	t5, t6, pf_dec
-	addi	t5, t5, 55
-	j	pf_put
-pf_dec:
-	addi	t5, t5, 48
-pf_put:
-pf_wait:
-	lbu	t1, UART_LSR(t0)
-	andi	t1, t1, UART_TX_READY
-	beqz	t1, pf_wait
-	sb	t5, 0(t0)
-	addi	t4, t4, -1
-	bnez	t4, pf_hex
-	addi	sp, sp, 4
-	j	advance_host
 
 got_packet:
 	# Check ARP (ethertype 08:06 at t3+536, opcode 00:01 at t3+544)
@@ -741,14 +665,7 @@ ch_ret_net:
 	li	a1, 1			# a1=1: loaded from network
 	beqz	a0, exec_binary
 
-	# Hash mismatch after download -- print 'H', try next host.
-	li	t0, UART_BASE
-hm_wait:
-	lbu	t1, UART_LSR(t0)
-	andi	t1, t1, UART_TX_READY
-	beqz	t1, hm_wait
-	li	t2, 'H'
-	sb	t2, 0(t0)
+	# Hash mismatch after download -- try next host.
 	j	advance_host
 
 repost_rx:
