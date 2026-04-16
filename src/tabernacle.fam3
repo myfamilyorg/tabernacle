@@ -69,14 +69,18 @@
 .equ	VIRT_DESC_OFFSET,	20480
 .equ	VIRT_DISK_STATUS,	25088
 .equ	VIRT_DISK_HEADER,	25090
-.equ	LOAD_LOC,		25108
+.equ	DATA_REGION_SIZE,		25108
 .equ	STACK_OFFSET,		0x400000
 
 # ==========================================================================
 #  Entry point
 # ==========================================================================
 _start:
+	# s11 = data region base, past the binary load area.
+	# Binary loads at data: label (accessed via lla/j data).
 	lla	s11, data
+	li	t0, BIN_SIZE
+	add	s11, s11, t0
 	li	t0, 4095
 	add	s11, s11, t0
 	li	t0, -4096
@@ -84,9 +88,9 @@ _start:
 	li	t0, STACK_OFFSET
 	add	sp, s11, t0
 
-	# Zero s11..s11+LOAD_LOC.
+	# Zero s11..s11+DATA_REGION_SIZE.
 	mv	t0, s11
-	li	t1, LOAD_LOC
+	li	t1, DATA_REGION_SIZE
 	add	t1, s11, t1
 mem_zero:
 	sw	zero, 0(t0)
@@ -223,11 +227,10 @@ found_disk:
 	ori	t1, t1, 4
 	sw	t1, VIO_STATUS(s0)
 
-	# -- Read binary from disk (4 KB blocks, direct to LOAD_LOC) --
+	# -- Read binary from disk (64 KB blocks, direct to data) --
 	addi	sp, sp, -4
 	sw	s0, 0(sp)		# stash disk base
-	li	s0, LOAD_LOC
-	add	s0, s0, s11		# dest ptr
+	lla	s0, data		# dest ptr
 	li	s1, BIN_SIZE		# bytes remaining
 	li	s2, 0			# sector number
 	li	s6, 0			# avail idx
@@ -267,8 +270,7 @@ read_done:
 
 	# Hash the loaded binary.
 	addi	sp, sp, -32
-	li	a0, LOAD_LOC
-	add	a0, a0, s11
+	lla	a0, data
 	li	a1, BIN_SIZE
 	mv	a2, sp
 	li	gp, 0
@@ -599,7 +601,7 @@ not_arp:
 	and	t5, a6, t6
 	bnez	t5, repost_rx		# already received
 
-	# Compute dst = LOAD_LOC + seq * CHUNK_SIZE.
+	# Compute dst = data + seq * CHUNK_SIZE.
 	# CHUNK_SIZE=1400 = 1024+256+128-8 = (seq<<10)+(seq<<8)+(seq<<7)-(seq<<3)
 	slli	a4, t0, 10
 	slli	a5, t0, 8
@@ -608,8 +610,7 @@ not_arp:
 	add	a4, a4, a5
 	slli	a5, t0, 3
 	sub	a4, a4, a5		# a4 = seq * 1400
-	li	a5, LOAD_LOC
-	add	a5, a5, s11
+	lla	a5, data
 	add	a5, a5, a4		# a5 = dst
 
 	# Data length = UDP_length - 15 (8 UDP hdr + 7 FAMC hdr).
@@ -664,8 +665,7 @@ chunk_copy_done:
 	# -- Hash verify after all chunks received --
 do_hash_verify:
 	addi	sp, sp, -32
-	li	a0, LOAD_LOC
-	add	a0, a0, s11
+	lla	a0, data
 	li	a1, BIN_SIZE
 	mv	a2, sp
 	li	gp, 1
@@ -698,12 +698,7 @@ repost_rx:
 exec_binary:
 	li	a0, SEED_LIST_OFFSET
 	add	a0, a0, s11
-	li	t0, LOAD_LOC
-	add	t0, t0, s11
-	# ===============================================================
-	# THE ONE INDIRECT JUMP -- jalr x0, 0(t0)  =  0x00028067
-	# ===============================================================
-	.word	0x00028067
+	j	data
 
 	# -- Advance to next host with wrap-around --
 advance_host:
