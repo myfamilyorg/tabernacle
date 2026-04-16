@@ -1,25 +1,39 @@
 #!/bin/sh
+# Run an RV32I binary in QEMU virt.
+#
+# Usage: q32 [options] <binary>
+#   --cpu=CPU     CPU model (default: rv32i strict)
+#   --net         Enable virtio-net (user-mode NAT)
+#   --disk=FILE   Attach FILE as virtio-blk disk
+#
+# Examples:
+#   q32 program.bin
+#   q32 --net bin/famchain
+#   q32 --net --disk=node.bin bin/famchain
+#   printf '10.0.2.2:3737\004' | q32 --net bin/famchain
 
-SMP=1
 CPU="rv32,m=false,a=false,f=false,d=false,c=false,\
 zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\
 zcd=false,zcf=false,zcmp=false,zcmt=false,zicsr=false,zifencei=false"
 FILE=""
+NET=0
+DISK=""
 
 for arg in "$@"; do
 	case "$arg" in
 		--cpu=*) CPU="${arg#--cpu=}" ;;
-		--*) echo "Unknown option: $arg"; echo "Usage: $0 [--cpu=CPU] <path/to/bin>"; exit 1 ;;
+		--net) NET=1 ;;
+		--disk=*) DISK="${arg#--disk=}" ;;
+		--help|-h)
+			echo "Usage: $0 [--cpu=CPU] [--net] [--disk=FILE] <binary>"
+			exit 0 ;;
+		--*) echo "Unknown option: $arg"; exit 1 ;;
 		*) FILE="$arg" ;;
 	esac
 done
 
 if [ -z "$FILE" ]; then
-	echo "Usage: $0 [--cpu=CPU] <path/to/bin>"
-	echo "Examples:"
-	echo "  $0 program.bin                              # rv32i (default)"
-	echo "  $0 --cpu=rv32i,zicsr=true program.bin       # + CSR support"
-	echo "  $0 --cpu=rv32i,zicsr=true,m=true program.bin  # + M extension"
+	echo "Usage: $0 [--cpu=CPU] [--net] [--disk=FILE] <binary>"
 	exit 1
 fi
 
@@ -34,12 +48,25 @@ if [ "$MAGIC" != "13000000" ]; then
 	exit 1
 fi
 
-qemu-system-riscv32 \
-	-machine virt \
-	-cpu "$CPU" \
-	-smp $SMP \
-	-nographic \
-	-bios none \
-	-device loader,file="$FILE",addr=0x80000000 \
-	-serial stdio \
-	-monitor none 2>/dev/null
+# Build QEMU arguments
+ARGS="-machine virt -cpu $CPU -nographic -bios none"
+ARGS="$ARGS -device loader,file=$FILE,addr=0x80000000"
+ARGS="$ARGS -serial stdio -monitor none"
+
+if [ "$NET" = "1" ]; then
+	ARGS="$ARGS -global virtio-mmio.force-legacy=true"
+	ARGS="$ARGS -netdev user,id=n0"
+	ARGS="$ARGS -device virtio-net-device,netdev=n0"
+fi
+
+if [ -n "$DISK" ]; then
+	if [ ! -e "$DISK" ]; then
+		echo "Error: disk image $DISK not found"
+		exit 1
+	fi
+	ARGS="$ARGS -global virtio-mmio.force-legacy=true"
+	ARGS="$ARGS -drive file=$DISK,format=raw,if=none,id=d0"
+	ARGS="$ARGS -device virtio-blk-device,drive=d0"
+fi
+
+qemu-system-riscv32 $ARGS 2>/dev/null

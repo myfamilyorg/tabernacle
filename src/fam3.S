@@ -45,7 +45,7 @@
 #
 # Pseudos:
 #   nop li mv j beqz bnez neg not
-#   seqz snez sltz sgtz bltz bgez
+#   seqz snez sltz sgtz bltz bgez blez
 #   bgt ble bgtu bleu
 #   lla wfi
 #   prologue epilogue
@@ -135,7 +135,7 @@
 #   34=ps_seqz, 35=ps_snez, 36=ps_sltz, 37=ps_sgtz,
 #   38=ps_bgt, 39=ps_ble, 40=ps_bgtu, 41=ps_bleu,
 #   42=ps_prologue, 43=ps_epilogue, 44=ps_return,
-#   46=ps_bltz, 47=ps_bgez, 48=ps_wfi
+#   46=ps_bltz, 47=ps_bgez, 48=ps_wfi, 49=ps_blez
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Entry point — jump over embedded data tables
@@ -292,6 +292,8 @@ mnem_table:
 .byte 46, 0, 0, 0
 .ascii "bgez\0\0\0\0"
 .byte 47, 0, 0, 0
+.ascii "blez\0\0\0\0"
+.byte 49, 0, 0, 0
 
 # Frame pseudos (prologue/epilogue kept — they just save/restore regs to stack;
 # "return" removed because it expands to epilogue + ret)
@@ -510,6 +512,12 @@ poweroff_hang:
 #   E21 B-type range             E22 J-type range
 #   E24 bad string literal       E25 bad prologue
 #   E26 bad epilogue
+#
+# Known issue: .word / .byte directives do not support trailing '#'
+# comments on the same line.  The tokenizer's comment handler sets
+# EOL but read_token continues into the next line, causing the next
+# mnemonic to be consumed as a .word value (E17 at link time).
+# Workaround: put comments on a separate line before .word/.byte.
 
 imm_range_i:
 	li	a0, 19			# E19 = I/S-type immediate out of range
@@ -1851,7 +1859,10 @@ read_reg_op_d41:
 	j	read_reg_op_rs41
 read_reg_op_d42:
 	addi	gp, gp, -1
+	bnez	gp, read_reg_op_d43
 	j	read_reg_op_rs42
+read_reg_op_d43:
+	j	read_reg_op_rs43
 
 read_imm_op:
 	addi	sp, sp, -4
@@ -2080,8 +2091,11 @@ read_br_target_d9:
 	j	read_br_target_rs9
 read_br_target_d10:
 	addi	gp, gp, -1
+	bnez	gp, read_br_target_d11
 	j	read_br_target_rs10
 
+read_br_target_d11:
+	j	read_br_target_rs11
 define_label:
 	li	t0, 33			# max s0 = 32 (31 chars + colon)
 	blt	s0, t0, dl_ok
@@ -3302,12 +3316,23 @@ do_ps_bgez_rs0:
 	j	dispatch_disp
 d_48:
 	li	t0, 48
-	bne	a0, t0, d_err
+	bne	a0, t0, d_49
 	addi	sp, sp, -4
 	sw	gp, 0(sp)
 	li	gp, 0
 	j	do_ps_wfi
 do_ps_wfi_rs0:
+	lw	gp, 0(sp)
+	addi	sp, sp, 4
+	j	dispatch_disp
+d_49:
+	li	t0, 49
+	bne	a0, t0, d_err
+	addi	sp, sp, -4
+	sw	gp, 0(sp)
+	li	gp, 0
+	j	do_ps_blez
+do_ps_blez_rs0:
 	lw	gp, 0(sp)
 	addi	sp, sp, 4
 	j	dispatch_disp
@@ -4116,6 +4141,27 @@ read_br_target_rs9:
 	lw	a1, 4(sp)
 	li	a2, 0
 	li	a3, 4			# blt
+	li	a0, 0x63
+	lw	gp, 0(sp)
+	addi	sp, sp, 8
+	j	emit_branch_auto
+
+# blez rs, tgt → bge x0, rs, tgt
+do_ps_blez:
+	addi	sp, sp, -8
+	sw	gp, 0(sp)
+	li	gp, 43
+	j	read_reg_op
+read_reg_op_rs43:
+	sw	a0, 4(sp)
+	li	a0, 0
+	li	gp, 11
+	j	read_br_target
+read_br_target_rs11:
+	mv	a4, a0
+	li	a1, 0
+	lw	a2, 4(sp)
+	li	a3, 5			# bge
 	li	a0, 0x63
 	lw	gp, 0(sp)
 	addi	sp, sp, 8

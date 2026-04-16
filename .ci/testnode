@@ -216,16 +216,103 @@ fi
 # ════════════════════════════════════════════════════════════════════════════
 section "Integration"
 
-# ── 2a. famchain boot: stack / s11 / mem-zero / write_byte ──────────────────
+# ── 2a. famchain disk path: load, hash-verify, jump ─────────────────────────
+# Build a tiny test node binary, compute its gimli hash, rebuild famchain
+# with those constants, run famchain with the test node as a virtio-blk
+# disk, and verify famchain's UART output is 'L' (the test node's marker).
 TOTAL=$((TOTAL + 1))
-out=$(run_bin_text "$DIR/bin/famchain" 2)
-if [[ "$out" == "OK" ]]; then
-	record_pass "famchain boot emits 'OK'"
+name="famchain disk: load + hash + jump"
+test_node_src="$TESTS_DIR/test_node.fam3"
+test_node_bin="$TMP/test_node.bin"
+test_config="$TMP/bin_config.inc"
+test_famchain="$TMP/famchain.bin"
+
+# Step 1: build the test node binary.
+if ! assemble_one "$test_node_src" "$test_node_bin"; then
+	record_fail "$name" "test_node.fam3 assembly failed"
 else
-	record_fail "famchain boot emits 'OK'" "got '$out'"
+	# Step 2: generate bin_config.inc with gimli hash.
+	PYTHONPATH="$TOOLS_DIR" python3 "$TOOLS_DIR/gen_bin_config.py" \
+		"$test_node_bin" "$TMP" 2>/dev/null
+
+	# Step 3: rebuild famchain with test config.
+	if ! assemble_many "$test_famchain" "$test_config" "$SRC_DIR/famchain.fam3"; then
+		record_fail "$name" "famchain re-assembly failed"
+	else
+		# Step 4: run famchain with test node as virtio-blk disk.
+		# Feed EOT (0x04) as UART input so the seed-list parser completes
+		# immediately. The disk path runs after.
+		got=$(printf '\004' | timeout -k 2 10 qemu-system-riscv32 \
+			-machine virt -cpu "$CPU" \
+			-nographic -bios none \
+			-device loader,file="$test_famchain",addr=0x80000000 \
+			-global virtio-mmio.force-legacy=true \
+			-drive file="$test_node_bin",format=raw,if=none,id=d0 \
+			-device virtio-blk-device,drive=d0 \
+			-serial stdio -monitor none 2>/dev/null \
+			| head -c 1)
+		if [[ "$got" == "L" ]]; then
+			record_pass "$name"
+		else
+			record_fail "$name" "got '$(echo -n "$got" | xxd -p)' (expected 'L'=4c)"
+		fi
+	fi
 fi
 
-# ── Summary ─────────────────────────────────────────────────────────────────
+# -- 2b. famchain network path: download + hash + jump -----------------------
+# No disk device provided -> famchain falls through to network path.
+# server.py serves the test node binary over UDP.  famchain downloads it,
+# hash-verifies, and jumps to it.  The test node prints 'L'.
+TOTAL=$((TOTAL + 1))
+name="famchain net: download + hash + jump"
+test_node_src="$TESTS_DIR/test_node.fam3"
+test_node_bin="$TMP/test_node_net.bin"
+test_config_net="$TMP/bin_config_net.inc"
+test_famchain_net="$TMP/famchain_net.bin"
+
+if ! assemble_one "$test_node_src" "$test_node_bin"; then
+	record_fail "$name" "test_node assembly failed"
+else
+	# Generate bin_config.
+	PYTHONPATH="$TOOLS_DIR" python3 "$TOOLS_DIR/gen_bin_config.py" \
+		"$test_node_bin" "$TMP" 2>/dev/null
+	mv "$TMP/bin_config.inc" "$test_config_net"
+
+	# Rebuild famchain.
+	if ! assemble_many "$test_famchain_net" "$test_config_net" "$SRC_DIR/famchain.fam3"; then
+		record_fail "$name" "famchain re-assembly failed"
+	else
+		# Start server in background.
+		PYTHONPATH="$TOOLS_DIR" python3 "$TOOLS_DIR/server.py" \
+			"$test_node_bin" --port 3737 &
+		SERVER_PID=$!
+		sleep 0.3
+
+		# Run famchain: no disk, virtio-net only.
+		# Seed list "10.0.2.2:3737" via UART stdin.
+		got=$(printf '10.0.2.2:3737\004' | timeout -k 2 15 \
+			qemu-system-riscv32 \
+			-machine virt -cpu "$CPU" \
+			-nographic -bios none \
+			-device loader,file="$test_famchain_net",addr=0x80000000 \
+			-global virtio-mmio.force-legacy=true \
+			-netdev user,id=n0 \
+			-device virtio-net-device,netdev=n0 \
+			-serial stdio -monitor none 2>/dev/null \
+			| head -c 1)
+
+		kill "$SERVER_PID" 2>/dev/null
+		wait "$SERVER_PID" 2>/dev/null
+
+		if [[ "$got" == "L" ]]; then
+			record_pass "$name"
+		else
+			record_fail "$name" "got '$(echo -n "$got" | xxd -p)' (expected 'L'=4c)"
+		fi
+	fi
+fi
+
+# -- Summary ------------------------------------------------------------------
 echo
 echo "=== Results ==="
 echo "  $PASS passed, $FAIL failed, $TOTAL total"
