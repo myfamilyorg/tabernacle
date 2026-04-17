@@ -54,9 +54,4 @@ run bin/famc src/full_node.fam > bin/full_node
 # re-run build.sh.
 run bin/fam3 src/bin_config.inc src/tabernacle.fam3 > bin/tabernacle
 
-# Stage the node binary where tools/server.py looks for it by default.
-mkdir -p tmp
-cp bin/full_node tmp/node.bin
-echo "Staged tmp/node.bin ($(wc -c < tmp/node.bin) bytes)" >&2
-
 echo "Success!"
