@@ -20,9 +20,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# ────────────────────────────────�
+# ──────────────────────────────────────────────────────────────────────────────
 # fam2.S — RV32I mnemonic assembler (third-stage bootstrap)
-# ────────────────────────────────�
+# ──────────────────────────────────────────────────────────────────────────────
 #
 # Reads text from UART (terminated by EOT = 0x04), emits a RISC-V binary
 # back over UART, then poweroffs.
@@ -72,9 +72,9 @@
 # .section .text
 # .globl _start
 
-# ════════════════════════════════�
+# ═══════════════════════════════════════════════════════════════════════
 # Format codes (in mnemonic table byte 12)
-# ════════════════════════════════�
+# ═══════════════════════════════════════════════════════════════════════
 # .equ FMT_R,     0
 # .equ FMT_I,     1
 # .equ FMT_S,     2
@@ -101,36 +101,60 @@
 # .equ TOK_LABEL, 6	# identifier followed by ':'
 # .equ TOK_EOT,   7
 
-# ════════════════════════════════�
+# ═══════════════════════════════════════════════════════════════════════
 #  Initialization
-# ════════════════════════════════�
+# ═══════════════════════════════════════════════════════════════════════
 # _start:
-
 :L000
 13 00 00 00	# addi	zero,zero,0 ; q32 magic
+
+# Constants
 13 0B A0 00	# addi	s6,zero,10
 B7 0A 00 10	# lui	s5,0x10000 ; UART 0x10000000
+
+# Compute base address
 17 05 00 00	# auipc	a0,0x0 ; a0 = PC of this instruction
 13 05 05 FF	# addi	a0,a0,-16 ; a0 = _start (back up past nop+li+lui)
+
+# Output buffer at _start + 0x10000
 B7 02 01 00	# lui	t0,0x10
 B3 04 55 00	# add	s1,a0,t0
 13 89 04 00	# addi	s2,s1,0
+
+# Symtab at _start + 0x20000
 B7 02 02 00	# lui	t0,0x20
 B3 09 55 00	# add	s3,a0,t0
 13 8A 09 00	# addi	s4,s3,0
+
+# Fixup table at _start + 0x30000
 B7 02 03 00	# lui	t0,0x30
 B3 0B 55 00	# add	s7,a0,t0
 13 8C 0B 00	# addi	s8,s7,0
+
+# Token buffer at _start + 0x40000
 B7 02 04 00	# lui	t0,0x40
 33 0D 55 00	# add	s10,a0,t0
+
+# Stack at _start + 0x50000
 B7 02 05 00	# lui	t0,0x50
 33 01 55 00	# add	sp,a0,t0
+
+# Data tables (embedded in code section)
 97 1C 00 00	# auipc	s9,0x1
 93 8C 8C 26	# addi	s9,s9,616
+
+# la s9, mnem_table
 97 1D 00 00	# auipc	s11,0x1
 93 8D 0D 51	# addi	s11,s11,1296
+
+# la s11, reg_table
+# Putback character (0 = none)
+# We use the word just before the token buffer for this
 23 2E 0D FE	# sw	zero,-4(s10)
 
+# ═══════════════════════════════════════════════════════════════════════
+# Main Loop
+# ═══════════════════════════════════════════════════════════════════════
 :L001
 93 01 00 00	# addi	gp,zero,0 ; next_token site 0
 6F 00 00 00	# jal	zero,next_token
@@ -142,15 +166,22 @@ B7 02 05 00	# lui	t0,0x50
 63 14 55 00	# bne	a0,t0,nt_rs0 ; EOT → resolve fixups
 6F 00 00 00	# jal	zero,resolve
 @L215
+
+# beq a0, t0, resolve # EOT → resolve fixups
 93 02 00 00	# addi	t0,zero,0
 63 00 55 00	# beq	a0,t0,main_loop ; skip blank/separator
 @L001
 93 02 60 00	# addi	t0,zero,6
 63 00 55 00	# beq	a0,t0,handle_label
 @L009
+
+# Must be TOK_IDENT — mnemonic or hex passthrough
+# First try hex passthrough: exactly 2 chars, both valid uppercase hex
 93 02 20 00	# addi	t0,zero,2
 63 10 54 00	# bne	s0,t0,try_mnemonic
 @L007
+
+# Check if both chars are uppercase hex (0-9, A-F)
 83 42 0D 00	# lbu	t0,0(s10)
 93 01 00 00	# addi	gp,zero,0 ; is_upper_hex site 0
 6F 00 00 00	# jal	zero,is_upper_hex
@@ -167,6 +198,8 @@ B7 02 05 00	# lui	t0,0x50
 :L004
 63 00 05 00	# beq	a0,zero,try_mnemonic
 @L007
+
+# Hex passthrough: decode two hex chars → byte
 83 42 0D 00	# lbu	t0,0(s10)
 93 01 00 00	# addi	gp,zero,0 ; hex_val site 0
 6F 00 00 00	# jal	zero,hex_val
@@ -196,9 +229,13 @@ B7 02 05 00	# lui	t0,0x50
 63 14 05 00	# bne	a0,zero,lm_rs0 ; Unknown mnemonic
 6F 00 00 00	# jal	zero,error_halt
 @L228
+
+# beqz a0, error_halt # Unknown mnemonic
 93 07 05 00	# addi	a5,a0,0 ; a5 = mnemonic table entry ptr
 03 A7 87 00	# lw	a4,8(a5) ; a4 = opcode template
 83 C6 C7 00	# lbu	a3,12(a5) ; a3 = format type
+
+# Dispatch on format
 93 02 00 00	# addi	t0,zero,0
 63 80 56 00	# beq	a3,t0,do_r_type
 @L013
@@ -226,6 +263,9 @@ B7 02 05 00	# lui	t0,0x50
 6F 00 00 00	# jal	zero,error_halt
 @L228
 
+# ═══════════════════════════════════════════════════════════════════════
+# Label Definition
+# ═══════════════════════════════════════════════════════════════════════
 # Zero 40 bytes at s4
 :L009
 93 02 0A 00	# addi	t0,s4,0
@@ -236,6 +276,8 @@ B7 02 05 00	# lui	t0,0x50
 93 82 42 00	# addi	t0,t0,4
 63 90 62 00	# bne	t0,t1,hl_zero
 @L010
+
+# Copy token buffer to symtab entry (up to 31 chars)
 93 02 0A 00	# addi	t0,s4,0 ; dest
 13 03 0D 00	# addi	t1,s10,0 ; src
 B3 03 8D 00	# add	t2,s10,s0 ; src end
@@ -258,6 +300,10 @@ B3 02 99 40	# sub	t0,s2,s1
 6F 00 00 00	# jal	zero,main_loop
 @L001
 
+# ═══════════════════════════════════════════════════════════════════════
+# Format Handlers
+# ═══════════════════════════════════════════════════════════════════════
+# ─── R-type: rd, rs1, rs2 ────────────────────────────────────────────
 :L013
 13 01 01 FF	# addi	sp,sp,-16
 23 24 E1 00	# sw	a4,8(sp) ; save template
@@ -291,6 +337,7 @@ B3 02 99 40	# sub	t0,s2,s1
 6F 00 00 00	# jal	zero,main_loop
 @L001
 
+# ─── I-type: rd, rs1, imm ────────────────────────────────────────────
 :L018
 13 01 01 FF	# addi	sp,sp,-16
 23 24 E1 00	# sw	a4,8(sp)
@@ -324,6 +371,7 @@ B3 02 99 40	# sub	t0,s2,s1
 6F 00 00 00	# jal	zero,main_loop
 @L001
 
+# ─── Load: rd, imm(rs1) ──────────────────────────────────────────────
 :L023
 13 01 01 FF	# addi	sp,sp,-16
 23 24 E1 00	# sw	a4,8(sp)
@@ -357,6 +405,8 @@ B3 02 99 40	# sub	t0,s2,s1
 :L028
 03 25 81 00	# lw	a0,8(sp) ; template
 83 25 41 00	# lw	a1,4(sp) ; rd
+
+# a2 = rs1
 83 26 01 00	# lw	a3,0(sp) ; imm
 93 01 10 00	# addi	gp,zero,1
 6F 00 00 00	# jal	zero,encode_i
@@ -367,6 +417,7 @@ B3 02 99 40	# sub	t0,s2,s1
 6F 00 00 00	# jal	zero,main_loop
 @L001
 
+# ─── S-type: rs2, imm(rs1) ───────────────────────────────────────────
 :L030
 13 01 01 FF	# addi	sp,sp,-16
 23 24 E1 00	# sw	a4,8(sp)
@@ -399,6 +450,8 @@ B3 02 99 40	# sub	t0,s2,s1
 
 :L035
 03 25 81 00	# lw	a0,8(sp) ; template
+
+# a1 = rs1
 03 26 41 00	# lw	a2,4(sp) ; rs2
 83 26 01 00	# lw	a3,0(sp) ; imm
 93 01 00 00	# addi	gp,zero,0
@@ -410,6 +463,7 @@ B3 02 99 40	# sub	t0,s2,s1
 6F 00 00 00	# jal	zero,main_loop
 @L001
 
+# ─── B-type: rs1, rs2, label/imm ─────────────────────────────────────
 :L037
 13 01 C1 FE	# addi	sp,sp,-20
 23 26 E1 00	# sw	a4,12(sp)
@@ -425,6 +479,8 @@ B3 02 99 40	# sub	t0,s2,s1
 
 :L039
 23 22 A1 00	# sw	a0,4(sp) ; rs2
+
+# Third operand: label or immediate
 93 01 20 00	# addi	gp,zero,2
 6F 00 00 00	# jal	zero,next_token
 @L135
@@ -437,6 +493,8 @@ B3 02 99 40	# sub	t0,s2,s1
 :L041
 63 10 05 00	# bne	a0,zero,b_imm
 @L045
+
+# Identifier → label reference
 93 01 00 00	# addi	gp,zero,0
 6F 00 00 00	# jal	zero,lookup_label
 @L206
@@ -444,6 +502,8 @@ B3 02 99 40	# sub	t0,s2,s1
 :L042
 63 40 05 00	# blt	a0,zero,b_forward ; not found → forward ref
 @L043
+
+# Backward ref: compute offset
 B3 06 65 40	# sub	a3,a0,t1 ; t1 = current output offset (set by lookup_label helper)
 6F 00 00 00	# jal	zero,b_encode
 @L047
@@ -481,6 +541,7 @@ B3 06 65 40	# sub	a3,a0,t1 ; t1 = current output offset (set by lookup_label hel
 6F 00 00 00	# jal	zero,main_loop
 @L001
 
+# ─── U-type: rd, imm ─────────────────────────────────────────────────
 :L049
 13 01 01 FF	# addi	sp,sp,-16
 23 24 E1 00	# sw	a4,8(sp)
@@ -507,6 +568,7 @@ B3 06 65 40	# sub	a3,a0,t1 ; t1 = current output offset (set by lookup_label hel
 6F 00 00 00	# jal	zero,main_loop
 @L001
 
+# ─── J-type: rd, label/imm ───────────────────────────────────────────
 :L053
 13 01 01 FF	# addi	sp,sp,-16
 23 24 E1 00	# sw	a4,8(sp)
@@ -516,6 +578,8 @@ B3 06 65 40	# sub	a3,a0,t1 ; t1 = current output offset (set by lookup_label hel
 
 :L054
 23 22 A1 00	# sw	a0,4(sp) ; rd
+
+# Next operand: label or immediate
 93 01 30 00	# addi	gp,zero,3
 6F 00 00 00	# jal	zero,next_token
 @L135
@@ -528,6 +592,8 @@ B3 06 65 40	# sub	a3,a0,t1 ; t1 = current output offset (set by lookup_label hel
 :L056
 63 10 05 00	# bne	a0,zero,j_imm
 @L060
+
+# Identifier → label
 93 01 10 00	# addi	gp,zero,1
 6F 00 00 00	# jal	zero,lookup_label
 @L206
@@ -570,6 +636,9 @@ B3 06 65 40	# sub	a3,a0,t1 ; t1 = current output offset (set by lookup_label hel
 6F 00 00 00	# jal	zero,main_loop
 @L001
 
+# ═══════════════════════════════════════════════════════════════════════
+# Pseudo Instructions
+# ═══════════════════════════════════════════════════════════════════════
 :L064
 83 C6 E7 00	# lbu	a3,14(a5) ; pseudo ID
 93 02 00 00	# addi	t0,zero,0
@@ -593,6 +662,7 @@ B3 06 65 40	# sub	a3,a0,t1 ; t1 = current output offset (set by lookup_label hel
 6F 00 00 00	# jal	zero,error_halt
 @L228
 
+# nop → addi x0, x0, 0
 :L065
 13 05 30 01	# addi	a0,zero,19
 93 01 60 00	# addi	gp,zero,6
@@ -603,6 +673,7 @@ B3 06 65 40	# sub	a3,a0,t1 ; t1 = current output offset (set by lookup_label hel
 6F 00 00 00	# jal	zero,main_loop
 @L001
 
+# li rd, imm
 :L067
 13 01 01 FF	# addi	sp,sp,-16
 93 01 F0 00	# addi	gp,zero,15
@@ -617,6 +688,8 @@ B3 06 65 40	# sub	a3,a0,t1 ; t1 = current output offset (set by lookup_label hel
 
 :L069
 23 22 A1 00	# sw	a0,4(sp) ; imm
+
+# Check if imm fits in 12-bit signed (-2048..2047)
 83 22 41 00	# lw	t0,4(sp)
 13 03 F0 7F	# addi	t1,zero,2047
 63 40 53 00	# blt	t1,t0,li_two_insn
@@ -624,6 +697,8 @@ B3 06 65 40	# sub	a3,a0,t1 ; t1 = current output offset (set by lookup_label hel
 13 03 00 80	# addi	t1,zero,-2048
 63 C0 62 00	# blt	t0,t1,li_two_insn
 @L071
+
+# Single addi rd, x0, imm
 13 05 30 01	# addi	a0,zero,19 ; addi template
 83 25 81 00	# lw	a1,8(sp) ; rd
 13 06 00 00	# addi	a2,zero,0 ; rs1 = x0
@@ -641,8 +716,12 @@ B3 06 65 40	# sub	a3,a0,t1 ; t1 = current output offset (set by lookup_label hel
 83 22 41 00	# lw	t0,4(sp) ; imm
 37 13 00 00	# lui	t1,0x1
 13 03 03 80	# addi	t1,t1,-2048
+
+# li t1, 0x800
 B3 83 62 00	# add	t2,t0,t1 ; imm + 0x800
 93 D3 C3 40	# srai	t2,t2,0xc ; upper20
+
+# lui rd, upper
 13 05 70 03	# addi	a0,zero,55 ; lui template
 83 25 81 00	# lw	a1,8(sp) ; rd
 13 86 03 00	# addi	a2,t2,0
@@ -668,6 +747,7 @@ B3 83 62 00	# add	t2,t0,t1 ; imm + 0x800
 6F 00 00 00	# jal	zero,main_loop
 @L001
 
+# mv rd, rs → addi rd, rs, 0
 :L074
 13 01 81 FF	# addi	sp,sp,-8
 93 01 00 01	# addi	gp,zero,16
@@ -694,6 +774,7 @@ B3 83 62 00	# add	t2,t0,t1 ; imm + 0x800
 6F 00 00 00	# jal	zero,main_loop
 @L001
 
+# j label → jal x0, label
 :L078
 93 01 40 00	# addi	gp,zero,4
 6F 00 00 00	# jal	zero,next_token
@@ -707,6 +788,8 @@ B3 83 62 00	# add	t2,t0,t1 ; imm + 0x800
 :L080
 63 10 05 00	# bne	a0,zero,j_ps_imm
 @L084
+
+# Label
 93 01 20 00	# addi	gp,zero,2
 6F 00 00 00	# jal	zero,lookup_label
 @L206
@@ -748,6 +831,7 @@ B3 83 62 00	# add	t2,t0,t1 ; imm + 0x800
 6F 00 00 00	# jal	zero,main_loop
 @L001
 
+# beqz rs, label → beq rs, x0, label
 :L088
 13 01 81 FF	# addi	sp,sp,-8
 93 01 20 01	# addi	gp,zero,18
@@ -811,6 +895,7 @@ B3 06 65 40	# sub	a3,a0,t1
 6F 00 00 00	# jal	zero,main_loop
 @L001
 
+# bnez rs, label → bne rs, x0, label
 :L099
 13 01 81 FF	# addi	sp,sp,-8
 93 01 30 01	# addi	gp,zero,19
@@ -864,6 +949,8 @@ B3 06 65 40	# sub	a3,a0,t1
 :L108
 37 15 00 00	# lui	a0,0x1 ; bne template
 13 05 35 06	# addi	a0,a0,99
+
+# li a0, 0x00001063 # bne template
 83 25 41 00	# lw	a1,4(sp) ; rs1
 13 06 00 00	# addi	a2,zero,0 ; rs2 = x0
 93 01 20 00	# addi	gp,zero,2
@@ -875,6 +962,10 @@ B3 06 65 40	# sub	a3,a0,t1
 6F 00 00 00	# jal	zero,main_loop
 @L001
 
+# ═══════════════════════════════════════════════════════════════════════
+# Instruction Encoders
+# ═══════════════════════════════════════════════════════════════════════
+# encode_r: a0=template, a1=rd, a2=rs1, a3=rs2
 :L110
 13 01 C1 FF	# addi	sp,sp,-4
 23 20 31 00	# sw	gp,0(sp)
@@ -898,6 +989,7 @@ B3 06 65 40	# sub	a3,a0,t1
 6F 00 00 00	# jal	zero,enc_r_rs0
 @L017
 
+# encode_i: a0=template, a1=rd, a2=rs1, a3=imm12
 :L113
 13 01 C1 FF	# addi	sp,sp,-4
 23 20 31 00	# sw	gp,0(sp)
@@ -948,6 +1040,7 @@ B3 06 65 40	# sub	a3,a0,t1
 6F 00 00 00	# jal	zero,error_halt ; enc_i_rs7 was ps_ret (removed)
 @L228
 
+# encode_s: a0=template, a1=rs1, a2=rs2, a3=imm12
 :L116
 13 01 C1 FF	# addi	sp,sp,-4
 23 20 31 00	# sw	gp,0(sp)
@@ -955,9 +1048,13 @@ B3 06 65 40	# sub	a3,a0,t1
 33 65 55 00	# or	a0,a0,t0
 93 12 46 01	# slli	t0,a2,0x14 ; rs2
 33 65 55 00	# or	a0,a0,t0
+
+# imm[4:0] → bits[11:7]
 93 F2 F6 01	# andi	t0,a3,31
 93 92 72 00	# slli	t0,t0,0x7
 33 65 55 00	# or	a0,a0,t0
+
+# imm[11:5] → bits[31:25]
 93 D2 56 40	# srai	t0,a3,0x5
 93 F2 F2 07	# andi	t0,t0,127
 93 92 92 01	# slli	t0,t0,0x19
@@ -976,6 +1073,7 @@ B3 06 65 40	# sub	a3,a0,t1
 6F 00 00 00	# jal	zero,enc_s_rs0
 @L036
 
+# encode_b: a0=template, a1=rs1, a2=rs2, a3=imm13
 :L119
 13 01 C1 FF	# addi	sp,sp,-4
 23 20 31 00	# sw	gp,0(sp)
@@ -983,18 +1081,26 @@ B3 06 65 40	# sub	a3,a0,t1
 33 65 55 00	# or	a0,a0,t0
 93 12 46 01	# slli	t0,a2,0x14 ; rs2
 33 65 55 00	# or	a0,a0,t0
+
+# imm[12] → bit[31]
 93 D2 C6 00	# srli	t0,a3,0xc
 93 F2 12 00	# andi	t0,t0,1
 93 92 F2 01	# slli	t0,t0,0x1f
 33 65 55 00	# or	a0,a0,t0
+
+# imm[10:5] → bits[30:25]
 93 D2 56 00	# srli	t0,a3,0x5
 93 F2 F2 03	# andi	t0,t0,63
 93 92 92 01	# slli	t0,t0,0x19
 33 65 55 00	# or	a0,a0,t0
+
+# imm[4:1] → bits[11:8]
 93 D2 16 00	# srli	t0,a3,0x1
 93 F2 F2 00	# andi	t0,t0,15
 93 92 82 00	# slli	t0,t0,0x8
 33 65 55 00	# or	a0,a0,t0
+
+# imm[11] → bit[7]
 93 D2 B6 00	# srli	t0,a3,0xb
 93 F2 12 00	# andi	t0,t0,1
 93 92 72 00	# slli	t0,t0,0x7
@@ -1020,6 +1126,7 @@ B3 06 65 40	# sub	a3,a0,t1
 6F 00 00 00	# jal	zero,enc_b_rs2
 @L109
 
+# encode_u: a0=template, a1=rd, a2=imm20
 :L122
 13 01 C1 FF	# addi	sp,sp,-4
 23 20 31 00	# sw	gp,0(sp)
@@ -1044,23 +1151,32 @@ B3 06 65 40	# sub	a3,a0,t1
 6F 00 00 00	# jal	zero,enc_u_rs1
 @L072
 
+# encode_j: a0=template, a1=rd, a2=imm21
 :L125
 13 01 C1 FF	# addi	sp,sp,-4
 23 20 31 00	# sw	gp,0(sp)
 93 92 75 00	# slli	t0,a1,0x7 ; rd
 33 65 55 00	# or	a0,a0,t0
+
+# imm[20] → bit[31]
 93 52 46 01	# srli	t0,a2,0x14
 93 F2 12 00	# andi	t0,t0,1
 93 92 F2 01	# slli	t0,t0,0x1f
 33 65 55 00	# or	a0,a0,t0
+
+# imm[10:1] → bits[30:21]
 93 52 16 00	# srli	t0,a2,0x1
 93 F2 F2 3F	# andi	t0,t0,1023
 93 92 52 01	# slli	t0,t0,0x15
 33 65 55 00	# or	a0,a0,t0
+
+# imm[11] → bit[20]
 93 52 B6 00	# srli	t0,a2,0xb
 93 F2 12 00	# andi	t0,t0,1
 93 92 42 01	# slli	t0,t0,0x14
 33 65 55 00	# or	a0,a0,t0
+
+# imm[19:12] → bits[19:12]
 93 52 C6 00	# srli	t0,a2,0xc
 93 F2 F2 0F	# andi	t0,t0,255
 93 92 C2 00	# slli	t0,t0,0xc
@@ -1082,6 +1198,7 @@ B3 06 65 40	# sub	a3,a0,t1
 6F 00 00 00	# jal	zero,enc_j_rs1
 @L087
 
+# emit_word: a0=32-bit word, store at s2, advance s2 (leaf)
 :L128
 23 20 A9 00	# sw	a0,0(s2)
 13 09 49 00	# addi	s2,s2,4
@@ -1115,6 +1232,10 @@ B3 06 65 40	# sub	a3,a0,t1
 6F 00 00 00	# jal	zero,ew_rs6
 @L066
 
+# ═══════════════════════════════════════════════════════════════════════
+# Tokenizer
+# ═══════════════════════════════════════════════════════════════════════
+# read_char: returns char in a0. Uses putback slot at s10-4. (leaf)
 :L130
 03 25 CD FF	# lw	a0,-4(s10) ; check putback
 63 00 05 00	# beq	a0,zero,rc_poll
@@ -1143,6 +1264,7 @@ B3 06 65 40	# sub	a3,a0,t1
 6F 00 00 00	# jal	zero,rc_rs2
 @L147
 
+# putback_char: store a0 into putback slot (leaf)
 :L133
 23 2E AD FE	# sw	a0,-4(s10)
 6F 00 00 00	# jal	zero,putback_char_disp
@@ -1152,6 +1274,9 @@ B3 06 65 40	# sub	a3,a0,t1
 6F 00 00 00	# jal	zero,pb_rs0
 @L149
 
+# next_token:
+# returns: a0 = token type
+# token text in buffer at s10, length in s0
 :L135
 13 01 C1 FF	# addi	sp,sp,-4
 23 20 31 00	# sw	gp,0(sp)
@@ -1175,21 +1300,31 @@ B3 06 65 40	# sub	a3,a0,t1
 93 02 C0 02	# addi	t0,zero,44
 63 00 55 00	# beq	a0,t0,nt_skip
 @L136
+
+# Newline → EOL
 93 02 A0 00	# addi	t0,zero,10
 63 00 55 00	# beq	a0,t0,nt_eol
 @L138
+
+# Comment
 93 02 30 02	# addi	t0,zero,35
 63 00 55 00	# beq	a0,t0,nt_comment
 @L139
+
+# EOT
 93 02 40 00	# addi	t0,zero,4
 63 00 55 00	# beq	a0,t0,nt_eot
 @L141
+
+# Open/close paren
 93 02 80 02	# addi	t0,zero,40
 63 00 55 00	# beq	a0,t0,nt_lparen
 @L142
 93 02 90 02	# addi	t0,zero,41
 63 00 55 00	# beq	a0,t0,nt_rparen
 @L143
+
+# Everything else (digits, letters, '-', '_') → identifier
 6F 00 00 00	# jal	zero,nt_ident
 @L144
 
@@ -1227,6 +1362,8 @@ B3 06 65 40	# sub	a3,a0,t1
 6F 00 00 00	# jal	zero,nt_ret
 @L151
 
+# ─── Identifier parsing ──────────────────────────────────────────────
+# a0 has first char
 # Zero token buffer (8 words = 32 bytes, enough for lookup)
 :L144
 23 20 0D 00	# sw	zero,0(s10)
@@ -1283,11 +1420,14 @@ B3 02 8D 00	# add	t0,s10,s0
 63 D0 A2 00	# bge	t0,a0,nt_id_loop
 @L145
 
+# a0 has the char after the identifier
 # Check for ':' → label definition
 :L148
 93 02 A0 03	# addi	t0,zero,58
 63 00 55 00	# beq	a0,t0,nt_label_def
 @L150
+
+# Put back the lookahead char
 93 01 00 00	# addi	gp,zero,0
 6F 00 00 00	# jal	zero,putback_char
 @L133
@@ -1351,6 +1491,11 @@ B3 02 8D 00	# add	t0,s10,s0
 6F 00 00 00	# jal	zero,nt_rs10
 @L188
 
+# ═══════════════════════════════════════════════════════════════════════
+# Helper Functions
+# ═══════════════════════════════════════════════════════════════════════
+# is_tok_numeric: check if token buffer starts with digit or '-'
+# returns a0=1 if numeric, 0 if not (leaf)
 :L153
 83 42 0D 00	# lbu	t0,0(s10)
 13 03 D0 02	# addi	t1,zero,45
@@ -1396,6 +1541,7 @@ B3 02 8D 00	# add	t0,s10,s0
 6F 00 00 00	# jal	zero,itn_rs5
 @L102
 
+# is_upper_hex: t0=char, returns a0=1 if [0-9A-F], else 0 (leaf)
 :L157
 13 05 10 00	# addi	a0,zero,1
 13 03 00 03	# addi	t1,zero,48
@@ -1425,6 +1571,8 @@ B3 02 8D 00	# add	t0,s10,s0
 6F 00 00 00	# jal	zero,iuh_rs1
 @L004
 
+# hex_val: t0=hex char [0-9A-F], returns a0=value 0-15 (leaf)
+# Note: must not clobber t1 (caller may use it)
 :L161
 13 85 02 FD	# addi	a0,t0,-48
 93 03 A0 00	# addi	t2,zero,10
@@ -1443,6 +1591,7 @@ B3 02 8D 00	# add	t0,s10,s0
 6F 00 00 00	# jal	zero,hv_rs1
 @L006
 
+# expect_reg: read next token, parse as register, return reg num in a0
 :L164
 13 01 C1 FF	# addi	sp,sp,-4
 23 20 31 00	# sw	gp,0(sp)
@@ -1540,6 +1689,7 @@ B3 02 8D 00	# add	t0,s10,s0
 6F 00 00 00	# jal	zero,er_rs19
 @L100
 
+# expect_imm: read next token, parse as number, return value in a0
 :L168
 13 01 C1 FF	# addi	sp,sp,-4
 23 20 31 00	# sw	gp,0(sp)
@@ -1581,6 +1731,8 @@ B3 02 8D 00	# add	t0,s10,s0
 6F 00 00 00	# jal	zero,ei_rs5
 @L069
 
+# parse_num: parse token buffer at s10 (length s0) as number, return in a0 (leaf)
+# handles: decimal (42), hex (0xFF), negative (-42, -0xFF)
 :L172
 13 05 00 00	# addi	a0,zero,0 ; accumulator
 93 03 0D 00	# addi	t2,s10,0 ; read ptr
@@ -1588,6 +1740,8 @@ B3 02 8D 00	# add	t0,s10,s0
 93 0F 00 00	# addi	t6,zero,0 ; negative flag
 63 80 C3 01	# beq	t2,t3,pn_done ; empty → 0
 @L182
+
+# Check for '-' prefix
 83 C2 03 00	# lbu	t0,0(t2)
 13 03 D0 02	# addi	t1,zero,45
 63 90 62 00	# bne	t0,t1,pn_check_hex
@@ -1603,6 +1757,8 @@ B3 02 8D 00	# add	t0,s10,s0
 13 03 00 03	# addi	t1,zero,48
 63 90 62 00	# bne	t0,t1,pn_dec_loop
 @L180
+
+# Could be 0x
 93 8E 13 00	# addi	t4,t2,1
 63 80 CE 01	# beq	t4,t3,pn_dec_loop ; just "0"
 @L180
@@ -1624,18 +1780,24 @@ B3 02 8D 00	# add	t0,s10,s0
 @L181
 83 C2 03 00	# lbu	t0,0(t2)
 93 83 13 00	# addi	t2,t2,1
+
+# 0-9
 13 03 00 03	# addi	t1,zero,48
 63 C0 62 00	# blt	t0,t1,pn_negate
 @L181
 13 03 90 03	# addi	t1,zero,57
 63 50 53 00	# bge	t1,t0,pn_hex09
 @L176
+
+# A-F
 13 03 10 04	# addi	t1,zero,65
 63 C0 62 00	# blt	t0,t1,pn_negate
 @L181
 13 03 60 04	# addi	t1,zero,70
 63 50 53 00	# bge	t1,t0,pn_hexAF
 @L177
+
+# a-f
 13 03 10 06	# addi	t1,zero,97
 63 C0 62 00	# blt	t0,t1,pn_negate
 @L181
@@ -1678,6 +1840,8 @@ B3 02 8D 00	# add	t0,s10,s0
 63 40 53 00	# blt	t1,t0,pn_negate
 @L181
 93 82 02 FD	# addi	t0,t0,-48
+
+# a0 = a0 * 10 + t0
 13 13 35 00	# slli	t1,a0,0x3
 13 15 15 00	# slli	a0,a0,0x1
 33 05 65 00	# add	a0,a0,t1
@@ -1721,6 +1885,7 @@ B3 02 8D 00	# add	t0,s10,s0
 6F 00 00 00	# jal	zero,pn_rs6
 @L107
 
+# expect_lparen: read next token, assert '('
 :L184
 13 01 C1 FF	# addi	sp,sp,-4
 23 20 31 00	# sw	gp,0(sp)
@@ -1746,6 +1911,7 @@ B3 02 8D 00	# add	t0,s10,s0
 6F 00 00 00	# jal	zero,elp_rs2
 @L033
 
+# expect_rparen: read next token, assert ')'
 :L187
 13 01 C1 FF	# addi	sp,sp,-4
 23 20 31 00	# sw	gp,0(sp)
@@ -1770,12 +1936,19 @@ B3 02 8D 00	# add	t0,s10,s0
 6F 00 00 00	# jal	zero,erp_rs2
 @L035
 
+# ═══════════════════════════════════════════════════════════════════════
+# Register Parser
+# ═══════════════════════════════════════════════════════════════════════
+# parse_reg: token in buffer at s10, length in s0 (leaf)
+# returns register number in a0, or -1 if not a register
 # Check for 'x' prefix (x0-x31)
 :L190
 83 42 0D 00	# lbu	t0,0(s10)
 13 03 80 07	# addi	t1,zero,120
 63 90 62 00	# bne	t0,t1,pr_abi
 @L193
+
+# Parse number after 'x'
 13 05 00 00	# addi	a0,zero,0 ; accumulator
 93 03 10 00	# addi	t2,zero,1 ; index
 
@@ -1790,6 +1963,8 @@ B3 02 7D 00	# add	t0,s10,t2
 13 03 90 00	# addi	t1,zero,9
 63 40 53 00	# blt	t1,t0,pr_fail
 @L198
+
+# a0 = a0 * 10 + t0
 13 13 35 00	# slli	t1,a0,0x3
 13 15 15 00	# slli	a0,a0,0x1
 33 05 65 00	# add	a0,a0,t1
@@ -1813,6 +1988,8 @@ B3 02 7D 00	# add	t0,s10,t2
 83 C2 03 00	# lbu	t0,0(t2) ; first byte of entry name
 63 80 02 00	# beq	t0,zero,pr_fail ; end of table (null sentinel)
 @L198
+
+# Compare name: entries are 8 bytes (5-byte name + 1 reg + 2 pad)
 13 8E 03 00	# addi	t3,t2,0 ; entry name ptr
 93 0E 0D 00	# addi	t4,s10,0 ; token ptr
 13 0F 00 00	# addi	t5,zero,0 ; match len
@@ -1834,6 +2011,8 @@ B3 02 7D 00	# add	t0,s10,t2
 :L196
 63 10 8F 00	# bne	t5,s0,pr_next
 @L197
+
+# Match!
 03 C5 53 00	# lbu	a0,5(t2) ; register number at offset 5
 6F 00 00 00	# jal	zero,pr_ret
 @L199
@@ -1857,6 +2036,11 @@ B3 02 7D 00	# add	t0,s10,t2
 6F 00 00 00	# jal	zero,error_halt ; pr_rs1 was do_jalr_type (removed)
 @L228
 
+# ═══════════════════════════════════════════════════════════════════════
+# Mnemonic Lookup
+# ═══════════════════════════════════════════════════════════════════════
+# lookup_mnem: token in buffer at s10, length in s0 (leaf)
+# returns pointer to 16-byte entry in a0, or 0 if not found
 :L201
 93 83 0C 00	# addi	t2,s9,0 ; table ptr
 
@@ -1864,6 +2048,8 @@ B3 02 7D 00	# add	t0,s10,t2
 83 C2 03 00	# lbu	t0,0(t2) ; first byte
 63 80 02 00	# beq	t0,zero,lm_fail ; null sentinel = end of table
 @L204
+
+# Compare 8-byte name (token buf is zero-padded to 32 bytes)
 83 A2 03 00	# lw	t0,0(t2) ; first 4 bytes of entry
 03 23 0D 00	# lw	t1,0(s10) ; first 4 bytes of token
 63 90 62 00	# bne	t0,t1,lm_next
@@ -1872,6 +2058,8 @@ B3 02 7D 00	# add	t0,s10,t2
 03 23 4D 00	# lw	t1,4(s10)
 63 90 62 00	# bne	t0,t1,lm_next
 @L203
+
+# Match
 13 85 03 00	# addi	a0,t2,0
 6F 00 00 00	# jal	zero,lookup_mnem_disp
 @L205
@@ -1890,6 +2078,12 @@ B3 02 7D 00	# add	t0,s10,t2
 6F 00 00 00	# jal	zero,lm_rs0
 @L008
 
+# ═══════════════════════════════════════════════════════════════════════
+# Label / Fixup / Resolve
+# ═══════════════════════════════════════════════════════════════════════
+# lookup_label: token in buffer at s10, s0=length (leaf)
+# returns offset in a0 (>=0) if found, -1 if not found
+# also sets t1 = current output offset (for computing branch displacement)
 :L206
 33 03 99 40	# sub	t1,s2,s1 ; current output offset
 93 83 09 00	# addi	t2,s3,0 ; symtab scan ptr
@@ -1897,6 +2091,8 @@ B3 02 7D 00	# add	t0,s10,t2
 :L207
 63 80 43 01	# beq	t2,s4,ll_fail ; end of symtab
 @L209
+
+# Compare 32-byte name using 8 word compares
 03 AE 03 00	# lw	t3,0(t2)
 83 2E 0D 00	# lw	t4,0(s10)
 63 10 DE 01	# bne	t3,t4,ll_next
@@ -1929,6 +2125,8 @@ B3 02 7D 00	# add	t0,s10,t2
 83 2E CD 01	# lw	t4,28(s10)
 63 10 DE 01	# bne	t3,t4,ll_next
 @L208
+
+# Match — load offset
 03 A5 03 02	# lw	a0,32(t2)
 6F 00 00 00	# jal	zero,lookup_label_disp
 @L210
@@ -1962,6 +2160,8 @@ B3 02 7D 00	# add	t0,s10,t2
 6F 00 00 00	# jal	zero,ll_rs4
 @L103
 
+# add_fixup: token (label name) in buffer at s10, a1=fixup type (leaf)
+# records fixup for the instruction at s2-4
 # Zero 40 bytes at s8
 :L211
 93 02 0C 00	# addi	t0,s8,0
@@ -1972,6 +2172,8 @@ B3 02 7D 00	# add	t0,s10,t2
 93 82 42 00	# addi	t0,t0,4
 63 90 72 00	# bne	t0,t2,af_zero
 @L212
+
+# Copy token buffer (32 bytes, already zero-padded)
 93 02 0C 00	# addi	t0,s8,0
 93 03 0D 00	# addi	t2,s10,0
 13 0E 0D 02	# addi	t3,s10,32
@@ -1983,8 +2185,12 @@ B3 02 7D 00	# add	t0,s10,t2
 93 83 43 00	# addi	t2,t2,4
 63 90 C3 01	# bne	t2,t3,af_copy
 @L213
+
+# Store instruction address (output offset where it WILL be emitted)
 B3 02 99 40	# sub	t0,s2,s1
 23 20 5C 02	# sw	t0,32(s8)
+
+# Store fixup type
 23 02 BC 02	# sb	a1,36(s8)
 13 0C 8C 02	# addi	s8,s8,40
 6F 00 00 00	# jal	zero,add_fixup_disp
@@ -2009,19 +2215,28 @@ B3 02 99 40	# sub	t0,s2,s1
 6F 00 00 00	# jal	zero,af_rs4
 @L105
 
+# ─── Resolve all fixups ──────────────────────────────────────────────
 :L215
 93 8F 0B 00	# addi	t6,s7,0 ; fixup table iterator
 
 :L216
 63 80 8F 01	# beq	t6,s8,output ; done → output
 @L222
+
+# Load fixup type
 83 C6 4F 02	# lbu	a3,36(t6) ; B or J
+
+# Load instruction offset
 03 A7 0F 02	# lw	a4,32(t6) ; offset in output buffer
+
+# Search symtab for matching name
 93 83 09 00	# addi	t2,s3,0
 
 :L217
 63 80 43 01	# beq	t2,s4,res_next ; not found → skip
 @L221
+
+# Compare 32-byte names (8 word compares)
 03 AE 0F 00	# lw	t3,0(t6)
 83 AE 03 00	# lw	t4,0(t2)
 63 10 DE 01	# bne	t3,t4,res_snext
@@ -2054,10 +2269,16 @@ B3 02 99 40	# sub	t0,s2,s1
 83 AE C3 01	# lw	t4,28(t2)
 63 10 DE 01	# bne	t3,t4,res_snext
 @L220
+
+# Match — compute offset
 83 A2 03 02	# lw	t0,32(t2) ; label offset
 B3 82 E2 40	# sub	t0,t0,a4 ; displacement = label - instruction
+
+# Load instruction from output buffer
 33 8E E4 00	# add	t3,s1,a4 ; absolute address in buffer
 83 2E 0E 00	# lw	t4,0(t3) ; instruction word
+
+# Dispatch on fixup type
 13 0F 30 00	# addi	t5,zero,3
 63 80 E6 01	# beq	a3,t5,res_patch_b
 @L218
@@ -2067,6 +2288,7 @@ B3 82 E2 40	# sub	t0,t0,a4 ; displacement = label - instruction
 6F 00 00 00	# jal	zero,res_next
 @L221
 
+# t0 = offset, t4 = instruction
 # Scatter B-type immediate bits
 :L218
 13 0F 00 00	# addi	t5,zero,0
@@ -2125,6 +2347,9 @@ B3 EE EE 01	# or	t4,t4,t5
 6F 00 00 00	# jal	zero,res_loop
 @L216
 
+# ═══════════════════════════════════════════════════════════════════════
+# Output
+# ═══════════════════════════════════════════════════════════════════════
 # Emit q32 magic nop (0x13, 0x00, 0x00, 0x00) before output
 :L222
 13 05 30 01	# addi	a0,zero,19
@@ -2135,6 +2360,8 @@ A3 00 A9 00	# sb	a0,1(s2)
 23 01 A9 00	# sb	a0,2(s2)
 13 55 85 00	# srli	a0,a0,0x8
 A3 01 A9 00	# sb	a0,3(s2)
+
+# Send magic 4 bytes from s2
 13 0E 09 00	# addi	t3,s2,0
 13 05 49 00	# addi	a0,s2,4
 
@@ -2153,6 +2380,7 @@ A3 01 A9 00	# sb	a0,3(s2)
 6F 00 00 00	# jal	zero,tx_magic
 @L223
 
+# Normal output loop
 :L225
 63 80 24 01	# beq	s1,s2,shutdown
 @L227
@@ -2168,191 +2396,308 @@ A3 01 A9 00	# sb	a0,3(s2)
 6F 00 00 00	# jal	zero,output_lp
 @L225
 
+# ═══════════════════════════════════════════════════════════════════════
+# Shutdown
+# ═══════════════════════════════════════════════════════════════════════
 :L227
 B7 0A 10 00	# lui	s5,0x100
 B7 52 00 00	# lui	t0,0x5
 93 82 52 55	# addi	t0,t0,1365
 23 A0 5A 00	# sw	t0,0(s5)
 
+# ═══════════════════════════════════════════════════════════════════════
+# Error halt — infinite loop
+# ═══════════════════════════════════════════════════════════════════════
 :L228
 6F 00 00 00	# jal	zero,error_halt
 @L228
 
+# ═══════════════════════════════════════════════════════════════════════
+# DATA TABLES
+# ═══════════════════════════════════════════════════════════════════════
+# .balign 4
+# ─── Mnemonic Table ───────────────────────────────────────────────────
+# 16 bytes per entry: 8-byte name (null-padded) + 4-byte template + format + flags + pseudo_id + pad
 # R-type (format 0)
 :L229
 61 64 64 00	# .word	0x00646461
 00 00 00 00	# .word	0x00000000
+
+# .ascii "add\0\0\0\0\0"
 33 00 00 00	# .word	0x00000033
 00 00 00 00	# .word	0x00000000
 73 75 62 00	# .word	0x00627573
 00 00 00 00	# .word	0x00000000
+
+# .ascii "sub\0\0\0\0\0"
 33 00 00 40	# .word	0x40000033
 00 00 00 00	# .word	0x00000000
 61 6E 64 00	# .word	0x00646e61
 00 00 00 00	# .word	0x00000000
+
+# .ascii "and\0\0\0\0\0"
 33 70 00 00	# .word	0x00007033
 00 00 00 00	# .word	0x00000000
 6F 72 00 00	# .word	0x0000726f
 00 00 00 00	# .word	0x00000000
+
+# .ascii "or\0\0\0\0\0\0"
 33 60 00 00	# .word	0x00006033
 00 00 00 00	# .word	0x00000000
 78 6F 72 00	# .word	0x00726f78
 00 00 00 00	# .word	0x00000000
+
+# .ascii "xor\0\0\0\0\0"
 33 40 00 00	# .word	0x00004033
 00 00 00 00	# .word	0x00000000
 73 6C 6C 00	# .word	0x006c6c73
 00 00 00 00	# .word	0x00000000
+
+# .ascii "sll\0\0\0\0\0"
 33 10 00 00	# .word	0x00001033
 00 00 00 00	# .word	0x00000000
 73 72 6C 00	# .word	0x006c7273
 00 00 00 00	# .word	0x00000000
+
+# .ascii "srl\0\0\0\0\0"
 33 50 00 00	# .word	0x00005033
 00 00 00 00	# .word	0x00000000
 73 72 61 00	# .word	0x00617273
 00 00 00 00	# .word	0x00000000
+
+# .ascii "sra\0\0\0\0\0"
 33 50 00 40	# .word	0x40005033
 00 00 00 00	# .word	0x00000000
 73 6C 74 00	# .word	0x00746c73
 00 00 00 00	# .word	0x00000000
+
+# .ascii "slt\0\0\0\0\0"
 33 20 00 00	# .word	0x00002033
 00 00 00 00	# .word	0x00000000
 73 6C 74 75	# .word	0x75746c73
 00 00 00 00	# .word	0x00000000
+
+# .ascii "sltu\0\0\0\0"
 33 30 00 00	# .word	0x00003033
 00 00 00 00	# .word	0x00000000
+
+# I-type arithmetic (format 1): rd, rs1, imm
 61 64 64 69	# .word	0x69646461
 00 00 00 00	# .word	0x00000000
+
+# .ascii "addi\0\0\0\0"
 13 00 00 00	# .word	0x00000013
 01 00 00 00	# .word	0x00000001
 61 6E 64 69	# .word	0x69646e61
 00 00 00 00	# .word	0x00000000
+
+# .ascii "andi\0\0\0\0"
 13 70 00 00	# .word	0x00007013
 01 00 00 00	# .word	0x00000001
 6F 72 69 00	# .word	0x0069726f
 00 00 00 00	# .word	0x00000000
+
+# .ascii "ori\0\0\0\0\0"
 13 60 00 00	# .word	0x00006013
 01 00 00 00	# .word	0x00000001
 78 6F 72 69	# .word	0x69726f78
 00 00 00 00	# .word	0x00000000
+
+# .ascii "xori\0\0\0\0"
 13 40 00 00	# .word	0x00004013
 01 00 00 00	# .word	0x00000001
 73 6C 74 69	# .word	0x69746c73
 00 00 00 00	# .word	0x00000000
+
+# .ascii "slti\0\0\0\0"
 13 20 00 00	# .word	0x00002013
 01 00 00 00	# .word	0x00000001
 73 6C 74 69	# .word	0x69746c73
 75 00 00 00	# .word	0x00000075
+
+# .ascii "sltiu\0\0\0"
 13 30 00 00	# .word	0x00003013
 01 00 00 00	# .word	0x00000001
 73 6C 6C 69	# .word	0x696c6c73
 00 00 00 00	# .word	0x00000000
+
+# .ascii "slli\0\0\0\0"
 13 10 00 00	# .word	0x00001013
 01 00 00 00	# .word	0x00000001
 73 72 6C 69	# .word	0x696c7273
 00 00 00 00	# .word	0x00000000
+
+# .ascii "srli\0\0\0\0"
 13 50 00 00	# .word	0x00005013
 01 00 00 00	# .word	0x00000001
 73 72 61 69	# .word	0x69617273
 00 00 00 00	# .word	0x00000000
+
+# .ascii "srai\0\0\0\0"
 13 50 00 40	# .word	0x40005013
 01 00 00 00	# .word	0x00000001
+
+# Loads (format 7 = load): rd, imm(rs1)
 6C 62 00 00	# .word	0x0000626c
 00 00 00 00	# .word	0x00000000
+
+# .ascii "lb\0\0\0\0\0\0"
 03 00 00 00	# .word	0x00000003
 07 00 00 00	# .word	0x00000007
 6C 68 00 00	# .word	0x0000686c
 00 00 00 00	# .word	0x00000000
+
+# .ascii "lh\0\0\0\0\0\0"
 03 10 00 00	# .word	0x00001003
 07 00 00 00	# .word	0x00000007
 6C 77 00 00	# .word	0x0000776c
 00 00 00 00	# .word	0x00000000
+
+# .ascii "lw\0\0\0\0\0\0"
 03 20 00 00	# .word	0x00002003
 07 00 00 00	# .word	0x00000007
 6C 62 75 00	# .word	0x0075626c
 00 00 00 00	# .word	0x00000000
+
+# .ascii "lbu\0\0\0\0\0"
 03 40 00 00	# .word	0x00004003
 07 00 00 00	# .word	0x00000007
 6C 68 75 00	# .word	0x0075686c
 00 00 00 00	# .word	0x00000000
+
+# .ascii "lhu\0\0\0\0\0"
 03 50 00 00	# .word	0x00005003
 07 00 00 00	# .word	0x00000007
+
+# Stores (format 2): rs2, imm(rs1)
 73 62 00 00	# .word	0x00006273
 00 00 00 00	# .word	0x00000000
+
+# .ascii "sb\0\0\0\0\0\0"
 23 00 00 00	# .word	0x00000023
 02 00 00 00	# .word	0x00000002
 73 68 00 00	# .word	0x00006873
 00 00 00 00	# .word	0x00000000
+
+# .ascii "sh\0\0\0\0\0\0"
 23 10 00 00	# .word	0x00001023
 02 00 00 00	# .word	0x00000002
 73 77 00 00	# .word	0x00007773
 00 00 00 00	# .word	0x00000000
+
+# .ascii "sw\0\0\0\0\0\0"
 23 20 00 00	# .word	0x00002023
 02 00 00 00	# .word	0x00000002
+
+# Branches (format 3): rs1, rs2, label
 62 65 71 00	# .word	0x00716562
 00 00 00 00	# .word	0x00000000
+
+# .ascii "beq\0\0\0\0\0"
 63 00 00 00	# .word	0x00000063
 03 00 00 00	# .word	0x00000003
 62 6E 65 00	# .word	0x00656e62
 00 00 00 00	# .word	0x00000000
+
+# .ascii "bne\0\0\0\0\0"
 63 10 00 00	# .word	0x00001063
 03 00 00 00	# .word	0x00000003
 62 6C 74 00	# .word	0x00746c62
 00 00 00 00	# .word	0x00000000
+
+# .ascii "blt\0\0\0\0\0"
 63 40 00 00	# .word	0x00004063
 03 00 00 00	# .word	0x00000003
 62 67 65 00	# .word	0x00656762
 00 00 00 00	# .word	0x00000000
+
+# .ascii "bge\0\0\0\0\0"
 63 50 00 00	# .word	0x00005063
 03 00 00 00	# .word	0x00000003
 62 6C 74 75	# .word	0x75746c62
 00 00 00 00	# .word	0x00000000
+
+# .ascii "bltu\0\0\0\0"
 63 60 00 00	# .word	0x00006063
 03 00 00 00	# .word	0x00000003
 62 67 65 75	# .word	0x75656762
 00 00 00 00	# .word	0x00000000
+
+# .ascii "bgeu\0\0\0\0"
 63 70 00 00	# .word	0x00007063
 03 00 00 00	# .word	0x00000003
+
+# U-type (format 4): rd, imm
 6C 75 69 00	# .word	0x0069756c
 00 00 00 00	# .word	0x00000000
+
+# .ascii "lui\0\0\0\0\0"
 37 00 00 00	# .word	0x00000037
 04 00 00 00	# .word	0x00000004
 61 75 69 70	# .word	0x70697561
 63 00 00 00	# .word	0x00000063
+
+# .ascii "auipc\0\0\0"
 17 00 00 00	# .word	0x00000017
 04 00 00 00	# .word	0x00000004
+
+# J-type (format 5): rd, label
 6A 61 6C 00	# .word	0x006c616a
 00 00 00 00	# .word	0x00000000
+
+# .ascii "jal\0\0\0\0\0"
 6F 00 00 00	# .word	0x0000006f
 05 00 00 00	# .word	0x00000005
+
+# Pseudos (format 6)
 6E 6F 70 00	# .word	0x00706f6e
 00 00 00 00
+
+# .ascii "nop\0\0\0\0\0"
 00 00 00 00
 06 00 00 00	# .word	0x00000006
 6C 69 00 00	# .word	0x0000696c
 00 00 00 00
+
+# .ascii "li\0\0\0\0\0\0"
 00 00 00 00
 06 00 01 00	# .word	0x00010006
 6D 76 00 00	# .word	0x0000766d
 00 00 00 00
+
+# .ascii "mv\0\0\0\0\0\0"
 00 00 00 00
 06 00 02 00	# .word	0x00020006
 6A 00 00 00	# .word	0x0000006a
 00 00 00 00
+
+# .ascii "j\0\0\0\0\0\0\0"
 00 00 00 00
 06 00 03 00	# .word	0x00030006
 62 65 71 7A	# .word	0x7a716562
 00 00 00 00
+
+# .ascii "beqz\0\0\0\0"
 00 00 00 00
 06 00 05 00	# .word	0x00050006
 62 6E 65 7A	# .word	0x7a656e62
 00 00 00 00
+
+# .ascii "bnez\0\0\0\0"
 00 00 00 00
 06 00 06 00	# .word	0x00060006
+
+# Sentinel (end of table)
 00 00 00 00
 00 00 00 00
 00 00 00 00
 00 00 00 00
 
+# .word 0, 0, 0, 0
+# .word 0, 0, 0, 0
+# .word 0, 0, 0, 0
+# ─── Register Table ───────────────────────────────────────────────────
+# 8 bytes per entry: up to 5 chars name (null-terminated) + reg number at byte 5 + 2 pad
 :L230
 7A 65 72 6F	# .word	0x6f72657a
 00 00 00 00	# .word	0x00000000
@@ -2420,5 +2765,7 @@ B7 52 00 00	# lui	t0,0x5
 00 1E 00 00	# .word	0x00001e00
 74 36 00 00	# .word	0x00003674
 00 1F 00 00	# .word	0x00001f00
+
+# Sentinel
 00 00 00 00
 00 00 00 00
