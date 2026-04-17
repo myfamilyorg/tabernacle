@@ -20,10 +20,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# ────────────────────────────────�
+# ──────────────────────────────────────────────────────────────────────────────
 # file: fam1.S - stage 1 bootstrap assembler (GNU as reference)
 # RISC-V 32-bit Hex-to-Binary with Labels and Branch Fixups
-# ────────────────────────────────�
+# ──────────────────────────────────────────────────────────────────────────────
 #
 # Input format (superset of fam0):
 #   Hex bytes:   "13 05 A0 00"      (same as fam0)
@@ -74,6 +74,7 @@ B7 2C 00 80	# lui	s9,0x80002 ; Fixup table  @ 0x80002000
 B7 34 00 80	# lui	s1,0x80003 ; Output buffer @ 0x80003000
 13 89 04 00	# addi	s2,s1,0
 
+# ─── Main Input Loop ─────────────────────────────────────────────────
 # loop:
 03 CF 5A 00	# lbu	t5,5(s5) ; UART status
 13 7F 1F 00	# andi	t5,t5,1 ; Data ready?
@@ -84,14 +85,14 @@ E3 0C 0F FE	# beq	t5,zero,loop
 63 14 63 01	# bne	t1,s6,not_nl
 13 0A 00 00	# addi	s4,zero,0
 
-# '#' starts comment
 # not_nl:
+# '#' starts comment
 13 0E 30 02	# addi	t3,zero,35
 63 14 C3 01	# bne	t1,t3,not_hash
 13 0A 10 00	# addi	s4,zero,1
 
-# EOT → resolve fixups and output
 # not_hash:
+# EOT → resolve fixups and output
 13 0E 40 00	# addi	t3,zero,4
 63 02 C3 0D	# beq	t1,t3,resolve
 
@@ -118,6 +119,7 @@ E3 4E C3 FB	# blt	t1,t3,loop
 63 64 C3 01	# bltu	t1,t3,store ; 10–15 valid
 6F F0 5F FA	# jal	zero,loop ; invalid → skip
 
+# ─── Nibble Packing ──────────────────────────────────────────────────
 # store:
 93 C9 19 00	# xori	s3,s3,1 ; Toggle high/low
 63 96 09 00	# bne	s3,zero,store_low ; Was high → now store low
@@ -130,6 +132,8 @@ B3 EE 6E 00	# or	t4,t4,t1 ; Pack high | low
 13 09 19 00	# addi	s2,s2,1
 6F F0 5F F8	# jal	zero,loop
 
+# ─── Label Definition ────────────────────────────────────────────────
+# Read 4 chars from UART, store (name, output_addr) in label table
 # label_def:
 13 0E 00 00	# addi	t3,zero,0 ; Byte counter
 
@@ -147,6 +151,8 @@ E3 10 5E FE	# bne	t3,t0,ld_poll
 13 0C 8C 00	# addi	s8,s8,8 ; Advance table pointer
 6F F0 1F F5	# jal	zero,loop
 
+# ─── Fixup Reference ─────────────────────────────────────────────────
+# Read 4 chars from UART, store (name, instr_addr) in fixup table
 # fixup_ref:
 13 0E 00 00	# addi	t3,zero,0 ; Byte counter
 
@@ -165,6 +171,8 @@ E3 10 5E FE	# bne	t3,t0,fu_poll
 13 0D 8D 00	# addi	s10,s10,8 ; Advance table pointer
 6F F0 9F F1	# jal	zero,loop
 
+# ─── Resolve Fixups ──────────────────────────────────────────────────
+# Iterate fixup table, look up each name, patch the instruction
 # resolve:
 93 8F 0C 00	# addi	t6,s9,0 ; t6 = fixup iterator
 
@@ -196,6 +204,8 @@ E3 10 5E FE	# bne	t3,t0,fu_poll
 63 0E 5E 04	# beq	t3,t0,patch_j ; J-type jump
 6F 00 80 0A	# jal	zero,res_next ; Unknown → skip
 
+# ─── Patch B-type Immediate ──────────────────────────────────────────
+# B-type: imm[12|10:5] rs2 rs1 funct3 imm[4:1|11] opcode
 # patch_b:
 83 A2 03 00	# lw	t0,0(t2) ; Load instruction
 13 0E 00 00	# addi	t3,zero,0 ; Build encoded immediate
@@ -219,6 +229,8 @@ B3 E2 C2 01	# or	t0,t0,t3 ; Merge immediate into instruction
 23 A0 53 00	# sw	t0,0(t2) ; Store patched instruction
 6F 00 40 05	# jal	zero,res_next
 
+# ─── Patch J-type Immediate ──────────────────────────────────────────
+# J-type: imm[20|10:1|11|19:12] rd opcode
 # patch_j:
 83 A2 03 00	# lw	t0,0(t2) ; Load instruction
 13 0E 00 00	# addi	t3,zero,0 ; Build encoded immediate
@@ -241,10 +253,12 @@ B3 E2 C2 01	# or	t0,t0,t3 ; Merge immediate into instruction
 B3 E2 C2 01	# or	t0,t0,t3 ; Merge immediate into instruction
 23 A0 53 00	# sw	t0,0(t2) ; Store patched instruction
 
+# fall through
 # res_next:
 93 8F 8F 00	# addi	t6,t6,8
 6F F0 1F F1	# jal	zero,res_loop
 
+# ─── Output ──────────────────────────────────────────────────────────
 # output:
 63 80 24 03	# beq	s1,s2,shutdown ; Empty → exit
 03 CE 04 00	# lbu	t3,0(s1) ; Load byte
@@ -257,6 +271,7 @@ E3 0C 03 FE	# beq	t1,zero,tx_poll
 23 80 CA 01	# sb	t3,0(s5) ; Send byte
 6F F0 5F FE	# jal	zero,output
 
+# ─── Shutdown ────────────────────────────────────────────────────────
 # shutdown:
 B7 0A 10 00	# lui	s5,0x100 ; QEMU virt test device 0x100000
 37 53 00 00	# lui	t1,0x5 ; 0x5000
