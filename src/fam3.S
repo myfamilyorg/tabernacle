@@ -513,11 +513,12 @@ poweroff_hang:
 #   E24 bad string literal       E25 bad prologue
 #   E26 bad epilogue
 #
-# Known issue: .word / .byte directives do not support trailing '#'
-# comments on the same line.  The tokenizer's comment handler sets
-# EOL but read_token continues into the next line, causing the next
-# mnemonic to be consumed as a .word value (E17 at link time).
-# Workaround: put comments on a separate line before .word/.byte.
+# Trailing `#` comments on the same line as .word / .byte work: when
+# read_imm_op sees TB_EOL set after its read_token (indicating the
+# tokenizer skipped past a newline before finding a token), it pushes
+# the token back and returns a1=1 instead of running eval_expr on it.
+# do_ps_word / do_ps_byte check a1 and exit the loop cleanly, and the
+# main loop then processes the pushed-back token as its own statement.
 
 imm_range_i:
 	li	a0, 19			# E19 = I/S-type immediate out of range
@@ -1870,12 +1871,32 @@ read_imm_op:
 	li	gp, 3
 	j	read_token
 read_token_rs3:
+	# If the tokenizer crossed a newline before collecting this token, the
+	# token belongs to the next logical line.  Push it back and signal the
+	# caller with a1=1 instead of running eval_expr on it — eval_expr on an
+	# identifier that happens to be the next line's mnemonic would halt
+	# with E17 (unresolved symbol) during the final fixup pass, which
+	# bit `.word VAL  # trailing comment` as a previously documented bug.
+	lw	t0, TB_EOL(s10)
+	bnez	t0, rio_pushback
 	mv	a0, s10
 	add	a1, s10, s0
 	li	gp, 3
 	j	eval_expr
 eval_expr_rs3:
 	bne	a2, a1, rio_bad
+	li	a1, 0			# normal return: a0 = value
+	lw	gp, 0(sp)
+	addi	sp, sp, 4
+	j	read_imm_op_disp
+rio_pushback:
+	# Pushback the token so a subsequent read_token returns it unchanged.
+	# Zero a0 so single-op callers that ignore a1 produce a harmless 0 imm
+	# rather than whatever was in a0 from the previous iteration.
+	li	t0, 1
+	sw	t0, TB_PUSHBACK(s10)
+	li	a0, 0
+	li	a1, 1			# signal: no imm read (line ended first)
 	lw	gp, 0(sp)
 	addi	sp, sp, 4
 	j	read_imm_op_disp
@@ -4276,14 +4297,17 @@ byte_lp:
 	li	gp, 5		# single-token expression per value
 	j	read_imm_op
 read_imm_op_rs5:
+	# a1=1 means read_imm_op saw a newline before finding a token — the
+	# token (if any) was pushed back and belongs on the next logical line.
+	# Don't emit anything; exit cleanly.
+	bnez	a1, byte_done
 	sb	a0, 0(s2)
 	addi	s2, s2, 1
-	# Check if more values: pending_nl or eol_flag means end of line
-	lw	t0, TB_PENDING(s10)		# pending_nl (set when newline ends token)
+	# Check if more values: pending_nl means the token we just consumed
+	# ended with \n; EOT means input is exhausted.
+	lw	t0, TB_PENDING(s10)
 	bnez	t0, byte_done
-	lw	t0, TB_EOL(s10)		# eol_flag (set at start of next read_token)
-	bnez	t0, byte_done
-	lbu	t0, TB_EOT(s10)		# sticky EOT
+	lbu	t0, TB_EOT(s10)
 	beqz	t0, byte_lp
 byte_done:
 	lw	gp, 0(sp)
@@ -4301,12 +4325,14 @@ word_lp:
 	li	gp, 6
 	j	read_imm_op
 read_imm_op_rs6:
+	# See do_ps_byte — a1=1 means the next token is on a following line.
+	# Skip the emit so we don't turn a trailing `#` comment or missing
+	# operand into a bogus emit / E17.
+	bnez	a1, word_done
 	li	gp, 9
 	j	emit_word
 emit_word_rs9:
 	lw	t0, TB_PENDING(s10)
-	bnez	t0, word_done
-	lw	t0, TB_EOL(s10)
 	bnez	t0, word_done
 	lbu	t0, TB_EOT(s10)
 	beqz	t0, word_lp
