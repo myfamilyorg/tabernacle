@@ -1,0 +1,78 @@
+#!/bin/sh
+# Regenerate src/bin_config.inc from src/full_node.fam, then rebuild
+# bin/tabernacle so its embedded hash/size match the new node.
+#
+# Self-hosted: uses bin/gen_bin_config (compiled from src/gen_bin_config.fam3
+# by build.sh) to compute the gimli-hash. Requires QEMU only, no python.
+#
+# Typical workflow after editing src/full_node.fam:
+#
+#   bash build.sh                    # bootstrap, compile node + gen_bin_config
+#   tools/refresh_bin_config         # regen bin_config + rebuild tabernacle
+#   git add src/bin_config.inc       # commit the updated hash
+#
+# Anyone who doesn't touch full_node.fam can run just `bash build.sh`.
+set -e
+
+SELF="$0"
+[ -L "$SELF" ] && SELF="$(readlink -f "$SELF")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+
+cd "$ROOT_DIR"
+
+for f in bin/famc bin/fam3 bin/gen_bin_config; do
+	if [ ! -f "$f" ]; then
+		echo "tools/refresh_bin_config: $f missing — run build.sh first" >&2
+		exit 1
+	fi
+done
+
+CPU="rv32,m=false,a=false,f=false,d=false,c=false,\
+zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\
+zcd=false,zcf=false,zcmp=false,zcmt=false,zicsr=false,zifencei=false"
+
+# Compile full_node.fam so bin/full_node is fresh before we hash it.
+# Direct famc invocation (no wrapper): pipe source + EOT through QEMU with
+# bin/famc loaded as the compiler binary.
+echo "Compiling src/full_node.fam" >&2
+(cat src/full_node.fam; printf '\004') | qemu-system-riscv32 \
+	-machine virt -cpu "$CPU" \
+	-nographic -bios none \
+	-device loader,file=bin/famc,addr=0x80000000 > bin/full_node
+
+# Build the input stream for gen_bin_config: 4-byte little-endian length
+# prefix followed by the node bytes. Pipe into QEMU; its UART stdout will
+# be the new bin_config.inc contents.
+echo "Generating src/bin_config.inc from bin/full_node" >&2
+SIZE=$(wc -c < bin/full_node)
+{
+	for i in 0 8 16 24; do
+		byte=$(( (SIZE >> i) & 0xFF ))
+		# POSIX printf: octal escapes are portable; hex isn't.
+		printf "\\$(printf '%03o' $byte)"
+	done
+	cat bin/full_node
+} | qemu-system-riscv32 \
+	-machine virt -cpu "$CPU" \
+	-nographic -bios none \
+	-device loader,file=bin/gen_bin_config,addr=0x80000000 \
+	-serial stdio -monitor none 2>/dev/null > src/bin_config.inc
+
+# Sanity-check: the output must start with a '#' comment header.
+FIRST=$(head -c 1 src/bin_config.inc)
+if [ "$FIRST" != "#" ]; then
+	echo "tools/refresh_bin_config: gen_bin_config produced unexpected output" >&2
+	head -c 200 src/bin_config.inc >&2
+	exit 1
+fi
+
+# Rebuild tabernacle against the updated bin_config.
+echo "Rebuilding bin/tabernacle" >&2
+tools/build_node bin/tabernacle > /dev/null
+
+# Restage the node binary for tools/server.py.
+mkdir -p tmp
+cp bin/full_node tmp/node.bin
+echo "Staged tmp/node.bin ($(wc -c < tmp/node.bin) bytes)" >&2
+echo "Done."

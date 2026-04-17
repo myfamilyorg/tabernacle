@@ -12,13 +12,15 @@
 //
 // Memory layout:
 //   bin_base    = image_base                          (first byte of our image)
+//   bin_size    = gp - image_base                     (this binary's own size,
+//                                                      4-aligned by famc — what
+//                                                      gen_bin_config.py will
+//                                                      record as BIN_SIZE in
+//                                                      tabernacle's bin_config)
 //   famc stack  = [gp .. gp + 64 KiB], sp grows down  (default famc layout)
-//   scratch     = align_up(image_base + 128 KiB, 4 KiB)
-//                                                     (virtio queue area; sits
+//   scratch     = align_up(gp + 64 KiB, 4 KiB)        (virtio queue area; sits
 //                                                      above famc's stack so
 //                                                      they can't collide)
-
-BIN_SIZE = 3145728;        // 3 MiB, matches tabernacle's bin_config
 
 // --- UART ---
 UART_BASE = 0x10000000;
@@ -62,7 +64,11 @@ fn emit(c) {
 
 // --- top-level setup ---
 bin_base := image_base;
-scratch := (bin_base + 0x20FFF) & 0xFFFFF000;
+gp_val := 0;
+asm { (gp_val = gp) }
+bin_size := gp_val - bin_base;
+// Scratch sits above famc's default stack: page-align (gp + 64 KiB) up.
+scratch := (gp_val + 0x10FFF) & 0xFFFFF000;
 
 // --- scan MMIO for a virtio-blk device (device_id = 2) ---
 blk := 0;
@@ -96,7 +102,7 @@ arg1 == 0 ? emit('L') : blk == 0 ? emit('E') : {
         // --- write loop: chunk the image into BLOCK_MAX-byte writes ---
         src := bin_base;
         sector := 0;
-        remaining := BIN_SIZE;
+        remaining := bin_size;
         avail_idx := 0;
         err := 0;
 

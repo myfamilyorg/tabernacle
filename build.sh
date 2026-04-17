@@ -1,10 +1,17 @@
 #!/usr/bin/sh
 # Bootstrap build. Each stage compiles the next from source using only the
-# previous stage's binary. No external tools other than QEMU.
+# previous stage's binary. Nothing here depends on anything except QEMU —
+# no python, no external assemblers, no libc.
 #
 # Stages:
 #   fam0 → fam1 → fam2 → fam3 → famc    (compiler toolchain)
-#   tabernacle                             (node loader, assembled by fam3)
+#   gen_bin_config                      (self-hosted gimli-hash + config
+#                                        generator, used by
+#                                        tools/refresh_bin_config)
+#   full_node                           (the node image, compiled from
+#                                        src/full_node.fam via famc)
+#   tabernacle                          (node loader, assembled by fam3
+#                                        against the current bin_config.inc)
 #
 # Usage: run <assembler> <source...>
 # Multiple source files are concatenated before piping to the assembler.
@@ -31,6 +38,25 @@ run bin/fam0 src/fam1.fam0 > bin/fam1
 run bin/fam1 src/fam2.fam1 > bin/fam2
 run bin/fam2 src/fam3.fam2 > bin/fam3
 run bin/fam3 src/famc.fam3 > bin/famc
+
+# Self-hosted gimli-hash + bin_config generator (used by
+# tools/refresh_bin_config to regenerate src/bin_config.inc without python).
+run bin/fam3 src/gen_bin_config.fam3 > bin/gen_bin_config
+
+# Compile the node binary with the freshly-built famc. Pass the source
+# directly (no stdlib prepend) — full_node.fam emits its own UART helper
+# and doesn't need stdlib's puts.
+run bin/famc src/full_node.fam > bin/full_node
+
+# Tabernacle is compiled against the checked-in src/bin_config.inc. If
+# full_node.fam has changed in a way that shifts its hash or size, the
+# checked-in bin_config is stale — run tools/refresh_bin_config and then
+# re-run build.sh.
 run bin/fam3 src/bin_config.inc src/tabernacle.fam3 > bin/tabernacle
+
+# Stage the node binary where tools/server.py looks for it by default.
+mkdir -p tmp
+cp bin/full_node tmp/node.bin
+echo "Staged tmp/node.bin ($(wc -c < tmp/node.bin) bytes)" >&2
 
 echo "Success!"

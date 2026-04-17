@@ -1,0 +1,650 @@
+# gen_bin_config.fam3 -- self-hosted replacement for tools/gen_bin_config.py.
+#
+# Reads a binary from stdin (UART RX) as a 4-byte little-endian length
+# prefix followed by exactly that many bytes, computes the Gimli-hash, and
+# writes a bin_config.inc file to stdout (UART TX).
+#
+# A length prefix (rather than an EOT sentinel like famc uses for text
+# input) is necessary here because every byte value is valid inside the
+# binary we're hashing.
+#
+# Usage (see tools/refresh_bin_config for the invocation):
+#   emit_len4 <binary>
+#   cat <binary>
+# piped into qemu with -device loader,file=bin/gen_bin_config and
+# -serial mon:stdio > src/bin_config.inc.
+#
+# The Gimli implementation (gimli_hash + gimli_permute) is a straight copy
+# of the one in tabernacle.fam3 — dispatch is via gp-based return sites,
+# matching the "no jalr, static jumps only" invariant enforced by
+# tools/no-jalr and checked against every binary we ship.
+
+# ── Platform constants ───────────────────────────────────────────────────
+.equ	UART_BASE,		0x10000000
+.equ	UART_LSR,		5
+.equ	UART_TX_READY,		0x20
+.equ	UART_RX_READY,		0x01
+.equ	SHUTDOWN_ADDR,		0x00100000
+.equ	SHUTDOWN_VAL,		0x5555
+
+# Layout inside QEMU virt RAM (128 MiB starting at 0x80000000):
+#   0x80000000 .. ~0x80002000  our code + data (under 8 KiB)
+#   0x80100000 .. 0x80F00000    input buffer (14 MiB, plenty for any image)
+#   0x81000000                  initial sp (grows down)
+.equ	BUF_BASE,		0x80100000
+.equ	BUF_END,		0x80F00000
+.equ	STACK_TOP,		0x81000000
+
+# ══════════════════════════════════════════════════════════════════════════
+# _start: set up sp, read input, hash, format output, power off.
+# ══════════════════════════════════════════════════════════════════════════
+_start:
+	lui	sp, 0x81000		# sp = STACK_TOP (0x81000000)
+
+	# s0 = buffer base, s1 = write cursor, s2 = buffer end.
+	lui	s0, 0x80100
+	addi	s1, s0, 0
+	lui	s2, 0x80F00
+
+# -- Read 4-byte little-endian length prefix into s4. ---------------------
+	li	s4, 0			# accumulated length
+	li	s5, 0			# byte index 0..3
+read_len:
+	li	t0, UART_BASE
+rl_wait:
+	lbu	t1, UART_LSR(t0)
+	andi	t1, t1, UART_RX_READY
+	beqz	t1, rl_wait
+	lbu	t2, 0(t0)
+	slli	t3, s5, 3		# shift = byte_index * 8
+	sll	t2, t2, t3
+	or	s4, s4, t2
+	addi	s5, s5, 1
+	li	t0, 4
+	blt	s5, t0, read_len
+
+	# Sanity-check length against the 14 MiB buffer.
+	li	t0, 0x00E00000		# BUF_END - BUF_BASE = 14 MiB
+	bgeu	s4, t0, input_too_big
+
+# -- Read exactly s4 bytes of payload. ------------------------------------
+	addi	s6, s4, 0		# bytes remaining
+read_loop:
+	beqz	s6, read_done
+	li	t0, UART_BASE
+rd_wait:
+	lbu	t1, UART_LSR(t0)
+	andi	t1, t1, UART_RX_READY
+	beqz	t1, rd_wait
+	lbu	t2, 0(t0)
+	sb	t2, 0(s1)
+	addi	s1, s1, 1
+	addi	s6, s6, -1
+	j	read_loop
+
+read_done:
+
+	# Allocate 32-byte hash output on the stack.
+	addi	sp, sp, -32
+	addi	s3, sp, 0		# s3 = hash output ptr
+
+	# Call gimli_hash(data=s0, len=s4, out=s3).
+	addi	a0, s0, 0
+	addi	a1, s4, 0
+	addi	a2, s3, 0
+	li	gp, 0			# gp=0 → gh_ret
+	j	gimli_hash
+
+gh_ret:
+	# -- Header lines --
+	lla	a0, hdr1
+	li	gp, 0			# gp=0 → es_ret_h1
+	j	emit_str
+es_ret_h1:
+	lla	a0, hdr2
+	li	gp, 1			# gp=1 → es_ret_h2
+	j	emit_str
+es_ret_h2:
+
+	# -- ".equ\tBIN_SIZE,\t\t<len>\n" --
+	lla	a0, size_prefix
+	li	gp, 2			# gp=2 → es_ret_sz
+	j	emit_str
+es_ret_sz:
+	addi	a0, s4, 0
+	li	gp, 0			# gp=0 → ed_ret
+	j	emit_dec
+ed_ret:
+	li	a0, 10			# '\n'
+	li	gp, 0			# gp=0 → ec_ret_nlsz
+	j	emit_char
+ec_ret_nlsz:
+
+	# -- 8 x ".equ\tBIN_HASH<i>,\t\t0x<word>\n" --
+	li	s5, 0			# i
+hash_loop:
+	li	t0, 8
+	bge	s5, t0, hash_done
+	lla	a0, hash_prefix
+	li	gp, 3			# gp=3 → es_ret_hp
+	j	emit_str
+es_ret_hp:
+	addi	a0, s5, 48		# '0' + i
+	li	gp, 1			# gp=1 → ec_ret_dig
+	j	emit_char
+ec_ret_dig:
+	lla	a0, hash_mid
+	li	gp, 4			# gp=4 → es_ret_hm
+	j	emit_str
+es_ret_hm:
+	slli	t0, s5, 2
+	add	t0, s3, t0
+	lw	a0, 0(t0)
+	li	gp, 0			# gp=0 → eh_ret
+	j	emit_hex8
+eh_ret:
+	li	a0, 10			# '\n'
+	li	gp, 2			# gp=2 → ec_ret_nlh
+	j	emit_char
+ec_ret_nlh:
+	addi	s5, s5, 1
+	j	hash_loop
+
+hash_done:
+	li	t0, SHUTDOWN_ADDR
+	li	t1, SHUTDOWN_VAL
+	sw	t1, 0(t0)
+hang:
+	wfi
+	j	hang
+
+input_too_big:
+	lla	a0, err_too_big
+	li	gp, 5			# gp=5 → es_ret_err
+	j	emit_str
+es_ret_err:
+	li	t0, SHUTDOWN_ADDR
+	li	t1, SHUTDOWN_VAL
+	sw	t1, 0(t0)
+	j	hang
+
+# ══════════════════════════════════════════════════════════════════════════
+# emit_char -- write the byte in a0 (low 8 bits) to the UART.
+# Dispatch sites: gp=0 ec_ret_nlsz, gp=1 ec_ret_dig, gp=2 ec_ret_nlh.
+# Clobbers: t0, t1.
+# ══════════════════════════════════════════════════════════════════════════
+emit_char:
+	li	t0, UART_BASE
+ec_wait:
+	lbu	t1, UART_LSR(t0)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, ec_wait
+	sb	a0, 0(t0)
+emit_char_disp:
+	beqz	gp, ec_ret_nlsz
+	li	t0, 1
+	beq	gp, t0, ec_ret_dig
+	li	t0, 2
+	beq	gp, t0, ec_ret_nlh
+	j	dispatch_error
+
+# ══════════════════════════════════════════════════════════════════════════
+# emit_str -- write the null-terminated string at a0 to the UART.
+# Dispatch sites: gp=0..5 (see uses above).
+# Clobbers: t0, t1, t2, t3.
+# ══════════════════════════════════════════════════════════════════════════
+emit_str:
+	addi	t3, a0, 0		# read ptr
+	li	t2, UART_BASE
+es_loop:
+	lbu	t0, 0(t3)
+	beqz	t0, es_done
+es_wait:
+	lbu	t1, UART_LSR(t2)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, es_wait
+	sb	t0, 0(t2)
+	addi	t3, t3, 1
+	j	es_loop
+es_done:
+emit_str_disp:
+	beqz	gp, es_ret_h1
+	li	t0, 1
+	beq	gp, t0, es_ret_h2
+	li	t0, 2
+	beq	gp, t0, es_ret_sz
+	li	t0, 3
+	beq	gp, t0, es_ret_hp
+	li	t0, 4
+	beq	gp, t0, es_ret_hm
+	li	t0, 5
+	beq	gp, t0, es_ret_err
+	j	dispatch_error
+
+# ══════════════════════════════════════════════════════════════════════════
+# emit_dec -- write the unsigned decimal value in a0 to the UART.
+# Dispatch sites: gp=0 ed_ret.
+# Strategy: repeated subtraction-by-10 to peel digits into a stack buffer
+# (LSB first), then emit in reverse. Max 10 digits for 32-bit unsigned;
+# we allocate 16 bytes of scratch.
+# Clobbers: t0..t6, a0.
+# ══════════════════════════════════════════════════════════════════════════
+emit_dec:
+	addi	sp, sp, -20
+	sw	gp, 16(sp)
+	bnez	a0, ed_nonzero
+	# Special-case: v=0 → emit single '0'.
+	li	a0, 48
+	li	t2, UART_BASE
+ed_zero_wait:
+	lbu	t1, UART_LSR(t2)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, ed_zero_wait
+	sb	a0, 0(t2)
+	j	ed_epilogue
+ed_nonzero:
+	addi	t3, sp, 16		# write ptr (grows downward inside buf)
+	li	t4, 0			# digit count
+ed_gen:
+	beqz	a0, ed_emit
+	# divmod by 10 via subtraction loop (max 10 iterations: a0 ∈ [0, 9]
+	# after at most 10 subtracts since remainder < 10).
+	addi	t5, zero, 0		# quotient
+	addi	t6, a0, 0		# remainder
+ed_div:
+	li	t0, 10
+	blt	t6, t0, ed_div_done
+	sub	t6, t6, t0
+	addi	t5, t5, 1
+	j	ed_div
+ed_div_done:
+	# t5 = a0/10, t6 = a0%10
+	addi	t3, t3, -1
+	addi	t6, t6, 48		# '0' + digit
+	sb	t6, 0(t3)
+	addi	t4, t4, 1
+	addi	a0, t5, 0
+	j	ed_gen
+ed_emit:
+	li	t2, UART_BASE
+ed_emit_loop:
+	beqz	t4, ed_epilogue
+ed_emit_wait:
+	lbu	t1, UART_LSR(t2)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, ed_emit_wait
+	lbu	t5, 0(t3)
+	sb	t5, 0(t2)
+	addi	t3, t3, 1
+	addi	t4, t4, -1
+	j	ed_emit_loop
+ed_epilogue:
+	lw	gp, 16(sp)
+	addi	sp, sp, 20
+emit_dec_disp:
+	beqz	gp, ed_ret
+	j	dispatch_error
+
+# ══════════════════════════════════════════════════════════════════════════
+# emit_hex8 -- write the 32-bit word in a0 as 8 uppercase hex digits.
+# Dispatch sites: gp=0 eh_ret.
+# Clobbers: t0..t5.
+# ══════════════════════════════════════════════════════════════════════════
+emit_hex8:
+	addi	sp, sp, -4
+	sw	gp, 0(sp)
+	li	t4, 7			# shift counter (7*4=28 down to 0)
+	li	t2, UART_BASE
+eh_loop:
+	slli	t3, t4, 2		# shift amount = t4 * 4
+	srl	t0, a0, t3		# t0 = a0 >> shift
+	andi	t0, t0, 0xF		# nibble
+	li	t1, 10
+	blt	t0, t1, eh_digit
+	addi	t0, t0, 55		# 'A' - 10
+	j	eh_emit
+eh_digit:
+	addi	t0, t0, 48		# '0'
+eh_emit:
+eh_wait:
+	lbu	t1, UART_LSR(t2)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, eh_wait
+	sb	t0, 0(t2)
+	addi	t4, t4, -1
+	bgez	t4, eh_loop
+	lw	gp, 0(sp)
+	addi	sp, sp, 4
+emit_hex8_disp:
+	beqz	gp, eh_ret
+	j	dispatch_error
+
+# ══════════════════════════════════════════════════════════════════════════
+# gimli_hash -- Gimli-Hash sponge (rate=16, output=32).
+# Unchanged from tabernacle.fam3 except that only gp=0 (gh_ret_main) is a
+# real caller — the internal permute calls (gpr_absorb / gpr_pad /
+# gpr_squeeze) are the same as tabernacle's.
+# ══════════════════════════════════════════════════════════════════════════
+gimli_hash:
+	addi	sp, sp, -24
+	sw	gp, 0(sp)
+	sw	s0, 4(sp)
+	sw	s1, 8(sp)
+	sw	s2, 12(sp)
+	sw	s3, 16(sp)
+	sw	s4, 20(sp)
+	addi	s1, a0, 0
+	addi	s2, a1, 0
+	addi	s3, a2, 0
+	addi	sp, sp, -48
+	addi	s0, sp, 0
+	sw	zero, 0(s0)
+	sw	zero, 4(s0)
+	sw	zero, 8(s0)
+	sw	zero, 12(s0)
+	sw	zero, 16(s0)
+	sw	zero, 20(s0)
+	sw	zero, 24(s0)
+	sw	zero, 28(s0)
+	sw	zero, 32(s0)
+	sw	zero, 36(s0)
+	sw	zero, 40(s0)
+	sw	zero, 44(s0)
+gh_absorb:
+	li	t0, 16
+	blt	s2, t0, gh_pad
+	lw	t0, 0(s1)
+	lw	t1, 0(s0)
+	xor	t1, t1, t0
+	sw	t1, 0(s0)
+	lw	t0, 4(s1)
+	lw	t1, 4(s0)
+	xor	t1, t1, t0
+	sw	t1, 4(s0)
+	lw	t0, 8(s1)
+	lw	t1, 8(s0)
+	xor	t1, t1, t0
+	sw	t1, 8(s0)
+	lw	t0, 12(s1)
+	lw	t1, 12(s0)
+	xor	t1, t1, t0
+	sw	t1, 12(s0)
+	addi	a0, s0, 0
+	li	gp, 0
+	j	gimli_permute
+gpr_absorb:
+	addi	s1, s1, 16
+	addi	s2, s2, -16
+	j	gh_absorb
+gh_pad:
+	addi	sp, sp, -16
+	addi	s4, sp, 0
+	sw	zero, 0(s4)
+	sw	zero, 4(s4)
+	sw	zero, 8(s4)
+	sw	zero, 12(s4)
+	addi	t0, s1, 0
+	addi	t1, s4, 0
+	addi	t2, s2, 0
+	beqz	t2, gh_pad_mark
+gh_copy:
+	lbu	t3, 0(t0)
+	sb	t3, 0(t1)
+	addi	t0, t0, 1
+	addi	t1, t1, 1
+	addi	t2, t2, -1
+	bnez	t2, gh_copy
+gh_pad_mark:
+	add	t0, s4, s2
+	lbu	t1, 0(t0)
+	xori	t1, t1, 0x01
+	sb	t1, 0(t0)
+	lbu	t1, 15(s4)
+	xori	t1, t1, 0x80
+	sb	t1, 15(s4)
+	lw	t0, 0(s4)
+	lw	t1, 0(s0)
+	xor	t1, t1, t0
+	sw	t1, 0(s0)
+	lw	t0, 4(s4)
+	lw	t1, 4(s0)
+	xor	t1, t1, t0
+	sw	t1, 4(s0)
+	lw	t0, 8(s4)
+	lw	t1, 8(s0)
+	xor	t1, t1, t0
+	sw	t1, 8(s0)
+	lw	t0, 12(s4)
+	lw	t1, 12(s0)
+	xor	t1, t1, t0
+	sw	t1, 12(s0)
+	addi	sp, sp, 16
+	addi	a0, s0, 0
+	li	gp, 1
+	j	gimli_permute
+gpr_pad:
+	lw	t0, 0(s0)
+	sw	t0, 0(s3)
+	lw	t0, 4(s0)
+	sw	t0, 4(s3)
+	lw	t0, 8(s0)
+	sw	t0, 8(s3)
+	lw	t0, 12(s0)
+	sw	t0, 12(s3)
+	addi	a0, s0, 0
+	li	gp, 2
+	j	gimli_permute
+gpr_squeeze:
+	lw	t0, 0(s0)
+	sw	t0, 16(s3)
+	lw	t0, 4(s0)
+	sw	t0, 20(s3)
+	lw	t0, 8(s0)
+	sw	t0, 24(s3)
+	lw	t0, 12(s0)
+	sw	t0, 28(s3)
+	addi	sp, sp, 48
+	lw	gp, 0(sp)
+	lw	s0, 4(sp)
+	lw	s1, 8(sp)
+	lw	s2, 12(sp)
+	lw	s3, 16(sp)
+	lw	s4, 20(sp)
+	addi	sp, sp, 24
+gimli_hash_disp:
+	beqz	gp, gh_ret
+	j	dispatch_error
+
+# ══════════════════════════════════════════════════════════════════════════
+# gimli_permute -- 24-round Gimli-384 permutation.
+# Register-based; state loaded from a0 at entry, stored back at exit.
+# Dispatch sites: gp=0 gpr_absorb, gp=1 gpr_pad, gp=2 gpr_squeeze.
+# ══════════════════════════════════════════════════════════════════════════
+gimli_permute:
+	addi	sp, sp, -48
+	sw	s0, 0(sp)
+	sw	s1, 4(sp)
+	sw	s2, 8(sp)
+	sw	s3, 12(sp)
+	sw	s4, 16(sp)
+	sw	s5, 20(sp)
+	sw	s6, 24(sp)
+	sw	s7, 28(sp)
+	sw	s8, 32(sp)
+	sw	s9, 36(sp)
+	sw	s10, 40(sp)
+	sw	gp, 44(sp)
+	addi	a3, a0, 0
+	lw	s0, 0(a3)
+	lw	s1, 4(a3)
+	lw	s2, 8(a3)
+	lw	s3, 12(a3)
+	lw	s4, 16(a3)
+	lw	s5, 20(a3)
+	lw	s6, 24(a3)
+	lw	s7, 28(a3)
+	lw	s8, 32(a3)
+	lw	s9, 36(a3)
+	lw	s10, 40(a3)
+	lw	a1, 44(a3)
+	li	a2, 24
+gp_round:
+	slli	t0, s0, 24
+	srli	t1, s0, 8
+	or	t0, t0, t1
+	slli	t1, s4, 9
+	srli	t2, s4, 23
+	or	t1, t1, t2
+	and	s0, t0, t1
+	slli	s0, s0, 3
+	xor	s0, s0, s8
+	xor	s0, s0, t1
+	or	s4, t0, s8
+	slli	s4, s4, 1
+	xor	s4, s4, t1
+	xor	s4, s4, t0
+	and	t2, t1, s8
+	slli	t2, t2, 2
+	slli	s8, s8, 1
+	xor	s8, s8, t0
+	xor	s8, s8, t2
+	slli	t0, s1, 24
+	srli	t1, s1, 8
+	or	t0, t0, t1
+	slli	t1, s5, 9
+	srli	t2, s5, 23
+	or	t1, t1, t2
+	and	s1, t0, t1
+	slli	s1, s1, 3
+	xor	s1, s1, s9
+	xor	s1, s1, t1
+	or	s5, t0, s9
+	slli	s5, s5, 1
+	xor	s5, s5, t1
+	xor	s5, s5, t0
+	and	t2, t1, s9
+	slli	t2, t2, 2
+	slli	s9, s9, 1
+	xor	s9, s9, t0
+	xor	s9, s9, t2
+	slli	t0, s2, 24
+	srli	t1, s2, 8
+	or	t0, t0, t1
+	slli	t1, s6, 9
+	srli	t2, s6, 23
+	or	t1, t1, t2
+	and	s2, t0, t1
+	slli	s2, s2, 3
+	xor	s2, s2, s10
+	xor	s2, s2, t1
+	or	s6, t0, s10
+	slli	s6, s6, 1
+	xor	s6, s6, t1
+	xor	s6, s6, t0
+	and	t2, t1, s10
+	slli	t2, t2, 2
+	slli	s10, s10, 1
+	xor	s10, s10, t0
+	xor	s10, s10, t2
+	slli	t0, s3, 24
+	srli	t1, s3, 8
+	or	t0, t0, t1
+	slli	t1, s7, 9
+	srli	t2, s7, 23
+	or	t1, t1, t2
+	and	s3, t0, t1
+	slli	s3, s3, 3
+	xor	s3, s3, a1
+	xor	s3, s3, t1
+	or	s7, t0, a1
+	slli	s7, s7, 1
+	xor	s7, s7, t1
+	xor	s7, s7, t0
+	and	t2, t1, a1
+	slli	t2, t2, 2
+	slli	a1, a1, 1
+	xor	a1, a1, t0
+	xor	a1, a1, t2
+	andi	t0, a2, 3
+	beqz	t0, gp_small_swap
+	li	t1, 2
+	beq	t0, t1, gp_big_swap
+	j	gp_round_end
+gp_small_swap:
+	addi	t0, s0, 0
+	addi	s0, s1, 0
+	addi	s1, t0, 0
+	addi	t0, s2, 0
+	addi	s2, s3, 0
+	addi	s3, t0, 0
+	li	t0, 0x9e377900
+	or	t0, t0, a2
+	xor	s0, s0, t0
+	j	gp_round_end
+gp_big_swap:
+	addi	t0, s0, 0
+	addi	s0, s2, 0
+	addi	s2, t0, 0
+	addi	t0, s1, 0
+	addi	s1, s3, 0
+	addi	s3, t0, 0
+gp_round_end:
+	addi	a2, a2, -1
+	bnez	a2, gp_round
+	sw	s0, 0(a3)
+	sw	s1, 4(a3)
+	sw	s2, 8(a3)
+	sw	s3, 12(a3)
+	sw	s4, 16(a3)
+	sw	s5, 20(a3)
+	sw	s6, 24(a3)
+	sw	s7, 28(a3)
+	sw	s8, 32(a3)
+	sw	s9, 36(a3)
+	sw	s10, 40(a3)
+	sw	a1, 44(a3)
+	lw	s0, 0(sp)
+	lw	s1, 4(sp)
+	lw	s2, 8(sp)
+	lw	s3, 12(sp)
+	lw	s4, 16(sp)
+	lw	s5, 20(sp)
+	lw	s6, 24(sp)
+	lw	s7, 28(sp)
+	lw	s8, 32(sp)
+	lw	s9, 36(sp)
+	lw	s10, 40(sp)
+	lw	gp, 44(sp)
+	addi	sp, sp, 48
+gimli_permute_disp:
+	beqz	gp, gpr_absorb
+	li	t0, 1
+	beq	gp, t0, gpr_pad
+	li	t0, 2
+	beq	gp, t0, gpr_squeeze
+	j	dispatch_error
+
+dispatch_error:
+	j	dispatch_error
+
+# ══════════════════════════════════════════════════════════════════════════
+# Data: null-terminated output strings.
+# ══════════════════════════════════════════════════════════════════════════
+hdr1:
+	.ascii	"# bin_config.inc -- auto-generated by tools/refresh_bin_config\n"
+	.byte	0
+hdr2:
+	.ascii	"# Hash function: gimli-hash (rate=16, capacity=32, output=32)\n"
+	.byte	0
+size_prefix:
+	.ascii	".equ\tBIN_SIZE,\t\t"
+	.byte	0
+hash_prefix:
+	.ascii	".equ\tBIN_HASH"
+	.byte	0
+hash_mid:
+	.ascii	",\t\t0x"
+	.byte	0
+err_too_big:
+	.ascii	"Error: input exceeds 14 MiB buffer\n"
+	.byte	0
