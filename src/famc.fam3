@@ -312,6 +312,45 @@ prereg_arg_zdone:
 	j	prereg_arg_loop
 prereg_arg_done:
 
+	# ── Pre-register `image_base` at frame offset 12 ────────────────
+	# Captured in the compiled program's prologue via self-relative
+	# auipc + addi (see Phase 2 below). Lets user code reference the
+	# runtime load address as `image_base` without an asm block.
+	# Same entry layout as arg0/1/2: name in [0..32), offset at 32,
+	# mutability=0 (immutable).
+	addi	t0, zero, 0
+prereg_ib_zero:
+	addi	t1, zero, 40
+	beq	t0, t1, prereg_ib_zdone
+	add	t2, s8, t0
+	sb	zero, 0(t2)
+	addi	t0, t0, 1
+	j	prereg_ib_zero
+prereg_ib_zdone:
+	addi	t0, zero, 'i'
+	sb	t0, 0(s8)
+	addi	t0, zero, 'm'
+	sb	t0, 1(s8)
+	addi	t0, zero, 'a'
+	sb	t0, 2(s8)
+	addi	t0, zero, 'g'
+	sb	t0, 3(s8)
+	addi	t0, zero, 'e'
+	sb	t0, 4(s8)
+	addi	t0, zero, '_'
+	sb	t0, 5(s8)
+	addi	t0, zero, 'b'
+	sb	t0, 6(s8)
+	addi	t0, zero, 'a'
+	sb	t0, 7(s8)
+	addi	t0, zero, 's'
+	sb	t0, 8(s8)
+	addi	t0, zero, 'e'
+	sb	t0, 9(s8)
+	sw	s9, 32(s8)
+	addi	s8, s8, 40
+	addi	s9, s9, 4
+
 # ── Phase 1: read all source text from UART into input buffer ──────────────
 	# Cap source size at 16 MiB: anything larger would leave no room for
 	# the output binary below bin_end, and the buffer is unbounded otherwise.
@@ -493,6 +532,41 @@ rd_done:
 	#   word = 0x23 | (8<<7) | (2<<12) | (8<<15) | (12<<20) = 0x00C42423
 	lui	a0, 0xC42
 	addi	a0, a0, 0x423
+	sw	a0, 0(s5)
+	addi	s5, s5, 4
+
+	# Capture image base into the pre-registered `image_base` slot at fp+12.
+	# Self-relative: auipc t0, 0  loads (base + auipc_pc) into t0; the
+	# following addi subtracts auipc_pc to leave just `base` in t0.
+	# auipc_pc here is the byte offset of the auipc within the binary,
+	# computed at compile time as (s5 - s4). It always fits in a 12-bit
+	# signed immediate because the prologue is well under 2 KiB.
+
+	# t0 (in famc.fam3) = auipc_pc = current emit offset.
+	sub	t6, s5, s4
+
+	# Emit auipc t0, 0  →  word 0x00000297
+	#   opcode=0x17, rd=t0=5, imm20=0
+	lui	a0, 0
+	addi	a0, a0, 0x297
+	sw	a0, 0(s5)
+	addi	s5, s5, 4
+
+	# Emit addi t0, t0, -auipc_pc.
+	#   word = (imm12 << 20) | 0x00028293, where imm12 = (-auipc_pc) & 0xFFF.
+	#   We compute (-auipc_pc) << 20 (low 12 bits land in [31:20] naturally).
+	sub	t5, zero, t6		# t5 = -auipc_pc
+	slli	t5, t5, 20		# t5 = imm12 in bits [31:20]
+	lui	a0, 0x28
+	addi	a0, a0, 0x293
+	or	a0, a0, t5
+	sw	a0, 0(s5)
+	addi	s5, s5, 4
+
+	# Emit sw t0, 12(fp)  →  word 0x00542623
+	#   opcode=0x23, f3=2, rs1=fp=8, rs2=t0=5, imm=12
+	lui	a0, 0x542
+	addi	a0, a0, 0x623
 	sw	a0, 0(s5)
 	addi	s5, s5, 4
 
@@ -2780,18 +2854,24 @@ lookup_or_alloc:
 	# without destroying the outer `x` — the for-loop allocates a new entry
 	# via `j la_new` and, on exit, restores s8 to "forget" it.
 	#
-	# a1 = effective scan lower bound: max(s7, fn_scope_base). Inside a fn
-	# body, fn_scope_base hides outer-scope entries so they can't be found
-	# (functions are not closures). At top level, fn_scope_base=0 → a1=s7.
-	addi	a1, s7, 0
-	lla	t0, fn_scope_base
-	lw	t0, 0(t0)
-	beqz	t0, la_bound_set
-	addi	a1, t0, 0
+	# Compute effective scan lower bound = max(s7, fn_scope_base) into the
+	# memory global lookup_lower_bound. Inside a fn body, fn_scope_base
+	# hides outer-scope entries (functions are not closures). At top level,
+	# fn_scope_base=0 → bound = s7. Using memory (not a reg) because a-regs
+	# are callee-visible and we mustn't clobber them on this path.
+	addi	t0, s7, 0
+	lla	t1, fn_scope_base
+	lw	t1, 0(t1)
+	beqz	t1, la_bound_set
+	addi	t0, t1, 0
 la_bound_set:
+	lla	t1, lookup_lower_bound
+	sw	t0, 0(t1)
 	addi	t0, s8, -40		# scan ptr = last entry
 la_scan:
-	blt	t0, a1, la_new
+	lla	t1, lookup_lower_bound
+	lw	t1, 0(t1)
+	blt	t0, t1, la_new
 	addi	t1, zero, 0
 la_cmp:
 	addi	t2, zero, 32
@@ -2829,15 +2909,19 @@ lookup:
 	# Same effective lower bound as lookup_or_alloc: hide outer scope when
 	# inside a fn body so referencing a top-level var errors cleanly
 	# (undefined variable) rather than silently reading the wrong frame.
-	addi	a1, s7, 0
-	lla	t0, fn_scope_base
-	lw	t0, 0(t0)
-	beqz	t0, lo_bound_set
-	addi	a1, t0, 0
+	addi	t0, s7, 0
+	lla	t1, fn_scope_base
+	lw	t1, 0(t1)
+	beqz	t1, lo_bound_set
+	addi	t0, t1, 0
 lo_bound_set:
+	lla	t1, lookup_lower_bound
+	sw	t0, 0(t1)
 	addi	t0, s8, -40
 lo_scan:
-	blt	t0, a1, lo_notfound
+	lla	t1, lookup_lower_bound
+	lw	t1, 0(t1)
+	blt	t0, t1, lo_notfound
 	addi	t1, zero, 0
 lo_cmp:
 	addi	t2, zero, 32
@@ -9641,7 +9725,15 @@ asm_end_padded:
 	lla	t0, current_asm_fn
 	lw	t1, 0(t0)
 	bnez	t1, asm_fn_end
-	j	cs_done
+	# Dispatch: if asm was reached from expression context (pi_ct → set
+	# asm_in_expr_ctx=1), return to ct_done so the surrounding expression
+	# parser keeps going. Otherwise it was a top-level statement, return
+	# to cs_done.
+	lla	t0, asm_in_expr_ctx
+	lw	t1, 0(t0)
+	beqz	t1, cs_done
+	sw	zero, 0(t0)
+	j	ct_done
 
 # ══════════════════════════════════════════════════════════════════════════════
 # asm_fn_begin — compile `asm NAME { ... }` named assembly function.
@@ -12011,6 +12103,26 @@ pi_ct_not_continue:
 	bne	t1, t2, pi_ct_not_for
 	j	ct_kw_for
 pi_ct_not_for:
+	# 'asm' (3 chars) — inline assembly block inside an expression
+	# context (e.g. inside a block expression or fn body). We set a flag
+	# so asm_end knows to dispatch back to ct_done instead of cs_done,
+	# then reuse the existing cs_kw_asm parser.
+	addi	t0, zero, 3
+	bne	s11, t0, pi_ct_not_asm
+	lbu	t1, 0(s10)
+	addi	t2, zero, 'a'
+	bne	t1, t2, pi_ct_not_asm
+	lbu	t1, 1(s10)
+	addi	t2, zero, 's'
+	bne	t1, t2, pi_ct_not_asm
+	lbu	t1, 2(s10)
+	addi	t2, zero, 'm'
+	bne	t1, t2, pi_ct_not_asm
+	lla	t0, asm_in_expr_ctx
+	addi	t1, zero, 1
+	sw	t1, 0(t0)
+	j	cs_kw_asm
+pi_ct_not_asm:
 	# 'return' (6 chars) — early return from the current function.
 	addi	t0, zero, 6
 	bne	s11, t0, pi_ct_not_return
@@ -14027,13 +14139,16 @@ cpt_try_slt:
 	bne	t1, t2, cpt_no_peephole
 cpt_have_slt:
 	# Build blt/bltu word: (f3<<12) | 0x463 | (rs1<<15) | (rs2<<20)
-	# slt(2)→blt(4), sltu(3)→bltu(6); +2 to map.
+	# slt(2)→blt(4), sltu(3)→bltu(6). The mapping is `f3 << 1` (linear
+	# scaling); a previous version used `+2`, which only worked for slt.
+	# That bug silently miscompiled `<u`/`>=u`/`!=` as ternary conditions
+	# (the latter because `!=` ends in `sltu a0, zero, a0`).
 	srli	t3, t0, 15
 	andi	t3, t3, 0x1F		# rs1
 	srli	t4, t0, 20
 	andi	t4, t4, 0x1F		# rs2
 	addi	s5, s5, -4		# delete slt
-	addi	t1, t1, 2
+	slli	t1, t1, 1
 	slli	t1, t1, 12
 	addi	t2, zero, 0x463
 	or	t1, t1, t2
@@ -14060,21 +14175,17 @@ ecw_cep_tern_jal_else:
 	addi	gp, zero, 19		# ce site 19 = ce_cep_tern_mid
 	j	compile_expr_p
 ce_cep_tern_mid:
-	# Peephole: if the middle branch's last emitted instruction is an
-	# unconditional jal (rd=0, opcode=0x6F) — e.g. it ended in `break`
-	# or `return` — then the jal_end we'd emit here is unreachable.
-	# Skip emission and store sentinel 0 in 20(sp) so the end-patcher
-	# also skips its patch step.
-	lw	t0, -4(s5)
-	andi	t1, t0, 0x7F
-	addi	t2, zero, 0x6F
-	bne	t1, t2, ctme_emit
-	srli	t1, t0, 7
-	andi	t1, t1, 0x1F
-	bnez	t1, ctme_emit
-	sw	zero, 20(sp)
-	j	ecw_cep_tern_jal_end
-ctme_emit:
+	# Always emit the jal_end. A previous version had a peephole here
+	# that skipped emission when the middle's last insn was an
+	# unconditional `jal zero, X`, on the assumption it must have come
+	# from `break`/`return` (which don't fall through). But a function
+	# call also ends in a `jal zero, fn_addr` — and fn calls *do* fall
+	# through (the master_dispatch returns to the post-call site). The
+	# peephole couldn't tell the two apart from the byte pattern, so it
+	# silently dropped the jal_end after fn calls in the middle and the
+	# else block then ran unconditionally. Always emitting jal_end costs
+	# one extra word per ternary that ends in break/return (it becomes
+	# unreachable padding), in exchange for correctness everywhere else.
 	sw	s5, 20(sp)		# future jal_end addr
 	addi	a0, zero, 0x6F
 	addi	gp, zero, 68
@@ -17070,6 +17181,20 @@ current_fn:
 # inside a function body is a compile error — functions are not closures.
 # 0 when we're at top level (no boundary check needed).
 fn_scope_base:
+	.word	0
+
+# Set to 1 when an `asm { ... }` block is parsed in expression context (from
+# pi_ct's keyword check). asm_end consults this to dispatch back to ct_done
+# instead of cs_done so the surrounding expression / block-expression keeps
+# parsing. Cleared (set to 0) in asm_end after dispatch.
+asm_in_expr_ctx:
+	.word	0
+
+# Scratch slot for the effective scan-lower-bound inside lookup / lookup_or_alloc.
+# Computed once at entry as max(s7, fn_scope_base) and used as the loop's stop
+# condition. Lives in memory rather than a register because the scan body uses
+# t0..t6 and the caller's a-regs must stay untouched.
+lookup_lower_bound:
 	.word	0
 
 # Non-zero while compiling the body of a named `asm name { ... }` function.

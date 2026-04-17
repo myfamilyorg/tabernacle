@@ -141,6 +141,39 @@ test_output() {
 	fi
 }
 
+# test_gp_matches_size: compile+run $src (which must print gp as 8 hex digits
+# to UART), then verify gp == 0x80000000 + aligned_binary_size. Locks in the
+# famc invariant that gp points to the first 4-byte-aligned address past the
+# compiled binary — nodes rely on this to compute their own base via gp-BIN_SIZE
+# without needing an image_base builtin.
+test_gp_matches_size() {
+	TOTAL=$((TOTAL + 1))
+	local name="$1" src="$2"
+	local bin="$TMPDIR/test_${TOTAL}.bin"
+	compile "$src" > "$bin" 2>&1 || true
+	case "$(check_bin "$bin"; echo $?)" in
+		1)  FAIL=$((FAIL + 1))
+		    echo "  FAIL  $name (no valid binary: $(head -c40 "$bin" | xxd -p))"
+		    return ;;
+		2)  FAIL=$((FAIL + 1))
+		    echo "  FAIL  $name (contains jalr)"
+		    return ;;
+	esac
+	local size aligned expected actual
+	size=$(wc -c < "$bin")
+	aligned=$(( (size + 3) & ~3 ))
+	expected=$(printf '%08X' $((0x80000000 + aligned)))
+	actual=$(run_bin "$bin" || true)
+	if [[ "$actual" == "$expected" ]]; then
+		PASS=$((PASS + 1))
+		[[ $VERBOSE -eq 1 ]] && echo "  PASS  $name"
+	else
+		FAIL=$((FAIL + 1))
+		printf "  FAIL  %s (expected gp=%s, got %q; bin size %d aligned %d)\n" \
+			"$name" "$expected" "$actual" "$size" "$aligned"
+	fi
+}
+
 # test_error: source must fail to compile, producing an error message on stdout
 # that exactly matches $expected. The "binary" famc emits on error is just the
 # error text (not a valid compiled binary).
@@ -761,6 +794,51 @@ test_output  "no-else ternary false path defaults to 0" \
 	"x = 0; y = x ? 7; @0x10000000 = y + 65;" "A"
 test_output  "no-else ternary true path returns value" \
 	"x = 1; y = x ? 1; @0x10000000 = y + 64;" "A"
+# Regression coverage for ternary bugs in famc. These were uncovered while
+# rewriting write_self.fam3 in famc.
+#
+# (1) `!=` as a ternary condition selected the wrong branch.  Root cause:
+#     peephole B in cep_pre_tern mapped `slt[u]` funct3 to its branch funct3
+#     by `+2`, which only works for slt(2)→blt(4); for sltu(3) it produced
+#     bge(5) instead of bltu(6). `!=` lowers to `xor; sltu a0, zero, a0` and
+#     hit this peephole. Fixed by `funct3 << 1` (slt→blt, sltu→bltu).
+test_output  "ternary with != condition, true case (value)" \
+	"x := 1; @0x10000000 = x != 0 ? 'A' : 'B';" "A"
+test_output  "ternary with != condition, false case (value)" \
+	"x := 0; @0x10000000 = x != 0 ? 'B' : 'A';" "A"
+test_output  "ternary with <u condition, true case" \
+	"x := 5; @0x10000000 = x <u 10 ? 'A' : 'B';" "A"
+test_output  "ternary with <u condition, false case" \
+	"x := 10; @0x10000000 = x <u 5 ? 'B' : 'A';" "A"
+test_output  "ternary with >=u condition, true case" \
+	"x := 10; @0x10000000 = x >=u 5 ? 'A' : 'B';" "A"
+# (2) Two-armed ternary with fn calls in BOTH branches always returned the
+#     false-branch value.  Root cause: ce_cep_tern_mid had a peephole that
+#     skipped emitting jal_end when the middle's last insn was an
+#     unconditional jal — intended for `break`/`return` (which don't fall
+#     through), but `f()` also ends in a jal that *does* fall through (to
+#     the post-call return site). Fixed by removing that peephole; an extra
+#     jal_end gets emitted in the break/return cases but it's just
+#     unreachable padding (one word).
+test_output  "ternary with fn calls in both branches, true case" \
+	"fn f() { 65 } fn g() { 66 } @0x10000000 = 1 ? f() : g();" "A"
+test_output  "ternary with fn calls in both branches, false case" \
+	"fn f() { 65 } fn g() { 66 } @0x10000000 = 0 ? f() : g();" "B"
+test_output  "ternary with fn call only in then, runtime cond" \
+	"fn f() { 65 } x := 1; @0x10000000 = x ? f() : 66;" "A"
+test_output  "ternary with fn call only in else, runtime cond" \
+	"fn g() { 66 } x := 0; @0x10000000 = x ? 65 : g();" "B"
+test_output  "nested ternary with fn calls in branches" \
+	"fn a() { 65 } fn b() { 66 } fn c() { 67 } @0x10000000 = 1 ? a() : 0 ? b() : c();" "A"
+# (3) `asm { ... }` was only recognized as a top-level statement; using it
+#     inside a block expression (or any nested context) errored out as
+#     "undefined variable" because the block parser tried to look up `asm`
+#     in the var symtab. Fixed by teaching ct_lbrace's leading-ident scan
+#     to recognize the `asm` keyword and divert to cs_kw_asm.
+test_output  "asm inside block expression" \
+	"x := 0; { asm { (x = gp) }; 0 }; @0x10000000 = x != 0 ? 'A' : 'N';" "A"
+test_output  "asm inside fn body" \
+	"fn get_gp() { x := 0; asm { (x = gp) }; x } @0x10000000 = get_gp() != 0 ? 'A' : 'N';" "A"
 
 # ============================================================================
 echo "=== Assignment as expression (Pratt) ==="
@@ -1499,6 +1577,56 @@ test_error   "top-level var inside fn body — not a closure" \
 # Explicit parameter pass-through still works.
 test_output  "entry args reach fn via explicit parameter" \
 	"fn id(v) { v + 65 } @0x10000000 = id(arg0);" "A"
+
+# ============================================================================
+echo "=== image_base (self-relative load address) ==="
+# Pre-registered top-level slot at frame offset 12. The compiled prologue
+# captures the image's runtime base via auipc + addi -<auipc_pc>, so user
+# code can read image_base anywhere as a normal var. Test harness loads
+# binaries at 0x80000000, so image_base must equal that.
+test_output  "image_base equals load address" \
+	"@0x10000000 = image_base == 0x80000000 ? 'A' : 'N';" "A"
+test_output  "image_base survives expression that clobbers a0" \
+	"x := 99 + 5 + 100; @0x10000000 = image_base == 0x80000000 ? 'A' : 'N';" "A"
+test_output  "image_base usable in arithmetic" \
+	"@0x10000000 = (image_base >>u 28) + 48;" "8"
+test_error   "image_base is immutable" \
+	"image_base = 5;" \
+	"Error:1:1 cannot reassign immutable"
+test_error   "image_base inside fn body — not a closure" \
+	"fn f() { image_base } f();" \
+	"Error:1:10 undefined variable"
+
+# ============================================================================
+echo "=== gp points to end of binary (node base calc depends on this) ==="
+# Nodes compute their base address as `gp - BIN_SIZE` rather than via a
+# dedicated image-base builtin. This only works if gp is set to exactly
+# align_up(binary_base + binary_size, 4). Test that invariant directly:
+# compile a small program, read its gp, and compare against the measured
+# binary size on disk.
+test_gp_matches_size "gp == base + aligned_size (minimal)" "$(cat <<'EOT'
+g := 0;
+asm { (g = gp) }
+for i in 0..8 {
+    n := (g >>u ((7 - i) << 2)) & 0xF;
+    @0x10000000 = n < 10 ? '0' + n : 'A' + n - 10;
+};
+EOT
+)"
+# Same invariant, larger binary (more instructions emitted).
+test_gp_matches_size "gp == base + aligned_size (with fn + loop)" "$(cat <<'EOT'
+fn emit_hex(v) {
+    for i in 0..8 {
+        n := (v >>u ((7 - i) << 2)) & 0xF;
+        @0x10000000 = n < 10 ? '0' + n : 'A' + n - 10;
+    };
+    0
+}
+g := 0;
+asm { (g = gp) }
+emit_hex(g);
+EOT
+)"
 
 # ============================================================================
 echo "=== Immutability ==="

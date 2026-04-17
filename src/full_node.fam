@@ -1,0 +1,168 @@
+// full_node.fam -- famc rewrite of write_self.fam3.
+//
+// Entry contract (from tabernacle):
+//   arg0 = seed-list pointer (unused in this version)
+//   arg1 = boot source: 0 = loaded from disk, 1 = loaded from network
+//
+// Behavior:
+//   arg1 == 0  -> emit 'L' (already on disk; nothing to do).
+//   no disk    -> emit 'E'.
+//   else       -> init virtio-blk, write BIN_SIZE bytes of ourselves to
+//                 disk. Emit 'W' on success, 'X' on virtio error.
+//
+// Memory layout:
+//   bin_base    = image_base                          (first byte of our image)
+//   famc stack  = [gp .. gp + 64 KiB], sp grows down  (default famc layout)
+//   scratch     = align_up(image_base + 128 KiB, 4 KiB)
+//                                                     (virtio queue area; sits
+//                                                      above famc's stack so
+//                                                      they can't collide)
+
+BIN_SIZE = 3145728;        // 3 MiB, matches tabernacle's bin_config
+
+// --- UART ---
+UART_BASE = 0x10000000;
+UART_LSR = 5;
+UART_TX_READY = 0x20;
+
+// --- virtio-blk legacy MMIO registers (offsets from device base) ---
+VIO_DEVICE_ID = 0x008;
+VIO_DRIVER_FEATURES = 0x020;
+VIO_GUEST_PAGE_SIZE = 0x028;
+VIO_QUEUE_SEL = 0x030;
+VIO_QUEUE_NUM = 0x038;
+VIO_QUEUE_ALIGN = 0x03C;
+VIO_QUEUE_PFN = 0x040;
+VIO_QUEUE_NOTIFY = 0x050;
+VIO_STATUS = 0x070;
+VIRT_MAGIC = 0x74726976;
+VIRTIO_BLK_DEVICE_ID = 2;
+
+// MMIO scan range for virtio devices on QEMU virt.
+MMIO_SCAN_TOP = 0x10008000;
+MMIO_SCAN_BOTTOM = 0x10001000;
+
+// Scratch area layout (offsets from scratch base).
+S_DESC = 0;
+S_AVAIL = 256;
+S_HEADER = 8192;
+S_STATUS = 8208;
+
+// Max bytes per virtio-blk write request (must be sector-aligned).
+BLOCK_MAX = 65536;
+
+// --- emit: TX-ready-poll then write one byte to UART ---
+fn emit(c) {
+    loop {
+        @(0x10000005) & 0x20 ? break 0;
+    };
+    @0x10000000 = c;
+    0
+}
+
+// --- top-level setup ---
+bin_base := image_base;
+scratch := (bin_base + 0x20FFF) & 0xFFFFF000;
+
+// --- scan MMIO for a virtio-blk device (device_id = 2) ---
+blk := 0;
+probe := MMIO_SCAN_TOP;
+loop {
+    probe < MMIO_SCAN_BOTTOM ? break 0;
+    *probe == VIRT_MAGIC && *(probe + VIO_DEVICE_ID) == VIRTIO_BLK_DEVICE_ID
+        ? { blk = probe; break 0 }
+        : probe -= 0x1000;
+};
+
+// --- main dispatch ---
+arg1 == 0 ? emit('L') : blk == 0 ? emit('E') : {
+    // Init virtio-blk (legacy MMIO handshake).
+    *(blk + VIO_STATUS) = 0;              // reset
+    *(blk + VIO_STATUS) = 1;              // ACK
+    *(blk + VIO_STATUS) = 3;              // ACK | DRIVER
+    *(blk + VIO_DRIVER_FEATURES) = 0;     // accept no features
+    *(blk + VIO_STATUS) = 11;             // ACK | DRIVER | FEATURES_OK
+
+    // Feature negotiation may have failed — device clears FEATURES_OK if so.
+    // Parens because famc parses `&` higher than `==` (opposite of C).
+    (*(blk + VIO_STATUS) & 8) == 0 ? emit('E') : {
+        *(blk + VIO_GUEST_PAGE_SIZE) = 4096;
+        *(blk + VIO_QUEUE_SEL) = 0;
+        *(blk + VIO_QUEUE_NUM) = 16;
+        *(blk + VIO_QUEUE_ALIGN) = 4096;
+        *(blk + VIO_QUEUE_PFN) = scratch >>u 12;
+        *(blk + VIO_STATUS) = 15;         // | DRIVER_OK
+
+        // --- write loop: chunk the image into BLOCK_MAX-byte writes ---
+        src := bin_base;
+        sector := 0;
+        remaining := BIN_SIZE;
+        avail_idx := 0;
+        err := 0;
+
+        loop {
+            remaining == 0 ? break 0;
+            err != 0 ? break 0;
+
+            // Block size = min(BLOCK_MAX, round_up(remaining, SECTOR_SIZE)).
+            bs := remaining < BLOCK_MAX
+                ? (remaining + 511) & 0xFFFFFE00
+                : BLOCK_MAX;
+
+            // Request header: type=1 (OUT), sector (u64 little-endian).
+            hdr := scratch + S_HEADER;
+            *hdr = 1;
+            *(hdr + 4) = 0;
+            *(hdr + 8) = sector;
+            *(hdr + 12) = 0;
+
+            // Status byte = 0xFF (pending until device writes 0 or 1).
+            @(scratch + S_STATUS) = 0xFF;
+
+            // desc[0] = header (16 B, NEXT, next=1)   — device reads
+            d := scratch + S_DESC;
+            *d = hdr;
+            *(d + 4) = 0;
+            *(d + 8) = 16;
+            #(d + 12) = 1;
+            #(d + 14) = 1;
+
+            // desc[1] = data (bs bytes, NEXT, next=2)  — device reads from us
+            *(d + 16) = src;
+            *(d + 20) = 0;
+            *(d + 24) = bs;
+            #(d + 28) = 1;
+            #(d + 30) = 2;
+
+            // desc[2] = status (1 B, WRITE)            — device writes to us
+            *(d + 32) = scratch + S_STATUS;
+            *(d + 36) = 0;
+            *(d + 40) = 1;
+            #(d + 44) = 2;
+            #(d + 46) = 0;
+
+            // avail ring: flags=0, idx=avail_idx+1, ring[0]=0
+            a := scratch + S_AVAIL;
+            #a = 0;
+            #(a + 2) = avail_idx + 1;
+            #(a + 4) = 0;
+
+            // Kick the device.
+            *(blk + VIO_QUEUE_NOTIFY) = 0;
+
+            // Poll until device writes status.
+            loop {
+                @(scratch + S_STATUS) != 0xFF ? break 0;
+            };
+            @(scratch + S_STATUS) == 0 ? {
+                src += bs;
+                sector += bs >>u 9;
+                remaining -= remaining < bs ? remaining : bs;
+                avail_idx += 1;
+                0
+            } : { err = 1; 0 };
+        };
+
+        err == 0 ? emit('W') : emit('X');
+    };
+};
