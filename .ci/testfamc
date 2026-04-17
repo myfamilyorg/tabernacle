@@ -1449,6 +1449,58 @@ test_error "unterminated nested block comment" \
 	"Error:2:1 unterminated block comment"
 
 # ============================================================================
+echo "=== Entry args (arg0/arg1/arg2) ==="
+# At _start, the compiled program's prologue captures a0/a1/a2 into pre-
+# registered top-level slots named arg0/arg1/arg2. On QEMU virt with
+# -bios none, the reset ROM leaves a0=hart_id=0 and a1=FDT pointer
+# (nonzero); a2 is whatever the ROM left behind, so we only check it
+# compiles and parses, not its exact value.
+test_output  "arg0 at entry is 0 (hart id)" \
+	"@0x10000000 = arg0 + 65;" "A"
+test_output  "arg1 at entry is nonzero (FDT ptr)" \
+	"@0x10000000 = arg1 == 0 ? 'N' : 'Y';" "Y"
+test_output  "arg0 survives expression that clobbers a0" \
+	"x := 99 + 5 + 100 + 200; @0x10000000 = arg0 + 65;" "A"
+test_output  "arg1 survives many a0 clobbers in a loop" \
+	"s := 0; for i in 0..10 { s += i; }; @0x10000000 = arg1 != 0 ? 'A' : 'N';" "A"
+test_output  "arg2 is readable (value not checked)" \
+	"@0x10000000 = arg2 == arg2 ? 'A' : 'N';" "A"
+test_output  "arg0 usable in expression" \
+	"@0x10000000 = (arg0 + 65) ^ 0;" "A"
+# User locals declared after arg0/arg1/arg2 start at frame offset 12.
+test_output  "user locals coexist with arg slots" \
+	"a := 1; b := 2; c := 3; @0x10000000 = a + b + c + 59 + arg0;" "A"
+test_error   "arg0 is immutable (=)" \
+	"arg0 = 5;" \
+	"Error:1:1 cannot reassign immutable"
+test_error   "arg1 is immutable (+=)" \
+	"arg1 += 1;" \
+	"Error:1:1 cannot reassign immutable"
+test_error   "arg2 is immutable (++)" \
+	"arg2++;" \
+	"Error:1:1 cannot reassign immutable"
+# := on a pre-existing immutable var falls through to the same assignment
+# path and reports "cannot reassign immutable" (not a redefinition error).
+test_error   "arg0 cannot be rebound with :=" \
+	"arg0 := 5;" \
+	"Error:1:1 cannot reassign immutable"
+# Functions are not closures: outer-scope vars are invisible inside fn
+# bodies. Reading one errors "undefined variable"; assigning creates a
+# new local (which is indistinguishable from any other first-def of x).
+test_error   "arg0 inside fn body — not a closure" \
+	"fn f() { arg0 } f();" \
+	"Error:1:10 undefined variable"
+test_error   "arg1 inside fn body — not a closure" \
+	"fn f() { arg1 } f();" \
+	"Error:1:10 undefined variable"
+test_error   "top-level var inside fn body — not a closure" \
+	"x = 5; fn f() { x } f();" \
+	"Error:1:17 undefined variable"
+# Explicit parameter pass-through still works.
+test_output  "entry args reach fn via explicit parameter" \
+	"fn id(v) { v + 65 } @0x10000000 = id(arg0);" "A"
+
+# ============================================================================
 echo "=== Immutability ==="
 test_error "compound += on immutable var" \
 	"x = 5; x += 1;" \

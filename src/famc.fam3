@@ -273,6 +273,45 @@ _start:
 	addi	s9, zero, 0		# next var slot
 	addi	s11, zero, 0		# token length
 
+	# ── Pre-register arg0, arg1, arg2 at frame offsets 0, 4, 8 ──────
+	# The compiled program's prologue captures a0/a1/a2 at _start into
+	# these slots so user code can reference entry-time arg values by
+	# name (arg0/arg1/arg2) without inline asm. Each entry is 40 bytes:
+	# name at [0..32), frame offset u32 at 32, mutability byte at 37.
+	# Mutability=0 means immutable (treated like `x = ...` binding).
+	addi	t6, zero, 0		# loop counter i
+prereg_arg_loop:
+	addi	t0, zero, 3
+	beq	t6, t0, prereg_arg_done
+	# Zero 40 bytes at s8.
+	addi	t0, zero, 0
+prereg_arg_zero:
+	addi	t1, zero, 40
+	beq	t0, t1, prereg_arg_zdone
+	add	t2, s8, t0
+	sb	zero, 0(t2)
+	addi	t0, t0, 1
+	j	prereg_arg_zero
+prereg_arg_zdone:
+	# Write name "argN" (4 bytes) into entry bytes 0..3.
+	addi	t0, zero, 'a'
+	sb	t0, 0(s8)
+	addi	t0, zero, 'r'
+	sb	t0, 1(s8)
+	addi	t0, zero, 'g'
+	sb	t0, 2(s8)
+	addi	t0, zero, '0'
+	add	t0, t0, t6
+	sb	t0, 3(s8)
+	# Frame offset at byte 32 (currently s9 = i*4).
+	sw	s9, 32(s8)
+	# Mutability flag at byte 37 is already 0 from the zero loop.
+	addi	s8, s8, 40
+	addi	s9, s9, 4
+	addi	t6, t6, 1
+	j	prereg_arg_loop
+prereg_arg_done:
+
 # ── Phase 1: read all source text from UART into input buffer ──────────────
 	# Cap source size at 16 MiB: anything larger would leave no room for
 	# the output binary below bin_end, and the buffer is unbounded otherwise.
@@ -426,6 +465,34 @@ rd_done:
 	#   word = 0x13 | (8<<7) | (2<<15) = 0x13 | 0x400 | 0x10000 = 0x00010413
 	lui	a0, 0x10
 	addi	a0, a0, 0x413
+	sw	a0, 0(s5)
+	addi	s5, s5, 4
+
+	# Capture entry-time a0/a1/a2 into the three pre-registered frame
+	# slots (arg0, arg1, arg2) so user code can read them by name.
+	# These run after the frame allocator, so fp is valid and the slots
+	# at fp+0/4/8 are inside the reserved frame (since s9 ≥ 12 from
+	# the pre-registration above). The rest of the prologue does not
+	# clobber a0/a1/a2, so the captured values are accurate.
+
+	# sw a0, 0(fp)  →  opcode=0x23, f3=2, rs1=fp=8, rs2=a0=10, imm=0
+	#   word = 0x23 | (0<<7) | (2<<12) | (8<<15) | (10<<20) = 0x00A42023
+	lui	a0, 0xA42
+	addi	a0, a0, 0x23
+	sw	a0, 0(s5)
+	addi	s5, s5, 4
+
+	# sw a1, 4(fp)  →  rs2=a1=11, imm=4
+	#   word = 0x23 | (4<<7) | (2<<12) | (8<<15) | (11<<20) = 0x00B422A3
+	lui	a0, 0xB42
+	addi	a0, a0, 0x2A3
+	sw	a0, 0(s5)
+	addi	s5, s5, 4
+
+	# sw a2, 8(fp)  →  rs2=a2=12, imm=8
+	#   word = 0x23 | (8<<7) | (2<<12) | (8<<15) | (12<<20) = 0x00C42423
+	lui	a0, 0xC42
+	addi	a0, a0, 0x423
 	sw	a0, 0(s5)
 	addi	s5, s5, 4
 
@@ -2712,9 +2779,19 @@ lookup_or_alloc:
 	# introduce a fresh binding for `x` that's visible inside the body
 	# without destroying the outer `x` — the for-loop allocates a new entry
 	# via `j la_new` and, on exit, restores s8 to "forget" it.
+	#
+	# a1 = effective scan lower bound: max(s7, fn_scope_base). Inside a fn
+	# body, fn_scope_base hides outer-scope entries so they can't be found
+	# (functions are not closures). At top level, fn_scope_base=0 → a1=s7.
+	addi	a1, s7, 0
+	lla	t0, fn_scope_base
+	lw	t0, 0(t0)
+	beqz	t0, la_bound_set
+	addi	a1, t0, 0
+la_bound_set:
 	addi	t0, s8, -40		# scan ptr = last entry
 la_scan:
-	blt	t0, s7, la_new
+	blt	t0, a1, la_new
 	addi	t1, zero, 0
 la_cmp:
 	addi	t2, zero, 32
@@ -2749,9 +2826,18 @@ la_next:
 # Returns via lookup_or_alloc_disp — caller's return sites are shared.
 # ══════════════════════════════════════════════════════════════════════════════
 lookup:
+	# Same effective lower bound as lookup_or_alloc: hide outer scope when
+	# inside a fn body so referencing a top-level var errors cleanly
+	# (undefined variable) rather than silently reading the wrong frame.
+	addi	a1, s7, 0
+	lla	t0, fn_scope_base
+	lw	t0, 0(t0)
+	beqz	t0, lo_bound_set
+	addi	a1, t0, 0
+lo_bound_set:
 	addi	t0, s8, -40
 lo_scan:
-	blt	t0, s7, lo_notfound
+	blt	t0, a1, lo_notfound
 	addi	t1, zero, 0
 lo_cmp:
 	addi	t2, zero, 32
@@ -8206,6 +8292,12 @@ cs_kw_fn:
 	addi	sp, sp, -80
 	sw	s8, 0(sp)
 	sw	s9, 4(sp)
+	# Hide outer scope from this fn body: set fn_scope_base = current s8,
+	# so lookup/lookup_or_alloc can't see entries below this boundary.
+	# Functions are not closures — the only way for outer-scope state to
+	# reach a fn body is through explicit parameters.
+	lla	t0, fn_scope_base
+	sw	s8, 0(t0)
 	# Slots 32/36/40 are new for the value-stack save area:
 	#   32(sp): saved outer expr_max_depth
 	#   36(sp): save_area_addr  (start of the 9 nop save slots in prologue)
@@ -8959,6 +9051,8 @@ pjt_cs_fn_skip:
 	lw	s8, 0(sp)
 	lw	s9, 4(sp)
 	lla	t0, current_fn
+	sw	zero, 0(t0)
+	lla	t0, fn_scope_base
 	sw	zero, 0(t0)
 
 	addi	sp, sp, 80
@@ -16968,6 +17062,14 @@ asm_fix_end:
 # we're inside a function body (so `return` is legal and the epilogue can
 # be located). Stores the function's entry_addr for diagnostic purposes.
 current_fn:
+	.word	0
+
+# Symtab boundary for the currently-compiling function. Set to the outer s8
+# value at fn body entry. Any symtab entry whose address is < fn_scope_base
+# belongs to an enclosing (top-level) scope; referencing such entries from
+# inside a function body is a compile error — functions are not closures.
+# 0 when we're at top level (no boundary check needed).
+fn_scope_base:
 	.word	0
 
 # Non-zero while compiling the body of a named `asm name { ... }` function.
