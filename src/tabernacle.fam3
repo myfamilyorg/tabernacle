@@ -236,8 +236,14 @@ found_disk:
 	li	s6, 0			# avail idx
 read_loop:
 	beqz	s1, read_done
-	# Descriptor size: min(4096, round_up(s1, 512)).
-	# Virtio-blk reads full sectors, so buffer must hold whole sectors.
+	# Descriptor size: min(65536, round_up(s1, 512)).
+	# Virtio-blk reads full sectors, so the final partial block is
+	# rounded up and the device may write up to 511 bytes past
+	# data+BIN_SIZE. This is harmless: gimli_hash is called with exact
+	# BIN_SIZE so the trailing bytes aren't hashed; worst-case spill
+	# is into the first few bytes of the RX queue at s11+0, which is
+	# unused on the disk-boot success path and re-initialised by
+	# scan_net if the hash fails and we fall through to network boot.
 	li	a3, 65536
 	bge	s1, a3, read_go
 	addi	a3, s1, 511

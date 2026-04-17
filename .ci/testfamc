@@ -1579,6 +1579,76 @@ test_output  "entry args reach fn via explicit parameter" \
 	"fn id(v) { v + 65 } @0x10000000 = id(arg0);" "A"
 
 # ============================================================================
+echo "=== Fn call with deref prefix (*fn() / @fn() / #fn()) ==="
+# `*fn()` / `@fn()` / `#fn()` treat the return value as a pointer. Compile
+# correctly as both rvalue and lvalue at statement top level and within
+# expression context.
+test_output  "@fn() rvalue" \
+	"p := 0x80100000; @p = 65; fn addr() { 0x80100000 } @0x10000000 = @addr();" "A"
+test_output  "@fn() = value (assignment target)" \
+	"fn addr() { 0x10000000 } @addr() = 65;" "A"
+test_output  "#fn() = value (halfword deref assignment)" \
+	"fn addr() { 0x10000000 } #addr() = 0x41;" "A"
+test_output  "@fn()[i] = value (indexed byte deref)" \
+	"fn addr() { 0x10000000 } @addr()[0] = 65;" "A"
+test_output  "(*fn()) = value with parens" \
+	"fn addr() { 0x10000000 } (*addr()) = 0x41;" "A"
+test_output  "*fn() = value (bare, statement-level)" \
+	"fn addr() { 0x10000000 } *addr() = 0x41;" "A"
+test_output  "*fn()[i] = value (bare, statement-level)" \
+	"fn addr() { 0x10000000 } *addr()[0] = 0x41;" "A"
+# Incrementing a fn call's return value is disallowed (it's a temporary,
+# not an lvalue).
+test_error   "++fn() rejected" \
+	"fn f() { 5 } ++f();" \
+	"Error:1:17 '++'/'--' requires an lvalue"
+test_error   "fn()++ rejected" \
+	"fn f() { 5 } f()++;" \
+	"Error:1:19 left of '=' is not an lvalue"
+
+# Brace-ended expressions at statement position are complete statements
+# (Rust-style): a trailing binary operator starts a new statement rather
+# than extending the brace expression. In expression position (RHS of `=`,
+# inside parens, etc.) the binary operator still applies normally.
+test_output  "block in expr context chains with binop — RHS of =" \
+	"@0x10000000 = { 30 } + { 35 };" "A"
+test_error   "block at stmt position — trailing '+' is not absorbed" \
+	"{ 30 } + 5;" \
+	"Error:1:8 Expected expression found '+'"
+test_output  "fn body followed by *fn()= statement compiles" \
+	"fn addr() { 0x10000000 } fn main() { *addr() = 0x41; } main();" "A"
+test_output  "block in fn body followed by *fn()= statement" \
+	"fn addr() { 0x10000000 } { *addr() = 0x41 }" "A"
+
+# ============================================================================
+echo "=== Known C-semantics quirks (documented, not bugs) ==="
+# Shifts mask the shift amount to its low 5 bits (RISC-V SLLI/SRLI
+# convention). Not a bug — matches the underlying hardware — but worth
+# locking in so a refactor can't silently change it.
+test_output  "1 << 32 == 1 (RISC-V mask)" \
+	"v := 1 << 32; @0x10000000 = v == 1 ? 'A' : 'N';" "A"
+test_output  "1 << 33 == 2 (RISC-V mask)" \
+	"v := 1 << 33; @0x10000000 = v == 2 ? 'A' : 'N';" "A"
+test_output  "1 << 64 == 1 (mask again)" \
+	"v := 1 << 64; @0x10000000 = v == 1 ? 'A' : 'N';" "A"
+# Division/modulo by zero returns M-extension sentinel values.
+test_output  "5 / 0 == -1 (M-ext convention)" \
+	"v := 5 / 0; @0x10000000 = v == -1 ? 'A' : 'N';" "A"
+test_output  "5 % 0 == 5 (remainder is dividend)" \
+	"v := 5 % 0; @0x10000000 = v == 5 ? 'A' : 'N';" "A"
+test_output  "5 /u 0 == -1" \
+	"v := 5 /u 0; @0x10000000 = v == -1 ? 'A' : 'N';" "A"
+# Chained comparisons lower left-associatively (C semantics, not math).
+# `3 < 2 < 1` is `(3<2)<1` = `0<1` = 1 (true), NOT "is 2 between 3 and 1".
+test_output  "chained comparison — C-style left-assoc" \
+	"@0x10000000 = (3 < 2 < 1) == 1 ? 'A' : 'N';" "A"
+# Short-circuit skips RHS side effects.
+test_output  "&& short-circuits division by zero on LHS=0" \
+	"x := 0; r := (x != 0) && (10 / x > 0); @0x10000000 = r == 0 ? 'A' : 'N';" "A"
+test_output  "|| short-circuits division by zero when LHS true" \
+	"x := 0; r := (x == 0) || (10 / x > 0); @0x10000000 = r == 1 ? 'A' : 'N';" "A"
+
+# ============================================================================
 echo "=== image_base (self-relative load address) ==="
 # Pre-registered top-level slot at frame offset 12. The compiled prologue
 # captures the image's runtime base via auipc + addi -<auipc_pc>, so user

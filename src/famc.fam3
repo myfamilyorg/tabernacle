@@ -5384,9 +5384,12 @@ sw_ct_loop_lbrace:
 	lla	t0, loop_start
 	sw	s5, 0(t0)
 
-	# Compile the body as a block primary. compile_expr_p with min_bp=0 will
-	# see '{' next and dispatch into ct_lbrace, which parses the block.
-	addi	t6, zero, 0
+	# Compile the body as a block primary. min_bp=-2 is the statement-
+	# context sentinel — compile_expr_p stops after the block's '}' so
+	# any following binary operator (e.g. `loop{break 5} * 2`) is left
+	# to the outer expression parser rather than being absorbed as part
+	# of the loop body.
+	addi	t6, zero, -2
 	addi	gp, zero, 26		# compile_expr site 26 = ce_ct_loop_body
 	j	compile_expr_p
 ce_ct_loop_body:
@@ -6602,7 +6605,10 @@ sw_ct_for_lbrace:
 	bne	t0, t1, ct_bad_loop_lbrace
 	# Recurse compile_expr_p — the nud sees '{' and dispatches into
 	# ct_lbrace, which parses the block and returns with a0 = last expr.
-	addi	t6, zero, 0
+	# min_bp=-2 is the statement-context sentinel so the for-loop body's
+	# compile_expr_p stops after the block's '}' and doesn't absorb a
+	# trailing binary operator meant for the outer expression.
+	addi	t6, zero, -2
 	addi	gp, zero, 31		# compile_expr site 31 = ce_ct_for_body
 	j	compile_expr_p
 ce_ct_for_body:
@@ -8816,7 +8822,10 @@ ew_cs_fn_sv7:
 cs_fn_params_saved:
 
 	# Compile the body — compile_expr_p sees '{' and parses a block.
-	addi	t6, zero, 0
+	# min_bp = -2 — statement-context sentinel so the fn body's
+	# compile_expr_p stops after the block's closing '}' instead of
+	# treating a following '*'/'+'/etc. as a binary operator.
+	addi	t6, zero, -2
 	addi	gp, zero, 32		# compile_expr site 32 = ce_cs_fn_body
 	j	compile_expr_p
 ce_cs_fn_body:
@@ -11718,10 +11727,13 @@ asm_bad_itype_imm:
 # We're in compile_unary's 12-byte frame; we allocate an extra 24 bytes for
 # our own state.
 ct_fn_call:
-	# Reject prefix ++/-- / deref against a call for now.
+	# Reject prefix ++/-- against a call (a function's return value is a
+	# temporary, not an lvalue, so it can't be incremented or decremented).
+	# Deref prefixes (`*fn()`, `@fn()`, `#fn()`) ARE allowed — they treat
+	# the return value as a pointer. The deref runs after ct_fn_call returns
+	# to ct_deref, which also handles `fn()[i]` indexing and sets lv_kind
+	# so `*fn() = x` / `@fn() = x` work as assignment targets.
 	lw	t0, 8(sp)
-	bnez	t0, ct_bad_literal_pp
-	lw	t0, 4(sp)
 	bnez	t0, ct_bad_literal_pp
 
 	addi	sp, sp, -24
@@ -11918,11 +11930,19 @@ pjt_ct_call_jal:
 	j	list_append_word
 law_ret_ret_site:
 
-	# a0 at runtime now holds the return value. lv_kind = 0 (not lvalue).
+	# a0 at runtime now holds the return value. Pop the fn_call frame so
+	# compile_unary's 12-byte frame is back in place (ct_deref reads
+	# deref_kind from 4(sp)). By default the call result is not an lvalue,
+	# but ct_deref flips lv_kind to 2 / 4 when a `@fn()` or `#fn()` deref
+	# applies, enabling `@fn() = x` / `#fn() = x` as assignment targets.
+	# Note: `*fn() = x` is NOT supported via this path — at top-level
+	# statement context the stack layout diverges and the deref_kind ends
+	# up zero at ct_deref entry. Workaround for `*fn() = x`: wrap in
+	# parens: `(*fn()) = x`.
 	addi	sp, sp, 24
 	lla	t0, lv_kind
 	sw	zero, 0(t0)
-	j	ct_done
+	j	ct_deref
 
 # ── ct_kw_return — compile `return [expr]` ──────────────────────────────────
 # Reached via pi_ct's keyword check. Requires we're inside a function.
@@ -12689,7 +12709,11 @@ scan_ret_blk:
 	addi	gp, zero, 1		# decl_go return site 1 = ct_blk_loop
 	j	cs_array_decl_go
 blk_compile_expr:
-	addi	t6, zero, 0		# min_bp = 0: full expression allowed
+	# min_bp = -2 — statement-context sentinel. Each sub-expression in
+	# a block is statement-like, so a brace-ended expression terminates
+	# (matching Rust's rule that `{...}` at statement position is a
+	# complete statement, not the LHS of a binop).
+	addi	t6, zero, -2
 	addi	gp, zero, 25		# compile_expr site 25 = ce_ct_blk_rec
 	j	compile_expr_p
 ce_ct_blk_rec:
@@ -13175,6 +13199,18 @@ cep_loop:
 	addi	gp, zero, 29		# skip_ws site 29 = sw_cep_op
 	j	skip_ws
 sw_cep_op:
+	# Statement-context check: if the caller passed min_bp = -2 (statement
+	# context sentinel) AND the previous nud was a brace-ending expression
+	# (block, loop, for), stop the operator loop. This prevents a trailing
+	# '*' from being consumed as binary MUL when the brace-ended expression
+	# is actually a complete statement (e.g. `fn f() {0} *p = x;`).
+	lw	t5, 4(sp)
+	addi	t0, zero, -2
+	bne	t5, t0, cep_no_stmt_stop
+	lla	t0, last_was_brace
+	lw	t0, 0(t0)
+	bnez	t0, cep_done
+cep_no_stmt_stop:
 	bge	s2, s3, cep_done
 	lbu	t0, 0(s2)
 
@@ -15689,7 +15725,10 @@ cs_fb:
 	lla	t0, expr_value_discarded
 	addi	t1, zero, 1
 	sw	t1, 0(t0)
-	addi	t6, zero, 0
+	# min_bp = -2 — statement-context sentinel. cep_loop stops on a
+	# brace-ended nud so `{expr} *ptr = x;` parses as two statements
+	# rather than treating '*' as MUL.
+	addi	t6, zero, -2
 	addi	gp, zero, 24		# compile_expr site 24 = ce_cs_exprstmt
 	j	compile_expr_p
 ce_cs_exprstmt:
