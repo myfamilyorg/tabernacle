@@ -48,6 +48,9 @@ run bin/fam3 src/gen_bin_config.fam3 > bin/gen_bin_config
 # and doesn't need stdlib's puts.
 run bin/famc src/full_node.fam > bin/full_node
 
+# Update bin config
+./tools/refresh_bin_config
+
 # Tabernacle is compiled against the checked-in src/bin_config.inc. If
 # full_node.fam has changed in a way that shifts its hash or size, the
 # checked-in bin_config is stale — run tools/refresh_bin_config and then
