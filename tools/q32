@@ -18,14 +18,17 @@ zcd=false,zcf=false,zcmp=false,zcmt=false,zicsr=false,zifencei=false"
 FILE=""
 NET=0
 DISK=""
+HOSTFWD=""
 
 for arg in "$@"; do
 	case "$arg" in
 		--cpu=*) CPU="${arg#--cpu=}" ;;
 		--net) NET=1 ;;
 		--disk=*) DISK="${arg#--disk=}" ;;
+		--hostfwd=*) HOSTFWD="${arg#--hostfwd=}" ;;
 		--help|-h)
-			echo "Usage: $0 [--cpu=CPU] [--net] [--disk=FILE] <binary>"
+			echo "Usage: $0 [--cpu=CPU] [--net] [--disk=FILE] [--hostfwd=SPEC] <binary>"
+			echo "  --hostfwd=udp::HOST_PORT-:GUEST_PORT  expose guest UDP port to host"
 			exit 0 ;;
 		--*) echo "Unknown option: $arg"; exit 1 ;;
 		*) FILE="$arg" ;;
@@ -55,7 +58,11 @@ ARGS="$ARGS -serial stdio -monitor none"
 
 if [ "$NET" = "1" ]; then
 	ARGS="$ARGS -global virtio-mmio.force-legacy=true"
-	ARGS="$ARGS -netdev user,id=n0"
+	if [ -n "$HOSTFWD" ]; then
+		ARGS="$ARGS -netdev user,id=n0,hostfwd=$HOSTFWD"
+	else
+		ARGS="$ARGS -netdev user,id=n0"
+	fi
 	ARGS="$ARGS -device virtio-net-device,netdev=n0"
 fi
 

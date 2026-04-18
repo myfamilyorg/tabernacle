@@ -32,13 +32,13 @@ CPU="rv32,m=false,a=false,f=false,d=false,c=false,\
 zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\
 zcd=false,zcf=false,zcmp=false,zcmt=false,zicsr=false,zifencei=false"
 
-# Compile full_node.fam + stdlib_node.fam into bin/full_node.
+# Compile full_node.fam + init.fam into bin/full_node.
 # full_node.fam is first so its `fn main(...)` definition is seen before
-# stdlib_node.fam's `fn _bootstrap` references it. The stdlib's top-level
-# code (which sets up sp/tp/s1 then calls _bootstrap) comes last and is
-# what executes at program entry.
-echo "Compiling src/full_node.fam + src/stdlib_node.fam" >&2
-(cat src/full_node.fam src/stdlib_node.fam; printf '\004') | qemu-system-riscv32 \
+# init.fam's `fn _bootstrap` references it. The init's top-level code
+# (which advances gp past the image, sets sp/tp/s1, and calls
+# _bootstrap) comes last and is what executes at program entry.
+echo "Compiling src/full_node.fam + src/init.fam" >&2
+(cat src/full_node.fam src/init.fam; printf '\004') | qemu-system-riscv32 \
 	-machine virt -cpu "$CPU" \
 	-nographic -bios none \
 	-device loader,file=bin/famc,addr=0x80000000 > bin/full_node

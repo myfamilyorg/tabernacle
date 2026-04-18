@@ -1,26 +1,54 @@
 // FILE: full_node.fam
 //
 // Defines `fn main(seed_list, boot_source, bin_size)` — the node entry
-// point invoked by stdlib_node.fam's _bootstrap after sp/tp/s1 have been
-// set up for a large RAM environment.
+// invoked by stdlib_node.fam's _bootstrap after sp/tp/s1 are configured
+// and gp has been advanced past the appended payload.
 //
-// Entry contract (from tabernacle via stdlib_node):
-//   seed_list   = pointer to `[count:u8][ip:4 port:2]*` (unused today)
+// Entry contract (from tabernacle, via stdlib_node):
+//   seed_list   = pointer to [count:u8][ip:4 port:2]* (unused here)
 //   boot_source = 0 -> loaded from disk, 1 -> loaded from network
-//   bin_size    = full image size in bytes (code + appended payload)
+//   bin_size    = full image size (code + appended payload)
 //   a3          = image_base (captured inline from the register)
 //
-// Behavior:
-//   boot_source == 0  -> emit 'L' (already on disk; nothing to do).
-//   no virtio-blk     -> emit 'E'.
-//   else              -> init virtio-blk, write bin_size bytes of
-//                        ourselves to disk, emit 'W' on success or 'X'
-//                        on device error.
+// Post-stdlib memory layout: gp is at end-of-image (4 KiB aligned) and
+// points at heap-growable memory. All per-request scratch (virtio queues,
+// packet buffers) is obtained from alloc().
 //
-// Note: fam's top-level `X = Y` constants are not visible inside
-// functions, so the platform constants (virtio-mmio offsets, etc.) are
-// inlined at each use site below.
+// fam note: top-level `X = Y` constants are not visible inside `fn`
+// bodies (famc scoping), so platform/protocol magic numbers are inlined
+// at the use site.
 
+// ──────────────────────────────────────────────────────────────────────
+//  alloc — 4-byte-aligned bump allocator backed by gp. Returns the old
+//  gp (i.e. the caller's newly reserved region) and advances gp by the
+//  rounded-up size.
+// ──────────────────────────────────────────────────────────────────────
+fn alloc(n) {
+	n_aligned := (n + 3) & 0xFFFFFFFC;
+	old_gp := 0;
+	asm { (old_gp = gp) };
+	new_gp := old_gp + n_aligned;
+	asm { (gp = new_gp) };
+	old_gp
+}
+
+// Allocate n bytes at a 4 KiB boundary. Rounds gp up to the next page
+// before reserving. Required for virtio QUEUE_PFN, which takes a page
+// frame number (queue_base >>u 12) and thus ignores any sub-page offset.
+fn alloc_page(n) {
+	n_pages := (n + 4095) & 0xFFFFF000;
+	old_gp := 0;
+	asm { (old_gp = gp) };
+	aligned_gp := (old_gp + 4095) & 0xFFFFF000;
+	new_gp := aligned_gp + n_pages;
+	asm { (gp = new_gp) };
+	aligned_gp
+}
+
+// ──────────────────────────────────────────────────────────────────────
+//  emit — poll TX-ready, then write one byte to the UART at 0x10000000.
+//  The UART LSR at 0x10000005 bit 0x20 is THR-empty.
+// ──────────────────────────────────────────────────────────────────────
 fn emit(c) {
 	loop {
 		@(0x10000005) & 0x20 ? break 0;
@@ -29,136 +57,638 @@ fn emit(c) {
 	0
 }
 
-fn main(seed_list, boot_source, bin_size) {
-	// Capture image_base from a3 at entry. main's prologue saves
-	// a0/a1/a2 but leaves a3 untouched, so it still holds whatever
-	// tabernacle set at `j data`.
-	bin_base := 0;
-	asm { (bin_base = a3) };
+// ──────────────────────────────────────────────────────────────────────
+//  emit_hex2 — emit two hex digits for the low byte of b.
+// ──────────────────────────────────────────────────────────────────────
+fn emit_hex2(b) {
+	hi := (b >>u 4) & 0xF;
+	lo := b & 0xF;
+	emit(hi < 10 ? hi + '0' : hi + 55);
+	emit(lo < 10 ? lo + '0' : lo + 55);
+	0
+}
 
-	// gp was set by famc's prologue to end-of-code. The appended
-	// payload (bible.txt) was cat'd onto the binary after famc ran,
-	// so its first byte is exactly at gp.
-	gp_val := 0;
-	asm { (gp_val = gp) };
+// ──────────────────────────────────────────────────────────────────────
+//  find_mmio — scan the QEMU-virt virtio MMIO slot range for a device
+//  with the given device_id (1 = net, 2 = blk). Returns the device base
+//  address, or 0 if not found.
+// ──────────────────────────────────────────────────────────────────────
+fn find_mmio(device_id) {
+	result := 0;
+	probe := 0x10008000;
+	loop {
+		probe < 0x10001000 ? break 0;
+		*probe == 0x74726976 && *(probe + 0x008) == device_id
+		? { result = probe; break 0 }
+		: probe -= 0x1000;
+	};
+	result
+}
 
-	// Debug: hex-dump the first 20 bytes of the appended payload so we
-	// can eyeball that the compressed bible is really sitting at gp.
-	emit('[');
-	ptr := gp_val;
+// ──────────────────────────────────────────────────────────────────────
+//  blk_init — legacy virtio-blk handshake. Allocates descriptor area +
+//  header + status byte, programs queue PFN, and leaves the device in
+//  DRIVER_OK state. Returns the base of the per-request scratch area
+//  (desc[0..3], avail ring, header at +8192, status byte at +8208) or 0
+//  on feature-negotiation failure.
+//
+//  virtio-mmio registers (offsets from blk base):
+//    0x020 DRIVER_FEATURES  0x028 GUEST_PAGE_SIZE  0x030 QUEUE_SEL
+//    0x038 QUEUE_NUM        0x03C QUEUE_ALIGN      0x040 QUEUE_PFN
+//    0x050 QUEUE_NOTIFY     0x070 STATUS
+// ──────────────────────────────────────────────────────────────────────
+fn blk_init(blk) {
+	// Virtio QUEUE_PFN takes a page frame number, so the virtqueue
+	// base must be 4 KiB aligned. 16 KiB gives room for desc + avail
+	// (first page), used ring (second page, padded via queue_align),
+	// the request header (offset 8192), and the status byte.
+	scratch := alloc_page(16384);
+
+	*(blk + 0x070) = 0;        // RESET
+	*(blk + 0x070) = 1;        // ACK
+	*(blk + 0x070) = 3;        // ACK | DRIVER
+	*(blk + 0x020) = 0;        // accept no features
+	*(blk + 0x070) = 11;       // ACK | DRIVER | FEATURES_OK
+
+	// If the device clears FEATURES_OK, feature negotiation failed.
+	result := 0;
+	(*(blk + 0x070) & 8) == 0 ? result = 0 : {
+		*(blk + 0x028) = 4096;
+		*(blk + 0x030) = 0;      // select queue 0
+		*(blk + 0x038) = 16;     // queue size
+		*(blk + 0x03C) = 4096;
+		*(blk + 0x040) = scratch >>u 12;
+		*(blk + 0x070) = 15;     // | DRIVER_OK
+		result = scratch;
+	};
+	result
+}
+
+// ──────────────────────────────────────────────────────────────────────
+//  blk_write_one — submit a single BLOCK_MAX-or-less virtio-blk write
+//  and poll status. Returns 0 on success, 1 on device error.
+//
+//  scratch layout (see blk_init):
+//    +0       desc[0..3]      (3 descriptors, 16 bytes each = 48 bytes)
+//    +256     avail ring      (flags:u16, idx:u16, ring[0..N]:u16)
+//    +8192    request header  (type:u32, reserved:u32, sector:u64)
+//    +8208    status byte     (0xFF pending, 0 ok, 1 err)
+// ──────────────────────────────────────────────────────────────────────
+fn blk_write_one(blk, scratch, src, bs, sector, avail_idx) {
+	// Request header.
+	hdr := scratch + 8192;
+	*hdr = 1;                  // type = OUT
+	*(hdr + 4) = 0;
+	*(hdr + 8) = sector;
+	*(hdr + 12) = 0;
+
+	@(scratch + 8208) = 0xFF;
+
+	d := scratch;              // desc[0] = header (device reads)
+	*d = hdr;
+	*(d + 4) = 0;
+	*(d + 8) = 16;
+	#(d + 12) = 1;             // flags = NEXT
+	#(d + 14) = 1;             // next = 1
+
+	*(d + 16) = src;           // desc[1] = data (device reads)
+	*(d + 20) = 0;
+	*(d + 24) = bs;
+	#(d + 28) = 1;
+	#(d + 30) = 2;
+
+	*(d + 32) = scratch + 8208;  // desc[2] = status (device writes)
+	*(d + 36) = 0;
+	*(d + 40) = 1;
+	#(d + 44) = 2;             // flags = WRITE
+	#(d + 46) = 0;
+
+	a := scratch + 256;        // avail ring
+	#a = 0;
+	#(a + 2) = avail_idx + 1;
+	#(a + 4) = 0;
+
+	*(blk + 0x050) = 0;        // QUEUE_NOTIFY — kick
+
+	loop {
+		@(scratch + 8208) != 0xFF ? break 0;
+	};
+	@(scratch + 8208) == 0 ? 0 : 1
+}
+
+// ──────────────────────────────────────────────────────────────────────
+//  blk_write_image — chunk bin_base..bin_base+bin_size into 64 KiB (or
+//  smaller, sector-rounded) writes via blk_write_one. Emits 'W' on
+//  success, 'X' on any device error.
+// ──────────────────────────────────────────────────────────────────────
+fn blk_write_image(blk, bin_base, bin_size) {
+	scratch := blk_init(blk);
+	scratch == 0 ? emit('E') : {
+		src := bin_base;
+		sector := 0;
+		remaining := bin_size;
+		avail_idx := 0;
+		err := 0;
+
+		loop {
+			remaining == 0 ? break 0;
+			err != 0 ? break 0;
+
+			// Last block is sector-rounded; all others are BLOCK_MAX.
+			bs := remaining < 65536
+			? (remaining + 511) & 0xFFFFFE00
+			: 65536;
+
+			r := blk_write_one(blk, scratch, src, bs, sector, avail_idx);
+			r == 0 ? {
+				src += bs;
+				sector += bs >>u 9;
+				remaining -= remaining < bs ? remaining : bs;
+				avail_idx += 1;
+				0
+			} : { err = 1; 0 };
+		};
+		err == 0 ? emit('W') : emit('X');
+	};
+	0
+}
+
+// ──────────────────────────────────────────────────────────────────────
+//  net_init — legacy virtio-net handshake. Programs RX (queue 0) and
+//  TX (queue 1) queues at the passed-in page-aligned base addresses.
+//  Returns 1 on success, 0 on feature-negotiation failure.
+//
+//  MMIO offsets match virtio-blk; device_id for net is 1.
+// ──────────────────────────────────────────────────────────────────────
+fn net_init(net, rx_q, tx_q) {
+	// Zero both queue regions (8 KiB each: desc+avail page + used ring
+	// page). Fresh alloc memory can contain stale descriptor state from
+	// tabernacle's DATA_REGION, which would corrupt our used-ring reads.
+	i := 0;
+	loop {
+		i == 8192 ? break 0;
+		*(rx_q + i) = 0;
+		*(tx_q + i) = 0;
+		i += 4;
+	};
+
+	*(net + 0x070) = 0;         // RESET
+	*(net + 0x070) = 1;         // ACK
+	*(net + 0x070) = 3;         // ACK | DRIVER
+	*(net + 0x020) = 0;         // accept no features
+	*(net + 0x070) = 11;        // ACK | DRIVER | FEATURES_OK
+
+	result := 0;
+	(*(net + 0x070) & 8) == 0 ? result = 0 : {
+		*(net + 0x028) = 4096;
+
+		// RX queue (queue 0). num=1 keeps the ring tiny; one in-flight
+		// descriptor at a time is plenty for our REQ/RSP workload.
+		*(net + 0x030) = 0;
+		*(net + 0x038) = 1;
+		*(net + 0x03C) = 4096;
+		*(net + 0x040) = rx_q >>u 12;
+
+		// TX queue (queue 1).
+		*(net + 0x030) = 1;
+		*(net + 0x038) = 1;
+		*(net + 0x03C) = 4096;
+		*(net + 0x040) = tx_q >>u 12;
+
+		*(net + 0x070) = 15;    // | DRIVER_OK
+		result = 1;
+	};
+	result
+}
+
+// ──────────────────────────────────────────────────────────────────────
+//  net_post_rx — post a descriptor at desc[0] pointing at `buf`/`len`
+//  (device-write), bump avail_idx, notify queue 0.
+//
+//  Queue layout (legacy, num=1):
+//    rx_q+0      desc[0]    (16 bytes)
+//    rx_q+16     avail ring (flags:u16, idx:u16, ring[0]:u16, used_event:u16)
+//    rx_q+4096   used ring  (flags:u16, idx:u16, ring[0]:{id:u32,len:u32}, avail_event:u16)
+// ──────────────────────────────────────────────────────────────────────
+fn net_post_rx(net, rx_q, buf, len, avail_idx) {
+	// desc[0]: addr=buf, len=len, flags=WRITE (2), next=0
+	*rx_q = buf;
+	*(rx_q + 4) = 0;
+	*(rx_q + 8) = len;
+	#(rx_q + 12) = 2;           // WRITE
+	#(rx_q + 14) = 0;
+
+	// avail ring
+	a := rx_q + 16;
+	#a = 0;                     // flags
+	#(a + 4) = 0;               // ring[0] = desc index 0
+	#(a + 2) = avail_idx;       // idx (bumped by caller each post)
+
+	*(net + 0x050) = 0;         // QUEUE_NOTIFY queue 0
+	0
+}
+
+// ──────────────────────────────────────────────────────────────────────
+//  net_poll_rx — non-blocking check of RX used ring. Returns the bytes
+//  written by the device if a new entry is present, else 0. `last_used`
+//  is the caller's record of the last-consumed used-ring idx.
+// ──────────────────────────────────────────────────────────────────────
+fn net_poll_rx(rx_q, last_used) {
+	used := rx_q + 4096;
+	cur := #(used + 2);         // current used.idx (u16)
+	cur == last_used ? 0 : {
+		// used ring[0] = {id:u32 @ +4, len:u32 @ +8}. num=1 → slot 0.
+		*(used + 8)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────
+//  net_send — post a TX descriptor at tx_q desc[0], bump avail, kick
+//  queue 1, and spin until the device signals completion on the used
+//  ring. Blocking is fine for our req/reply workload.
+// ──────────────────────────────────────────────────────────────────────
+fn net_send(net, tx_q, buf, len, avail_idx) {
+	*tx_q = buf;                 // desc[0].addr = buf
+	*(tx_q + 4) = 0;
+	*(tx_q + 8) = len;           // desc[0].len
+	#(tx_q + 12) = 0;            // flags = 0 (device reads from buf)
+	#(tx_q + 14) = 0;
+
+	a := tx_q + 16;              // avail ring
+	#a = 0;                      // flags
+	#(a + 4) = 0;                // ring[0] = desc 0
+	#(a + 2) = avail_idx;        // idx
+
+	*(net + 0x050) = 1;          // QUEUE_NOTIFY queue 1 (TX)
+
+	used := tx_q + 4096;
+	loop {
+		cur := #(used + 2);
+		cur == avail_idx ? break 0;
+	};
+	0
+}
+
+// ──────────────────────────────────────────────────────────────────────
+//  ip_checksum — RFC 1071 one's-complement 16-bit fold over a 20-byte
+//  IPv4 header. Caller zeroes the checksum field (hdr+10/11) before
+//  calling and writes the returned value back in big-endian order.
+// ──────────────────────────────────────────────────────────────────────
+fn ip_checksum(hdr) {
+	sum := 0;
 	i := 0;
 	loop {
 		i == 20 ? break 0;
-		b := @ptr;
-		hi := (b >>u 4) & 0xF;
-		lo := b & 0xF;
-		emit(hi < 10 ? hi + '0' : hi + 55);
-		emit(lo < 10 ? lo + '0' : lo + 55);
+		hi := @(hdr + i);
+		lo := @(hdr + i + 1);
+		sum += (hi << 8) | lo;
+		i += 2;
+	};
+	sum = (sum & 0xFFFF) + (sum >>u 16);
+	sum = (sum & 0xFFFF) + (sum >>u 16);
+	sum ^ 0xFFFF
+}
+
+// ──────────────────────────────────────────────────────────────────────
+//  handle_arp — if rx_buf holds an ARP request targeting our IP
+//  (10.0.2.15), build a reply in tx_buf and send it. Returns 1 if a
+//  reply was sent, 0 otherwise.
+//
+//  ARP-over-Ethernet starts at rx_buf + 12 (virtio_hdr) + 14 (eth) = 26:
+//    +0/1  hw_type=1          +2/3 proto_type=0x0800
+//    +4    hw_len=6           +5   proto_len=4
+//    +6/7  opcode             +8..13 sender MAC
+//    +14..17 sender IP        +18..23 target MAC
+//    +24..27 target IP
+// ──────────────────────────────────────────────────────────────────────
+fn handle_arp(net, tx_q, rx_buf, tx_buf, avail_idx) {
+	// Legacy virtio-net without MRG_RXBUF → 10-byte header.
+	// Ethernet starts at rx_buf + 10, ARP body at rx_buf + 10 + 14 = 24.
+	arp := rx_buf + 24;
+	opcode_hi := @(arp + 6);
+	opcode_lo := @(arp + 7);
+	result := 0;
+	opcode_hi == 0 && opcode_lo == 1 ? {
+		// Target IP check (10.0.2.15).
+		t0 := @(arp + 24);
+		t1 := @(arp + 25);
+		t2 := @(arp + 26);
+		t3 := @(arp + 27);
+		t0 == 10 && t1 == 0 && t2 == 2 && t3 == 15 ? {
+			// Zero 10-byte virtio_net_hdr.
+			i := 0;
+			loop {
+				i == 10 ? break 0;
+				@(tx_buf + i) = 0;
+				i += 1;
+			};
+			// Eth dst = requester's sender MAC (arp + 8).
+			i = 0;
+			loop {
+				i == 6 ? break 0;
+				@(tx_buf + 10 + i) = @(arp + 8 + i);
+				i += 1;
+			};
+			// Eth src = our MAC.
+			@(tx_buf + 16) = 0x52;
+			@(tx_buf + 17) = 0x54;
+			@(tx_buf + 18) = 0x00;
+			@(tx_buf + 19) = 0x12;
+			@(tx_buf + 20) = 0x34;
+			@(tx_buf + 21) = 0x56;
+			// Ethertype = ARP (0x0806).
+			@(tx_buf + 22) = 0x08;
+			@(tx_buf + 23) = 0x06;
+
+			out := tx_buf + 24;
+			@(out + 0) = 0x00; @(out + 1) = 0x01;   // hw_type = Ethernet
+			@(out + 2) = 0x08; @(out + 3) = 0x00;   // proto_type = IPv4
+			@(out + 4) = 6;
+			@(out + 5) = 4;
+			@(out + 6) = 0x00; @(out + 7) = 0x02;   // opcode = reply
+			// sender MAC = ours
+			@(out + 8)  = 0x52; @(out + 9)  = 0x54; @(out + 10) = 0x00;
+			@(out + 11) = 0x12; @(out + 12) = 0x34; @(out + 13) = 0x56;
+			// sender IP = 10.0.2.15
+			@(out + 14) = 10; @(out + 15) = 0; @(out + 16) = 2; @(out + 17) = 15;
+			// target MAC = requester's sender MAC
+			i = 0;
+			loop {
+				i == 6 ? break 0;
+				@(out + 18 + i) = @(arp + 8 + i);
+				i += 1;
+			};
+			// target IP = requester's sender IP
+			@(out + 24) = @(arp + 14);
+			@(out + 25) = @(arp + 15);
+			@(out + 26) = @(arp + 16);
+			@(out + 27) = @(arp + 17);
+
+			net_send(net, tx_q, tx_buf, 10 + 14 + 28, avail_idx);
+			emit('A');
+			result = 1;
+			0
+		} : 0
+	} : 0;
+	result
+}
+
+// ──────────────────────────────────────────────────────────────────────
+//  build_famc_template — fill tx_buf with the eth/IP/UDP header fields
+//  that stay constant across all chunks of a response: addresses, ports,
+//  protocol, TTL. Per-packet varying fields (IP total length, IP
+//  checksum, UDP length, FAMC seq, chunk payload) are set by the send
+//  loop in handle_famc.
+// ──────────────────────────────────────────────────────────────────────
+fn build_famc_template(rx_buf, tx_buf) {
+	// Offsets assume a 10-byte virtio_net_hdr (no MRG_RXBUF).
+	//   rx_buf+10..+23  Ethernet (dst 6, src 6, ethertype 2)
+	//   rx_buf+24..+43  IPv4 header (20 bytes, src IP at +36, dst IP at +40)
+	//   rx_buf+44..+51  UDP header (src port at +44, dst port at +46)
+	//   rx_buf+52..     UDP payload
+
+	// Zero 10-byte virtio_net_hdr.
+	i := 0;
+	loop {
+		i == 10 ? break 0;
+		@(tx_buf + i) = 0;
+		i += 1;
+	};
+
+	// Eth dst = incoming src MAC (rx_buf + 10 + 6 = rx_buf + 16).
+	i = 0;
+	loop {
+		i == 6 ? break 0;
+		@(tx_buf + 10 + i) = @(rx_buf + 16 + i);
+		i += 1;
+	};
+	// Eth src = our MAC.
+	@(tx_buf + 16) = 0x52; @(tx_buf + 17) = 0x54; @(tx_buf + 18) = 0x00;
+	@(tx_buf + 19) = 0x12; @(tx_buf + 20) = 0x34; @(tx_buf + 21) = 0x56;
+	// Ethertype = IPv4.
+	@(tx_buf + 22) = 0x08;
+	@(tx_buf + 23) = 0x00;
+
+	// IPv4 header (20 bytes) at tx_buf + 24.
+	ip := tx_buf + 24;
+	@(ip + 0) = 0x45;      // version 4, IHL 5
+	@(ip + 1) = 0;         // TOS
+	@(ip + 2) = 0;         // total length hi (patched)
+	@(ip + 3) = 0;         // total length lo (patched)
+	@(ip + 4) = 0;         // ID
+	@(ip + 5) = 0;
+	@(ip + 6) = 0;         // flags + frag offset
+	@(ip + 7) = 0;
+	@(ip + 8) = 64;        // TTL
+	@(ip + 9) = 17;        // protocol = UDP
+	@(ip + 10) = 0;        // checksum (patched)
+	@(ip + 11) = 0;
+	// src IP = 10.0.2.15
+	@(ip + 12) = 10; @(ip + 13) = 0; @(ip + 14) = 2; @(ip + 15) = 15;
+	// dst IP = requester's src IP (rx_buf + 24 + 12 = rx_buf + 36).
+	@(ip + 16) = @(rx_buf + 36);
+	@(ip + 17) = @(rx_buf + 37);
+	@(ip + 18) = @(rx_buf + 38);
+	@(ip + 19) = @(rx_buf + 39);
+
+	// UDP header at tx_buf + 44.
+	udp := tx_buf + 44;
+	@(udp + 0) = 0x0E; @(udp + 1) = 0x99;   // src port 3737
+	@(udp + 2) = @(rx_buf + 44);            // dst port = requester's src port
+	@(udp + 3) = @(rx_buf + 45);
+	@(udp + 4) = 0; @(udp + 5) = 0;         // UDP length (patched)
+	@(udp + 6) = 0; @(udp + 7) = 0;         // UDP checksum = 0 (valid for IPv4)
+	0
+}
+
+// ──────────────────────────────────────────────────────────────────────
+//  handle_famc — parse a FAMC REQ_RANGE ("FAMC" + 0x02 + start:BE u16
+//  + end:BE u16) received at rx_buf, and for each chunk in
+//  [start, min(end, NUM_CHUNKS-1)] send a RSP_CHUNK packet. CHUNK_SIZE
+//  is 1400 bytes; the last chunk may be shorter. Returns the number of
+//  packets sent (which also equals the number of avail_idx slots the
+//  caller should advance by).
+// ──────────────────────────────────────────────────────────────────────
+fn handle_famc(net, tx_q, rx_buf, tx_buf, image_base, bin_size, start_avail_idx) {
+	// UDP payload begins at rx_buf + 10 (virtio) + 14 (eth) + 20 (ip)
+	// + 8 (udp) = 52.
+	payload := rx_buf + 52;
+	magic_ok := @(payload + 0) == 'F' && @(payload + 1) == 'A'
+		&& @(payload + 2) == 'M' && @(payload + 3) == 'C';
+	count := 0;
+	magic_ok && @(payload + 4) == 0x02 ? {
+		start := (@(payload + 5) << 8) | @(payload + 6);
+		end   := (@(payload + 7) << 8) | @(payload + 8);
+
+		emit('R');
+
+		build_famc_template(rx_buf, tx_buf);
+
+		seq := start;
+		loop {
+			seq > end ? break 0;
+			// offset = seq * 1400 = seq*(1024+256+128-8)
+			offset := (seq << 10) + (seq << 8) + (seq << 7) - (seq << 3);
+			offset >= bin_size ? break 0;
+
+			remaining := bin_size - offset;
+			data_len := remaining < 1400 ? remaining : 1400;
+
+			// FAMC response header at tx_buf + 52.
+			fpl := tx_buf + 52;
+			@(fpl + 0) = 'F';
+			@(fpl + 1) = 'A';
+			@(fpl + 2) = 'M';
+			@(fpl + 3) = 'C';
+			@(fpl + 4) = 0x82;                         // RSP_CHUNK
+			@(fpl + 5) = (seq >>u 8) & 0xFF;
+			@(fpl + 6) = seq & 0xFF;
+
+			// Copy data_len bytes from image_base+offset to fpl+7.
+			src := image_base + offset;
+			i := 0;
+			loop {
+				i == data_len ? break 0;
+				@(fpl + 7 + i) = @(src + i);
+				i += 1;
+			};
+
+			// Patch UDP length = 8 (hdr) + 7 (FAMC hdr) + data_len.
+			udp_len := 8 + 7 + data_len;
+			@(tx_buf + 44 + 4) = (udp_len >>u 8) & 0xFF;
+			@(tx_buf + 44 + 5) = udp_len & 0xFF;
+
+			// Patch IP total length = 20 + UDP.
+			ip_total := 20 + udp_len;
+			@(tx_buf + 24 + 2) = (ip_total >>u 8) & 0xFF;
+			@(tx_buf + 24 + 3) = ip_total & 0xFF;
+
+			// Recompute IP header checksum (zero before call).
+			@(tx_buf + 24 + 10) = 0;
+			@(tx_buf + 24 + 11) = 0;
+			cksum := ip_checksum(tx_buf + 24);
+			@(tx_buf + 24 + 10) = (cksum >>u 8) & 0xFF;
+			@(tx_buf + 24 + 11) = cksum & 0xFF;
+
+			total_len := 10 + 14 + 20 + udp_len;
+			net_send(net, tx_q, tx_buf, total_len, start_avail_idx + count);
+			emit('C');
+
+			count += 1;
+			seq += 1;
+		};
+		0
+	} : 0;
+	count
+}
+
+// ──────────────────────────────────────────────────────────────────────
+//  serve — FAMC chunk server on port 3737. Infinite loop:
+//    - Poll RX used ring.
+//    - Dispatch on ethertype: ARP → handle_arp, IPv4/UDP/3737 →
+//      handle_famc. Everything else is silently dropped.
+//    - Repost the RX descriptor for the next frame.
+// ──────────────────────────────────────────────────────────────────────
+fn serve(image_base, bin_size) {
+	net := find_mmio(1);
+	net == 0 ? emit('N') : {
+		// Page-aligned: virtio QUEUE_PFN encodes the queue base as a
+		// page frame number, so the queue MUST start on a 4 KiB
+		// boundary. Plain alloc() is only 4-byte aligned.
+		rx_q := alloc_page(8192);
+		tx_q := alloc_page(8192);
+		rx_buf := rx_q + 512;
+		tx_buf := tx_q + 512;
+
+		ok := net_init(net, rx_q, tx_q);
+		ok == 0 ? emit('F') : {
+			emit('S');
+
+			rx_avail_idx := 1;
+			tx_avail_idx := 0;
+			net_post_rx(net, rx_q, rx_buf, 1536, rx_avail_idx);
+			last_used := 0;
+
+			loop {
+				rx_len := net_poll_rx(rx_q, last_used);
+				rx_len == 0 ? 0 : {
+					// Ethertype at rx_buf + 10 (virtio_hdr) + 12 (eth).
+					eth_hi := @(rx_buf + 22);
+					eth_lo := @(rx_buf + 23);
+
+					// ARP (0x0806)
+					eth_hi == 0x08 && eth_lo == 0x06 ? {
+						sent := handle_arp(net, tx_q, rx_buf, tx_buf, tx_avail_idx + 1);
+						tx_avail_idx += sent;
+						0
+					} : 0;
+
+					// IPv4 UDP to port 3737
+					eth_hi == 0x08 && eth_lo == 0x00 ? {
+						proto := @(rx_buf + 24 + 9);
+						dp_hi := @(rx_buf + 44 + 2);
+						dp_lo := @(rx_buf + 44 + 3);
+						proto == 17 && dp_hi == 0x0E && dp_lo == 0x99 ? {
+							sent := handle_famc(net, tx_q, rx_buf, tx_buf,
+								image_base, bin_size, tx_avail_idx + 1);
+							tx_avail_idx += sent;
+							0
+						} : 0;
+						0
+					} : 0;
+
+					last_used = (last_used + 1) & 0xFFFF;
+					rx_avail_idx = (rx_avail_idx + 1) & 0xFFFF;
+					net_post_rx(net, rx_q, rx_buf, 1536, rx_avail_idx);
+					0
+				};
+			}
+		};
+	};
+	0
+}
+
+// ──────────────────────────────────────────────────────────────────────
+//  debug_dump_hex20 — hex-dump the first 20 bytes at ptr, framed in
+//  brackets and terminated with a newline. Purely diagnostic.
+// ──────────────────────────────────────────────────────────────────────
+fn debug_dump_hex20(ptr) {
+	emit('[');
+	i := 0;
+	loop {
+		i == 20 ? break 0;
+		emit_hex2(@(ptr + i));
 		emit(' ');
-		ptr += 1;
 		i += 1;
 	};
 	emit(']');
 	emit(10);
+	0
+}
 
-	// Scratch at gp + 12 MiB, page-aligned — between s1 (gp + 8 MiB,
-	// the stack-bottom guard set by stdlib) and sp (gp + 64 MiB).
-	scratch := (gp_val + 0xC00FFF) & 0xFFFFF000;
+// ──────────────────────────────────────────────────────────────────────
+//  main — node entry.
+//    seed_list     : pointer to tabernacle's [count:u8][ip:4 port:2]*
+//    boot_source   : 0 = loaded from disk, 1 = loaded from network
+//    bin_size      : total image size in bytes (code + appended payload)
+//    image_base    : first byte of the image in memory
+//    payload_start : first byte of the appended payload in memory
+//                    (captured by init_env before gp was advanced)
+// ──────────────────────────────────────────────────────────────────────
+fn main(seed_list, boot_source, bin_size, image_base, payload_start) {
+	// Sanity-dump the first 20 bytes of the payload so a run can
+	// visually confirm the appended data is readable at the address
+	// init_env preserved for us.
+	debug_dump_hex20(payload_start);
 
-	// Scan MMIO for a virtio-blk device (device_id = 2). QEMU virt
-	// assigns virtio devices 0x10001000..0x10008000.
-	blk := 0;
-	probe := 0x10008000;
-	loop {
-		probe < 0x10001000 ? break 0;
-		*probe == 0x74726976 && *(probe + 0x008) == 2
-		? { blk = probe; break 0 }
-		: probe -= 0x1000;
-	};
-
+	// Dispatch: disk boot → 'L', no virtio-blk → 'E', network boot →
+	// write-to-disk.
+	blk := find_mmio(2);
 	boot_source == 0 ? emit('L') : blk == 0 ? emit('E') : {
-		// virtio-blk legacy MMIO handshake.
-		// STATUS = 0x070, DRIVER_FEATURES = 0x020, GUEST_PAGE_SIZE = 0x028,
-		// QUEUE_SEL = 0x030, QUEUE_NUM = 0x038, QUEUE_ALIGN = 0x03C,
-		// QUEUE_PFN = 0x040, QUEUE_NOTIFY = 0x050.
-		*(blk + 0x070) = 0;       // reset
-		*(blk + 0x070) = 1;       // ACK
-		*(blk + 0x070) = 3;       // ACK | DRIVER
-		*(blk + 0x020) = 0;       // accept no features
-		*(blk + 0x070) = 11;      // ACK | DRIVER | FEATURES_OK
-
-		(*(blk + 0x070) & 8) == 0 ? emit('E') : {
-			*(blk + 0x028) = 4096;
-			*(blk + 0x030) = 0;
-			*(blk + 0x038) = 16;
-			*(blk + 0x03C) = 4096;
-			*(blk + 0x040) = scratch >>u 12;
-			*(blk + 0x070) = 15;  // | DRIVER_OK
-
-			// Scratch layout: desc @ +0, avail @ +256, hdr @ +8192,
-			// status @ +8208. BLOCK_MAX = 64 KiB.
-			src := bin_base;
-			sector := 0;
-			remaining := bin_size;
-			avail_idx := 0;
-			err := 0;
-
-			loop {
-				remaining == 0 ? break 0;
-				err != 0 ? break 0;
-
-				bs := remaining < 65536
-				? (remaining + 511) & 0xFFFFFE00
-				: 65536;
-
-				hdr := scratch + 8192;
-				*hdr = 1;              // type = OUT
-				*(hdr + 4) = 0;
-				*(hdr + 8) = sector;
-				*(hdr + 12) = 0;
-
-				@(scratch + 8208) = 0xFF;
-
-				d := scratch + 0;      // desc[0] = header (read)
-				*d = hdr;
-				*(d + 4) = 0;
-				*(d + 8) = 16;
-				#(d + 12) = 1;         // flags = NEXT
-				#(d + 14) = 1;
-
-				*(d + 16) = src;       // desc[1] = data (read)
-				*(d + 20) = 0;
-				*(d + 24) = bs;
-				#(d + 28) = 1;
-				#(d + 30) = 2;
-
-				*(d + 32) = scratch + 8208;  // desc[2] = status (write)
-				*(d + 36) = 0;
-				*(d + 40) = 1;
-				#(d + 44) = 2;         // flags = WRITE
-				#(d + 46) = 0;
-
-				a := scratch + 256;    // avail ring
-				#a = 0;
-				#(a + 2) = avail_idx + 1;
-				#(a + 4) = 0;
-
-				*(blk + 0x050) = 0;    // kick
-
-				loop {
-					@(scratch + 8208) != 0xFF ? break 0;
-				};
-				@(scratch + 8208) == 0 ? {
-					src += bs;
-					sector += bs >>u 9;
-					remaining -= remaining < bs ? remaining : bs;
-					avail_idx += 1;
-					0
-				} : { err = 1; 0 };
-			};
-
-			err == 0 ? emit('W') : emit('X');
-		};
+		blk_write_image(blk, image_base, bin_size)
 	};
+
+	// Become a FAMC chunk server. Never returns.
+	serve(image_base, bin_size);
 	0
 }
