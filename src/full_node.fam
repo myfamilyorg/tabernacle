@@ -42,15 +42,21 @@ fn main(seed_list, boot_source, bin_size) {
 	gp_val := 0;
 	asm { (gp_val = gp) };
 
-	// Debug: echo the first line of the appended payload to prove
-	// it's really sitting in memory at gp.
+	// Debug: hex-dump the first 20 bytes of the appended payload so we
+	// can eyeball that the compressed bible is really sitting at gp.
 	emit('[');
 	ptr := gp_val;
+	i := 0;
 	loop {
-		ch := @ptr;
-		ch == 10 ? break 0;
-		emit(ch);
+		i == 20 ? break 0;
+		b := @ptr;
+		hi := (b >>u 4) & 0xF;
+		lo := b & 0xF;
+		emit(hi < 10 ? hi + '0' : hi + 55);
+		emit(lo < 10 ? lo + '0' : lo + 55);
+		emit(' ');
 		ptr += 1;
+		i += 1;
 	};
 	emit(']');
 	emit(10);
