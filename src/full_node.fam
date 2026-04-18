@@ -350,6 +350,59 @@ fn ip_checksum(hdr) {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+//  udp_checksum — RFC 768 UDP checksum: one's-complement fold over
+//  pseudo-header (src IP, dst IP, zero, protocol=17, UDP length) + UDP
+//  header (with checksum field zeroed) + UDP payload.
+//
+//  Required by real networks: many routers and cloud middleboxes drop
+//  UDP packets with checksum = 0 or with checksums that don't match
+//  after SLIRP's NAT src-IP rewrite produces a bogus delta-updated
+//  value. Computing the checksum correctly in the guest makes SLIRP's
+//  delta-update land on a valid value.
+//
+//  Args: tx_buf       = start of packet (virtio_net_hdr at +0)
+//        udp_total    = UDP header (8) + UDP payload in bytes
+// ──────────────────────────────────────────────────────────────────────
+fn udp_checksum(tx_buf, udp_total) {
+	ip := tx_buf + 24;
+	udp := tx_buf + 44;
+
+	sum := 0;
+	// Pseudo-header: src IP (4), dst IP (4), zero(1)+protocol(1), UDP length (2).
+	sum += (@(ip + 12) << 8) | @(ip + 13);
+	sum += (@(ip + 14) << 8) | @(ip + 15);
+	sum += (@(ip + 16) << 8) | @(ip + 17);
+	sum += (@(ip + 18) << 8) | @(ip + 19);
+	sum += 17;            // (0 << 8) | 17 = protocol
+	sum += udp_total;
+
+	// UDP header + payload. Caller must have written checksum bytes
+	// (udp+6, udp+7) as zero before calling.
+	i := 0;
+	loop {
+		i + 1 >= udp_total ? break 0;
+		hi := @(udp + i);
+		lo := @(udp + i + 1);
+		sum += (hi << 8) | lo;
+		i += 2;
+	};
+	// Odd-length tail: pad with a zero low byte.
+	i < udp_total ? {
+		sum += @(udp + i) << 8;
+		0
+	} : 0;
+
+	// Fold carries twice (enough for any 32-bit-unsigned accumulator).
+	sum = (sum & 0xFFFF) + (sum >>u 16);
+	sum = (sum & 0xFFFF) + (sum >>u 16);
+
+	result := sum ^ 0xFFFF;
+	// RFC 768: a computed value of 0 is transmitted as 0xFFFF, since
+	// 0 means "no checksum" and would be wrong for a present one.
+	result == 0 ? 0xFFFF : result
+}
+
+// ──────────────────────────────────────────────────────────────────────
 //  handle_arp — if rx_buf holds an ARP request targeting our IP
 //  (10.0.2.15), build a reply in tx_buf and send it. Returns 1 if a
 //  reply was sent, 0 otherwise.
@@ -563,12 +616,22 @@ fn handle_famc(net, tx_q, rx_buf, tx_buf, image_base, bin_size, start_avail_idx)
 			@(tx_buf + 24 + 2) = (ip_total >>u 8) & 0xFF;
 			@(tx_buf + 24 + 3) = ip_total & 0xFF;
 
-			// Recompute IP header checksum (zero before call).
+			// IP header checksum (zero before call).
 			@(tx_buf + 24 + 10) = 0;
 			@(tx_buf + 24 + 11) = 0;
 			cksum := ip_checksum(tx_buf + 24);
 			@(tx_buf + 24 + 10) = (cksum >>u 8) & 0xFF;
 			@(tx_buf + 24 + 11) = cksum & 0xFF;
+
+			// UDP checksum (zero field first, then compute over
+			// pseudo-header + UDP header + payload). Technically the
+			// Linux host kernel recomputes this on sendto(), but
+			// supplying a valid one here matches RFC and is harmless.
+			@(tx_buf + 44 + 6) = 0;
+			@(tx_buf + 44 + 7) = 0;
+			ucksum := udp_checksum(tx_buf, udp_len);
+			@(tx_buf + 44 + 6) = (ucksum >>u 8) & 0xFF;
+			@(tx_buf + 44 + 7) = ucksum & 0xFF;
 
 			total_len := 10 + 14 + 20 + udp_len;
 			net_send(net, tx_q, tx_buf, total_len, start_avail_idx + count);
