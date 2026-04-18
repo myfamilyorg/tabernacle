@@ -40,6 +40,11 @@ echo "Compiling src/full_node.fam" >&2
 	-machine virt -cpu "$CPU" \
 	-nographic -bios none \
 	-device loader,file=bin/famc,addr=0x80000000 > bin/full_node
+ 
+
+# Append bible to the binary
+#cat ./resources/bible.txt >> ./bin/full_node
+cat ./resources/test_wikipedia.txt >> ./bin/full_node
 
 # Build the input stream for gen_bin_config: 4-byte little-endian length
 # prefix followed by the node bytes. Pipe into QEMU; its UART stdout will
@@ -70,9 +75,3 @@ fi
 # Rebuild tabernacle against the updated bin_config.
 echo "Rebuilding bin/tabernacle" >&2
 tools/build_node bin/tabernacle > /dev/null
-
-# Restage the node binary for tools/server.py.
-mkdir -p tmp
-cp bin/full_node tmp/node.bin
-echo "Staged tmp/node.bin ($(wc -c < tmp/node.bin) bytes)" >&2
-echo "Done."

@@ -424,10 +424,16 @@ rd_done:
 	sw	a0, 0(s5)
 	addi	s5, s5, 4
 
-	# lui sp, 0x10      →  opcode=0x37, rd=sp=2, imm20=0x10
-	# word = (0x10 << 12) | (2 << 7) | 0x37
-	#      = 0x00010000 | 0x100 | 0x37 = 0x00010137
-	lui	a0, 0x10
+	# lui sp, 0x1000    →  opcode=0x37, rd=sp=2, imm20=0x1000
+	# word = (0x1000 << 12) | (2 << 7) | 0x37
+	#      = 0x01000000 | 0x100 | 0x37 = 0x01000137
+	# Main stack base = 16 MiB above gp. This reserves 16 MiB of headroom
+	# between end-of-code (gp) and the stack, so a binary image that has
+	# data appended after the code (e.g. full_node with a multi-MB bible
+	# payload) still has its entire image below sp — stack writes from
+	# the main prologue (sw a0/a1/a2/image_base at fp+0/4/8/12) don't
+	# corrupt the appended data.
+	lui	a0, 0x1000
 	addi	a0, a0, 0x137
 	sw	a0, 0(s5)
 	addi	s5, s5, 4
@@ -442,16 +448,18 @@ rd_done:
 	sw	a0, 0(s5)
 	addi	s5, s5, 4
 
-	# Shadow stack for return IDs — tp = gp + 32 KiB. Grows downward,
-	# separate from the main data stack (sp). Buffer overflows on sp
-	# can't reach return IDs stored on tp.
+	# Shadow stack for return IDs — tp = gp + 8 MiB. Grows downward,
+	# separate from the main data stack (sp). Kept above any appended
+	# image data (see sp above) but below sp so a runaway stack can't
+	# reach the shadow region first.
 	#
-	#   lui  tp, 0x8       # tp = 0x8000 = 32 KiB
-	#   add  tp, tp, gp   # tp = gp + 32 KiB
+	#   lui  tp, 0x800     # tp = 0x00800000 = 8 MiB
+	#   add  tp, tp, gp    # tp = gp + 8 MiB
 
-	# lui tp, 0x8 → opcode=0x37, rd=tp=4, imm20=0x8
-	# word = 0x37 | (4 << 7) | (0x8 << 12) = 0x37 | 0x200 | 0x8000 = 0x00008237
-	lui	a0, 0x8
+	# lui tp, 0x800 → opcode=0x37, rd=tp=4, imm20=0x800
+	# word = 0x37 | (4 << 7) | (0x800 << 12)
+	#      = 0x37 | 0x200 | 0x00800000 = 0x00800237
+	lui	a0, 0x800
 	addi	a0, a0, 0x237
 	sw	a0, 0(s5)
 	addi	s5, s5, 4
@@ -522,9 +530,9 @@ rd_done:
 	addi	s5, s5, 4
 
 	# sw a1, 4(fp)  →  rs2=a1=11, imm=4
-	#   word = 0x23 | (4<<7) | (2<<12) | (8<<15) | (11<<20) = 0x00B422A3
+	#   word = 0x23 | (4<<7) | (2<<12) | (8<<15) | (11<<20) = 0x00B42223
 	lui	a0, 0xB42
-	addi	a0, a0, 0x2A3
+	addi	a0, a0, 0x223
 	sw	a0, 0(s5)
 	addi	s5, s5, 4
 

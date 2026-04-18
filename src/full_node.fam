@@ -3,24 +3,27 @@
 // Entry contract (from tabernacle):
 //   arg0 = seed-list pointer (unused in this version)
 //   arg1 = boot source: 0 = loaded from disk, 1 = loaded from network
+//   arg2 = BIN_SIZE (bytes to write to disk; full image incl. appended data)
 //
 // Behavior:
 //   arg1 == 0  -> emit 'L' (already on disk; nothing to do).
 //   no disk    -> emit 'E'.
-//   else       -> init virtio-blk, write BIN_SIZE bytes of ourselves to
+//   else       -> init virtio-blk, write arg2 bytes of ourselves to
 //                 disk. Emit 'W' on success, 'X' on virtio error.
 //
-// Memory layout:
+// Memory layout (image may be several MiB because of an appended bible
+// payload, so sp/fp and scratch must sit *above* the entire image):
 //   bin_base    = image_base                          (first byte of our image)
-//   bin_size    = gp - image_base                     (this binary's own size,
-//                                                      4-aligned by famc — what
-//                                                      gen_bin_config.py will
-//                                                      record as BIN_SIZE in
-//                                                      tabernacle's bin_config)
-//   famc stack  = [gp .. gp + 64 KiB], sp grows down  (default famc layout)
-//   scratch     = align_up(gp + 64 KiB, 4 KiB)        (virtio queue area; sits
-//                                                      above famc's stack so
-//                                                      they can't collide)
+//   bin_size    = arg2                                (full image size, passed
+//                                                      by tabernacle from its
+//                                                      compiled-in BIN_SIZE)
+//   sp/fp       = gp + 8 MiB                          (relocated at entry —
+//                                                      famc's default gp+64KiB
+//                                                      would sit inside the
+//                                                      bible payload)
+//   scratch     = gp + 7 MiB, 4 KiB aligned           (virtio queue area;
+//                                                      below the relocated
+//                                                      stack, above the image)
 
 // --- UART ---
 UART_BASE = 0x10000000;
@@ -63,12 +66,18 @@ fn emit(c) {
 }
 
 // --- top-level setup ---
+// Note: famc's main prologue now places sp at gp + 16 MiB and tp at
+// gp + 8 MiB, so arg saves and stack/shadow-stack activity never land
+// inside the appended payload. bin_size comes from the caller (arg2 =
+// tabernacle's BIN_SIZE) rather than gp - image_base, because gp only
+// covers the compiled code, not the appended data.
 bin_base := image_base;
+bin_size := arg2;
 gp_val := 0;
 asm { (gp_val = gp) }
-bin_size := gp_val - bin_base;
-// Scratch sits above famc's default stack: page-align (gp + 64 KiB) up.
-scratch := (gp_val + 0x10FFF) & 0xFFFFF000;
+// Scratch sits at gp + 12 MiB, page-aligned: between tp (gp + 8 MiB)
+// and sp (gp + 16 MiB). Far above any reasonable image size.
+scratch := (gp_val + 0xC00FFF) & 0xFFFFF000;
 
 // --- scan MMIO for a virtio-blk device (device_id = 2) ---
 blk := 0;
@@ -172,13 +181,3 @@ arg1 == 0 ? emit('L') : blk == 0 ? emit('E') : {
 		err == 0 ? emit('W') : emit('X');
 	};
 };
-
-asm {
-	lui  t0, 0x100
-	lui  t1, 0x5
-	addi t1, t1, 0x555
-	sw   t1, 0(t0)
-	1:    wfi
-	j 1b
-	.zero 1000000
-}

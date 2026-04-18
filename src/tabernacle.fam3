@@ -704,6 +704,7 @@ repost_rx:
 exec_binary:
 	li	a0, SEED_LIST_OFFSET
 	add	a0, a0, s11
+	li	a2, BIN_SIZE
 	j	data
 
 	# -- Advance to next host with wrap-around --
