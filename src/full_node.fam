@@ -36,9 +36,24 @@ fn main(seed_list, boot_source, bin_size) {
 	bin_base := 0;
 	asm { (bin_base = a3) };
 
-	// gp was set by famc's prologue to end-of-code.
+	// gp was set by famc's prologue to end-of-code. The appended
+	// payload (bible.txt) was cat'd onto the binary after famc ran,
+	// so its first byte is exactly at gp.
 	gp_val := 0;
 	asm { (gp_val = gp) };
+
+	// Debug: echo the first line of the appended payload to prove
+	// it's really sitting in memory at gp.
+	emit('[');
+	ptr := gp_val;
+	loop {
+		ch := @ptr;
+		ch == 10 ? break 0;
+		emit(ch);
+		ptr += 1;
+	};
+	emit(']');
+	emit(10);
 
 	// Scratch at gp + 12 MiB, page-aligned — between s1 (gp + 8 MiB,
 	// the stack-bottom guard set by stdlib) and sp (gp + 64 MiB).
