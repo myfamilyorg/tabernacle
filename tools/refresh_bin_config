@@ -43,8 +43,7 @@ echo "Compiling src/full_node.fam" >&2
  
 
 # Append bible to the binary
-#cat ./resources/bible.txt >> ./bin/full_node
-cat ./resources/test_wikipedia.txt >> ./bin/full_node
+cat ./resources/bible.txt >> ./bin/full_node
 
 # Build the input stream for gen_bin_config: 4-byte little-endian length
 # prefix followed by the node bytes. Pipe into QEMU; its UART stdout will
