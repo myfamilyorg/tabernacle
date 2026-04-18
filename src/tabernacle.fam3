@@ -56,10 +56,14 @@
 # RISC-V memory-mapped timer (CLINT mtime). Plain lw, no CSR needed.
 # QEMU virt: 10 MHz. SiFive FE310: 32.768 kHz. Adjust per platform.
 .equ	MTIME_ADDR,		0x0200BFF8
-.equ	TIMEOUT_TICKS,		50000000	# 5 s -- no progress = host dead
-.equ	DEADLINE_TICKS,		0x6B49D200	# 3 min at 10 MHz
-.equ	BATCH_SIZE,		128		# chunks per request
-.equ	PACE_TICKS,		100000		# 10 ms between requests at 10 MHz
+.equ	DEADLINE_TICKS,		0x6B49D200	# 3 min at 10 MHz (hard cap per host)
+# NACK-with-idle loss recovery. After the initial REQ that asks for every
+# chunk, only re-request when the receive pipe has been quiet for at least
+# IDLE_INITIAL_TICKS (doubled each round, capped at IDLE_MAX_TICKS) AND
+# we still have gaps in the bitmap. No per-packet timer; loss recovery
+# only fires when the sender has actually stopped sending.
+.equ	IDLE_INITIAL_TICKS,	300000		# 30 ms at 10 MHz
+.equ	IDLE_MAX_TICKS,		5000000		# 500 ms at 10 MHz
 
 # -- Memory layout (offsets from s11) -------------------------------------
 .equ	RX_QUEUE_OFFSET,	0
@@ -442,90 +446,131 @@ div_nc_done:
 	addi	sp, sp, -4
 	sw	t2, 0(sp)		# [sp+0] = NUM_CHUNKS
 
-	# -- Sliding window download --
-	# Request BATCH_SIZE chunks at a time, paced 10ms apart.
-	# Cursor advances to first gap in bitmap each round.
-	# TIMEOUT_TICKS = hard deadline for zero-progress host.
+	# -- NACK-with-idle download --
+	# One REQ asks for every chunk up front; the server streams them
+	# all back. We only re-request after the pipe has gone idle
+	# (IDLE_TICKS with no new chunk), and when we do we send exactly
+	# one REQ per contiguous gap (no BATCH_SIZE padding). IDLE_TICKS
+	# doubles each recovery round, capped at IDLE_MAX_TICKS, so we
+	# don't collapse the wire under heavy loss.
+	#
+	# Register roles in this phase:
+	#   ra  = deadline anchor (per-host absolute ceiling)
+	#   s7  = current IDLE_TICKS threshold (backs off on each NACK)
+	#   s9  = last-chunk-receive time
+	#   sp+0 = NUM_CHUNKS
 	li	s6, MTIME_ADDR
-	li	s7, 0			# cursor
-	lw	s10, 0(s6)		# last_progress_time
-	mv	ra, s10			# host_start_time (deadline anchor)
-	# Set up RX queue pointers (persist across loop).
+	lw	ra, 0(s6)
+	lw	s9, 0(s6)
+	li	s7, IDLE_INITIAL_TICKS
+
+	# Set up RX queue pointers (persist across the loop).
 	li	t0, RX_QUEUE_OFFSET
 	add	t3, s11, t0
 	li	t0, 4096
 	add	t4, t3, t0
 
-slide_loop:
-	# -- Find first missing chunk from cursor --
-scan_gap:
+	# Initial REQ: ask for every chunk in one packet.
+	li	a0, 0
 	lw	t2, 0(sp)
-	bge	s7, t2, scan_wrap
-	srli	t0, s7, 5
-	slli	t0, t0, 2
-	add	t0, s2, t0
-	lw	t1, 0(t0)
-	andi	t5, s7, 31
-	li	t6, 1
-	sll	t6, t6, t5
-	and	t6, t1, t6
-	beqz	t6, found_gap
-	addi	s7, s7, 1
-	j	scan_gap
+	addi	a1, t2, -1
+	mv	a2, s4
+	li	gp, 0			# gp=0 → srr_ret_init
+	j	send_req_range
+srr_ret_init:
+	li	t0, RX_QUEUE_OFFSET
+	add	t3, s11, t0
+	li	t0, 4096
+	add	t4, t3, t0
 
-scan_wrap:
-	# Scanned all chunks. Complete?
+recv_loop:
+	.word	0x0220000F
+	lhu	t5, 2(t4)
+	bne	t5, s1, got_packet
+	# Done?
 	lw	t2, 0(sp)
 	beq	s3, t2, all_received
-	# Deadline exceeded? (prevents slow-drip DoS)
+	# Hard per-host deadline?
 	lw	t6, 0(s6)
 	sub	t0, t6, ra
 	li	t1, DEADLINE_TICKS
 	bgeu	t0, t1, host_failed
-	# No progress for TIMEOUT_TICKS?
-	sub	t6, t6, s10
-	li	t0, TIMEOUT_TICKS
-	bge	t6, t0, host_failed
-	# Wrap cursor and continue.
-	li	s7, 0
-	j	slide_loop
+	# Idle threshold elapsed?
+	lw	t6, 0(s6)
+	sub	t6, t6, s9
+	bltu	t6, s7, recv_loop
+	# Pipe is quiet — issue a NACK pass.
+	j	nack_pass
 
-found_gap:
-	# Send REQ_RANGE(s7, min(s7+BATCH_SIZE-1, LAST_CHUNK)).
-	mv	a0, s7
-	addi	a1, s7, BATCH_SIZE
-	addi	a1, a1, -1
-	lw	t2, 0(sp)
-	addi	t2, t2, -1
-	blt	a1, t2, cap_ok
-	mv	a1, t2
-cap_ok:
+nack_pass:
+	# Bump last_rx_time so we don't re-NACK immediately on reentry,
+	# and exponentially back off the idle threshold for the next round.
+	lw	s9, 0(s6)
+	slli	t0, s7, 1
+	li	t1, IDLE_MAX_TICKS
+	bltu	t0, t1, nack_bo_ok
+	mv	t0, t1
+nack_bo_ok:
+	mv	s7, t0
+
+	# Walk the bitmap for contiguous gap spans. Cursor lives on the
+	# stack so it survives send_req_range (which saves/restores s1..s4
+	# and gp but clobbers a/t-regs).
+	addi	sp, sp, -4
+	sw	zero, 0(sp)		# gap-scan cursor = 0
+
+gap_loop:
+	lw	a6, 0(sp)
+	lw	t2, 4(sp)		# NUM_CHUNKS (shifted by our push)
+	bge	a6, t2, gap_done
+	srli	t0, a6, 5
+	slli	t0, t0, 2
+	add	t0, s2, t0
+	lw	t1, 0(t0)
+	andi	t5, a6, 31
+	li	t6, 1
+	sll	t6, t6, t5
+	and	t6, t1, t6
+	bnez	t6, gap_step		# bit set → advance past
+
+	# Found first missing chunk at a6; extend a7 until set-bit or end.
+	mv	a7, a6
+gap_ext:
+	addi	a7, a7, 1
+	bge	a7, t2, gap_req
+	srli	t0, a7, 5
+	slli	t0, t0, 2
+	add	t0, s2, t0
+	lw	t1, 0(t0)
+	andi	t5, a7, 31
+	li	t6, 1
+	sll	t6, t6, t5
+	and	t6, t1, t6
+	beqz	t6, gap_ext
+
+gap_req:
+	# Gap is [a6, a7). Send REQ_RANGE(a6, a7-1) and resume scan at a7.
+	sw	a7, 0(sp)
+	mv	a0, a6
+	addi	a1, a7, -1
 	mv	a2, s4
-	li	gp, 0
+	li	gp, 1			# gp=1 → srr_ret_nack
 	j	send_req_range
-srr_ret_try:
-	addi	s7, s7, BATCH_SIZE
-
-	# Restore RX queue pointers (clobbered by send_req_range).
+srr_ret_nack:
 	li	t0, RX_QUEUE_OFFSET
 	add	t3, s11, t0
 	li	t0, 4096
 	add	t4, t3, t0
+	j	gap_loop
 
-	# -- Poll for PACE_TICKS (10ms), receiving packets --
-	lw	s9, 0(s6)
-poll_loop:
-	.word	0x0220000F
-	lhu	t5, 2(t4)
-	bne	t5, s1, got_packet
-	lw	t6, 0(s6)
-	sub	t6, t6, s9
-	li	t0, PACE_TICKS
-	bltu	t6, t0, poll_loop
-	# 10ms elapsed. Continue sliding.
-	lw	t2, 0(sp)
-	beq	s3, t2, all_received
-	j	slide_loop
+gap_step:
+	addi	a6, a6, 1
+	sw	a6, 0(sp)
+	j	gap_loop
+
+gap_done:
+	addi	sp, sp, 4
+	j	recv_loop
 
 host_failed:
 	addi	sp, sp, 4
@@ -661,8 +706,10 @@ chunk_copy_done:
 	or	a6, a6, t6
 	sw	a6, 0(a5)
 
-	# Update last-progress time (for host-dead detection).
-	lw	s10, 0(s6)
+	# Refresh last-chunk time so the idle-threshold counter stays at 0
+	# while the sender keeps streaming. recv_loop only triggers a NACK
+	# pass once s9 stops moving.
+	lw	s9, 0(s6)
 
 	# Count received.
 	addi	s3, s3, 1
@@ -698,7 +745,7 @@ repost_rx:
 	sh	t5, 18(t3)
 	.word	0x0110000F
 	sw	zero, VIO_QUEUE_NOTIFY(s0)
-	j	poll_loop
+	j	recv_loop
 
 	# -- Execute verified binary -----------------------------------
 exec_binary:
@@ -1111,7 +1158,9 @@ tk_ret_req:
 	lw	s4, 16(sp)
 	addi	sp, sp, 20
 send_req_range_disp:
-	beqz	gp, srr_ret_try
+	beqz	gp, srr_ret_init	# initial whole-file REQ
+	li	t0, 1
+	beq	gp, t0, srr_ret_nack	# per-gap NACK REQ
 	j	dispatch_error
 
 # ==========================================================================
