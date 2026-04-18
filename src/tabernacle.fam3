@@ -705,6 +705,7 @@ exec_binary:
 	li	a0, SEED_LIST_OFFSET
 	add	a0, a0, s11
 	li	a2, BIN_SIZE
+	lla	a3, data		# a3 = image_base (load address)
 	j	data
 
 	# -- Advance to next host with wrap-around --

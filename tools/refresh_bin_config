@@ -32,11 +32,13 @@ CPU="rv32,m=false,a=false,f=false,d=false,c=false,\
 zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\
 zcd=false,zcf=false,zcmp=false,zcmt=false,zicsr=false,zifencei=false"
 
-# Compile full_node.fam so bin/full_node is fresh before we hash it.
-# Direct famc invocation (no wrapper): pipe source + EOT through QEMU with
-# bin/famc loaded as the compiler binary.
-echo "Compiling src/full_node.fam" >&2
-(cat src/full_node.fam; printf '\004') | qemu-system-riscv32 \
+# Compile full_node.fam + stdlib_node.fam into bin/full_node.
+# full_node.fam is first so its `fn main(...)` definition is seen before
+# stdlib_node.fam's `fn _bootstrap` references it. The stdlib's top-level
+# code (which sets up sp/tp/s1 then calls _bootstrap) comes last and is
+# what executes at program entry.
+echo "Compiling src/full_node.fam + src/stdlib_node.fam" >&2
+(cat src/full_node.fam src/stdlib_node.fam; printf '\004') | qemu-system-riscv32 \
 	-machine virt -cpu "$CPU" \
 	-nographic -bios none \
 	-device loader,file=bin/famc,addr=0x80000000 > bin/full_node

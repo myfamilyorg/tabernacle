@@ -1,0 +1,60 @@
+// stdlib_node.fam — runtime setup for node programs that have data
+// appended past the compiled code (e.g. full_node with a bible payload).
+//
+// This file is concatenated AFTER the user program (which must define
+// `fn main(a, b, c)`) and piped into famc. The user file runs first so
+// its `fn main` definition is visible; this file's `fn _bootstrap` then
+// references it, and the top-level code at the bottom is what actually
+// executes at program entry.
+//
+// Responsibility split:
+//   famc's top-level prologue         sets gp, default sp/tp hints, s1=0
+//   this stdlib's top-level asm       overrides sp/tp/s1 for a large RAM env
+//   fn _bootstrap                     captures a0/a1/a2 into a safe frame,
+//                                     then calls main(a, b, c)
+//   fn main                           supplied by the user file
+
+fn _bootstrap() {
+	// These three locals live in _bootstrap's function frame, which is
+	// allocated on the already-relocated sp — i.e. well above any
+	// appended payload, so the inline `sw` writes from the asm capture
+	// below don't touch the image in memory.
+	a := 0;
+	b := 0;
+	c := 0;
+	asm {
+		(a = a0)
+		(b = a1)
+		(c = a2)
+	};
+	main(a, b, c)
+}
+
+// Top-level code starts here. This is what runs immediately after famc's
+// tiny prologue (gp setup + default sp/tp hints). Nothing in famc's
+// prologue touches memory, so when we get here the image in memory is
+// byte-for-byte what was loaded.
+asm {
+	// sp = gp + 64 MiB (main data stack)
+	lui  t0, 0x4000
+	add  sp, gp, t0
+
+	// tp = gp + 48 MiB (shadow return-address stack; grows down)
+	lui  t0, 0x3000
+	add  tp, gp, t0
+
+	// s1 = gp + 8 MiB (stack-bottom guard; famc emits a check at every
+	// sp update and poweroffs with 'S' if sp ever drops below s1). 8 MiB
+	// sits comfortably above a ~4.4 MiB bible payload with room to spare.
+	lui  t0, 0x800
+	add  s1, gp, t0
+}
+
+// a0/a1/a2 still hold the values tabernacle passed at `j data`; they
+// haven't been touched by the asm above or by famc's prologue. Calling
+// _bootstrap() with no arg list compiles to `jal _bootstrap`, which
+// leaves a-regs alone, so _bootstrap's body sees the original values.
+_bootstrap();
+
+// After _bootstrap returns, famc auto-emits the QEMU-virt poweroff
+// sequence (write 0x5555 to 0x00100000) — no explicit asm needed here.
