@@ -57,25 +57,46 @@
 # QEMU virt: 10 MHz. SiFive FE310: 32.768 kHz. Adjust per platform.
 .equ	MTIME_ADDR,		0x0200BFF8
 .equ	DEADLINE_TICKS,		0x6B49D200	# 3 min at 10 MHz (hard cap per host)
-# NACK-with-idle loss recovery. After the initial REQ that asks for every
-# chunk, only re-request when the receive pipe has been quiet for at least
-# IDLE_INITIAL_TICKS (doubled each round, capped at IDLE_MAX_TICKS) AND
-# we still have gaps in the bitmap. No per-packet timer; loss recovery
-# only fires when the sender has actually stopped sending.
-.equ	IDLE_INITIAL_TICKS,	300000		# 30 ms at 10 MHz
-.equ	IDLE_MAX_TICKS,		5000000		# 500 ms at 10 MHz
+# AIMD receiver-driven congestion control. Downloader keeps a per-host
+# cwnd and ssthresh; each round it REQ_RANGEs at most `cwnd` chunks
+# starting at the first gap in the bitmap, then waits for responses to
+# either fill the requested range or go idle for BATCH_IDLE_TICKS.
+#   - Clean batch (all chunks in [start, end] received): grow the window.
+#     Slow-start doubles cwnd until it reaches ssthresh, then
+#     congestion-avoidance bumps cwnd by 1.
+#   - Lossy batch: ssthresh = max(cwnd/2, CWND_MIN); cwnd = ssthresh.
+# The fixed pacing/IDLE_TICKS constants from the old NACK-with-idle
+# protocol are gone; cwnd converges to the link's burst capacity on its
+# own, so one knob fits any network.
+.equ	CWND_INIT,		4
+.equ	CWND_MIN,		2
+.equ	SSTHRESH_INIT,		128
+.equ	BATCH_IDLE_TICKS,	1000000		# 100 ms at 10 MHz
+
+# virtio-net RX queue depth. Must be a power of two; used.ring index and
+# avail.ring reposts wrap at `idx & (RX_QUEUE_NUM - 1)`. 16 is comfortably
+# above any realistic in-one-kick burst of paced 1400-byte packets from
+# user-mode SLIRP.
+.equ	RX_QUEUE_NUM,		16
+.equ	RX_QUEUE_MASK,		15
+.equ	RX_BUF_SIZE,		1536
 
 # -- Memory layout (offsets from s11) -------------------------------------
-.equ	RX_QUEUE_OFFSET,	0
-.equ	TX_QUEUE_OFFSET,	8192
-.equ	SEED_LIST_OFFSET,	14336
-.equ	DISK_DATA_OFFSET,	16384
-.equ	VIRT_DESC_OFFSET,	20480
-.equ	VIRT_DISK_STATUS,	25088
-.equ	VIRT_DISK_HEADER,	25090
-.equ	DIAG_LAST_REPORT,	25108		# mtime of last progress summary
-.equ	DIAG_START_TIME,	25112		# mtime at earliest tabernacle boot
-.equ	DATA_REGION_SIZE,	25116
+# RX now needs 16 descriptors + 16 × 1536 B buffers = 32 KiB; everything
+# after RX shifts by 24576 B vs. the old single-buffer layout.
+.equ	RX_QUEUE_OFFSET,	0		# 8 KiB queue (desc/avail + used)
+.equ	RX_BUFFERS_OFFSET,	8192		# 16 × 1536 = 24 KiB of buffers
+.equ	TX_QUEUE_OFFSET,	32768
+.equ	SEED_LIST_OFFSET,	38912
+.equ	DISK_DATA_OFFSET,	40960
+.equ	VIRT_DESC_OFFSET,	45056
+.equ	VIRT_DISK_STATUS,	49664
+.equ	VIRT_DISK_HEADER,	49666
+.equ	DIAG_LAST_REPORT,	49684		# mtime of last progress summary
+.equ	DIAG_START_TIME,	49688		# mtime at earliest tabernacle boot
+.equ	DIAG_SSTHRESH,		49692		# current AIMD slow-start threshold
+.equ	DIAG_NUM_CHUNKS,	49696		# total chunks for current transfer
+.equ	DATA_REGION_SIZE,	49700
 .equ	STACK_OFFSET,		0x400000
 
 # ==========================================================================
@@ -341,9 +362,12 @@ found_net:
 	li	t0, 4096
 	sw	t0, VIO_GUEST_PAGE_SIZE(s0)
 
-	# RX queue (queue 0)
+	# RX queue (queue 0): NUM=16. Desc table is 256 B (16×16), avail ring
+	# immediately after at rx_q+256, used ring aligned to next 4 KiB at
+	# rx_q+4096 (queue_align). Buffers live in a separate page-aligned
+	# region at s11+RX_BUFFERS_OFFSET, 1536 B per buffer.
 	sw	zero, VIO_QUEUE_SEL(s0)
-	li	t0, 1
+	li	t0, RX_QUEUE_NUM
 	sw	t0, VIO_QUEUE_NUM(s0)
 	li	t0, 4096
 	sw	t0, VIO_QUEUE_ALIGN(s0)
@@ -352,7 +376,8 @@ found_net:
 	srli	t2, t2, 12
 	sw	t2, VIO_QUEUE_PFN(s0)
 
-	# TX queue (queue 1)
+	# TX queue (queue 1): still num=1 — we only ever have one outbound
+	# REQ/ARP reply in flight.
 	li	t0, 1
 	sw	t0, VIO_QUEUE_SEL(s0)
 	sw	t0, VIO_QUEUE_NUM(s0)
@@ -367,21 +392,43 @@ found_net:
 	ori	t1, t1, 4
 	sw	t1, VIO_STATUS(s0)
 
-	# Post RX buffer: desc[0] at RX queue base.
+	# Populate 16 RX descriptors + avail ring slots. desc[i] points at
+	# rx_buffers + i*1536 with WRITE flag, len=1536. avail.ring[i] = i.
+	# After the loop, avail.idx = 16 and a single QUEUE_NOTIFY kicks the
+	# device, which will start filling buffers in desc-index order.
 	li	t0, RX_QUEUE_OFFSET
-	add	t3, s11, t0
-	addi	t4, t3, 512		# RX buffer at queue_base + 512
-	sw	t4, 0(t3)
-	sw	zero, 4(t3)
-	li	t4, 1536
-	sw	t4, 8(t3)
-	li	t4, 2			# WRITE flag
-	sh	t4, 12(t3)
-	sh	zero, 14(t3)
-	sh	zero, 16(t3)		# avail.flags
-	li	t4, 1
-	sh	t4, 18(t3)		# avail.idx = 1
-	sh	zero, 20(t3)		# ring[0] = 0
+	add	t3, s11, t0			# t3 = rx queue base
+	li	t0, RX_BUFFERS_OFFSET
+	add	t4, s11, t0			# t4 = rx buffer region base
+	li	t5, 0				# i
+rx_post_loop:
+	li	t0, RX_QUEUE_NUM
+	bge	t5, t0, rx_post_done
+	# desc[i] = { addr=rx_buffers + i*1536, len=1536, flags=WRITE, next=0 }
+	slli	t0, t5, 4			# desc offset = i * 16
+	add	t1, t3, t0
+	slli	t2, t5, 10			# i * 1024
+	slli	t0, t5, 9			# i * 512
+	add	t2, t2, t0			# i * 1536
+	add	t2, t2, t4			# buffer address
+	sw	t2, 0(t1)
+	sw	zero, 4(t1)
+	li	t0, RX_BUF_SIZE
+	sw	t0, 8(t1)
+	li	t0, 2				# WRITE
+	sh	t0, 12(t1)
+	sh	zero, 14(t1)
+	# avail.ring[i] = i   @ rx_q + 260 + 2*i
+	slli	t0, t5, 1
+	addi	t0, t0, 260
+	add	t1, t3, t0
+	sh	t5, 0(t1)
+	addi	t5, t5, 1
+	j	rx_post_loop
+rx_post_done:
+	sh	zero, 256(t3)			# avail.flags
+	li	t0, RX_QUEUE_NUM
+	sh	t0, 258(t3)			# avail.idx = 16
 	.word	0x0110000F
 	sw	zero, VIO_QUEUE_NOTIFY(s0)
 
@@ -462,69 +509,135 @@ div_nc:
 div_nc_done:
 	addi	sp, sp, -4
 	sw	t2, 0(sp)		# [sp+0] = NUM_CHUNKS
+	# Also mirror into the data region so print_progress can read it
+	# without depending on the current stack-frame layout.
+	li	t0, DIAG_NUM_CHUNKS
+	add	t0, s11, t0
+	sw	t2, 0(t0)
 
-	# -- NACK-with-idle download --
-	# One REQ asks for every chunk up front; the server streams them
-	# all back. We only re-request after the pipe has gone idle
-	# (IDLE_TICKS with no new chunk), and when we do we send exactly
-	# one REQ per contiguous gap (no BATCH_SIZE padding). IDLE_TICKS
-	# doubles each recovery round, capped at IDLE_MAX_TICKS, so we
-	# don't collapse the wire under heavy loss.
+	# -- AIMD receiver-driven download --
+	# cwnd (s7) and ssthresh (s11+DIAG_SSTHRESH) drive per-round batch
+	# size. Each round: scan bitmap for first hole, REQ_RANGE up to
+	# `cwnd` chunks from it, wait for batch to fill or go idle for
+	# BATCH_IDLE_TICKS, then grow (slow-start ×2, then CA +1) on clean
+	# rounds or halve on any loss. Converges to the link's burst
+	# capacity with no hand-tuned knobs.
 	#
-	# Register roles in this phase:
+	# Register roles during AIMD:
 	#   ra  = deadline anchor (per-host absolute ceiling)
-	#   s7  = current IDLE_TICKS threshold (backs off on each NACK)
-	#   s9  = last-chunk-receive time
-	#   sp+0 = NUM_CHUNKS
+	#   s7  = cwnd
+	#   s9  = last-chunk-receive time (idle detection)
+	#
+	# Stack frame within one AIMD round (below NUM_CHUNKS at caller sp):
+	#    0(sp) = batch_start
+	#    4(sp) = batch_end
+	#    8(sp) = batch_received (count of in-range chunks this round)
+	#   12(sp) = batch_size   (end - start + 1)
+	#   16(sp) = NUM_CHUNKS (persistent across rounds)
 	li	s6, MTIME_ADDR
 	lw	ra, 0(s6)
 	lw	s9, 0(s6)
-	li	s7, IDLE_INITIAL_TICKS
+	li	s7, CWND_INIT
 
-	# Anchor the 10-s progress-report timer at host-attempt start so the
-	# first "chunks=N/T" line can't fire before we've had a chance to
-	# receive anything. Stored in the data region because all s-regs are
-	# already booked.
+	li	t0, SSTHRESH_INIT
+	li	t1, DIAG_SSTHRESH
+	add	t1, s11, t1
+	sw	t0, 0(t1)
+
+	# Anchor the 10-s progress-report timer so the first "chunks=N/T"
+	# can't fire before we've had time to receive anything.
 	li	t0, DIAG_LAST_REPORT
 	add	t0, s11, t0
 	lw	t1, 0(s6)
 	sw	t1, 0(t0)
 
-	# Set up RX queue pointers (persist across the loop).
+	# RX queue/used-ring pointers; held in t3/t4 across the loop.
 	li	t0, RX_QUEUE_OFFSET
 	add	t3, s11, t0
 	li	t0, 4096
 	add	t4, t3, t0
 
-	# Initial REQ: ask for every chunk in one packet.
+aimd_round:
+	# All chunks received?
+	lw	t2, 0(sp)			# NUM_CHUNKS
+	beq	s3, t2, all_received
+
+	# Hard per-host deadline?
+	lw	t6, 0(s6)
+	sub	t0, t6, ra
+	li	t1, DEADLINE_TICKS
+	bgeu	t0, t1, host_failed
+
+	# Scan bitmap for first unreceived chunk → a0 = batch_start.
 	li	a0, 0
-	lw	t2, 0(sp)
-	addi	a1, t2, -1
+scan_start:
+	bge	a0, t2, all_received
+	srli	t0, a0, 5
+	slli	t0, t0, 2
+	add	t0, s2, t0
+	lw	t1, 0(t0)
+	andi	t5, a0, 31
+	li	t6, 1
+	sll	t6, t6, t5
+	and	t6, t1, t6
+	beqz	t6, scan_start_found
+	addi	a0, a0, 1
+	j	scan_start
+scan_start_found:
+	# a0 = first unset. Walk forward to find the end of the hole.
+	mv	a1, a0
+scan_end:
+	addi	a1, a1, 1
+	bge	a1, t2, scan_end_done
+	srli	t0, a1, 5
+	slli	t0, t0, 2
+	add	t0, s2, t0
+	lw	t1, 0(t0)
+	andi	t5, a1, 31
+	li	t6, 1
+	sll	t6, t6, t5
+	and	t6, t1, t6
+	beqz	t6, scan_end
+scan_end_done:
+	# Gap is [a0, a1). batch_size = min(cwnd, gap_len).
+	sub	t1, a1, a0
+	bge	s7, t1, use_gap_len
+	mv	t1, s7
+use_gap_len:					# t1 = batch_size
+	addi	a1, t1, -1
+	add	a1, a1, a0			# a1 = batch_end_inclusive
+
+	# Push batch frame before send_req_range (which clobbers a/t regs).
+	addi	sp, sp, -16
+	sw	a0, 0(sp)
+	sw	a1, 4(sp)
+	sw	zero, 8(sp)
+	sw	t1, 12(sp)
+
+	# REQ_RANGE(batch_start, batch_end) to the current host.
 	mv	a2, s4
-	li	gp, 0			# gp=0 → srr_ret_init
+	li	gp, 0
 	j	send_req_range
-srr_ret_init:
+srr_ret_aimd:
 	li	t0, RX_QUEUE_OFFSET
 	add	t3, s11, t0
 	li	t0, 4096
 	add	t4, t3, t0
 
-recv_loop:
-	.word	0x0220000F
-	lhu	t5, 2(t4)
-	bne	t5, s1, got_packet
+	# Anchor idle timer at REQ dispatch — silence before this doesn't
+	# count against the batch.
+	lw	s9, 0(s6)
 
-	# 10-second progress summary. Quiet by default: the check runs every
-	# poll cycle but print_progress only fires after 10 s of elapsed
-	# mtime. emit_decimal clobbers t3/t4, so we reload them before
-	# resuming recv_loop.
+batch_recv_loop:
+	# 10-second progress summary. Quiet by default; emit_decimal
+	# clobbers t3/t4, reload after pp_ret_recv.
 	lw	t6, 0(s6)
 	li	t1, DIAG_LAST_REPORT
 	add	t1, s11, t1
 	lw	t0, 0(t1)
 	sub	t0, t6, t0
 	li	t2, 100000000
-	bltu	t0, t2, rl_no_prog
+	bltu	t0, t2, brl_no_prog
 	sw	t6, 0(t1)
 	li	gp, 21
 	j	print_progress
@@ -533,94 +646,57 @@ pp_ret_recv:
 	add	t3, s11, t0
 	li	t0, 4096
 	add	t4, t3, t0
-rl_no_prog:
-	# Done?
-	lw	t2, 0(sp)
-	beq	s3, t2, all_received
-	# Hard per-host deadline?
-	lw	t6, 0(s6)
-	sub	t0, t6, ra
-	li	t1, DEADLINE_TICKS
-	bgeu	t0, t1, host_failed
-	# Idle threshold elapsed?
+brl_no_prog:
+	.word	0x0220000F
+	lhu	t5, 2(t4)
+	bne	t5, s1, got_packet
+
+	# Batch filled? (every chunk in [batch_start, batch_end] received)
+	lw	t0, 8(sp)			# batch_received
+	lw	t1, 12(sp)			# batch_size
+	bge	t0, t1, batch_eval
+
+	# Idle threshold elapsed? Treat as end-of-batch with loss.
 	lw	t6, 0(s6)
 	sub	t6, t6, s9
-	bltu	t6, s7, recv_loop
-	# Pipe is quiet — issue a NACK pass.
-	j	nack_pass
+	li	t0, BATCH_IDLE_TICKS
+	bltu	t6, t0, batch_recv_loop
 
-nack_pass:
-	# Bump last_rx_time so we don't re-NACK immediately on reentry,
-	# and exponentially back off the idle threshold for the next round.
-	lw	s9, 0(s6)
-	slli	t0, s7, 1
-	li	t1, IDLE_MAX_TICKS
-	bltu	t0, t1, nack_bo_ok
+batch_eval:
+	# Evaluate this round and adjust cwnd before returning to
+	# aimd_round. batch_received vs batch_size tells us if we lost any.
+	lw	t5, 8(sp)
+	lw	t6, 12(sp)
+	addi	sp, sp, 16
+	bge	t5, t6, aimd_grow
+
+	# Lossy: ssthresh = max(cwnd/2, CWND_MIN); cwnd = ssthresh.
+	srli	t0, s7, 1
+	li	t1, CWND_MIN
+	bgeu	t0, t1, aimd_ss_ok
 	mv	t0, t1
-nack_bo_ok:
+aimd_ss_ok:
 	mv	s7, t0
+	li	t1, DIAG_SSTHRESH
+	add	t1, s11, t1
+	sw	t0, 0(t1)
+	j	aimd_round
 
-	# Walk the bitmap for contiguous gap spans. Cursor lives on the
-	# stack so it survives send_req_range (which saves/restores s1..s4
-	# and gp but clobbers a/t-regs).
-	addi	sp, sp, -4
-	sw	zero, 0(sp)		# gap-scan cursor = 0
-
-gap_loop:
-	lw	a6, 0(sp)
-	lw	t2, 4(sp)		# NUM_CHUNKS (shifted by our push)
-	bge	a6, t2, gap_done
-	srli	t0, a6, 5
-	slli	t0, t0, 2
-	add	t0, s2, t0
-	lw	t1, 0(t0)
-	andi	t5, a6, 31
-	li	t6, 1
-	sll	t6, t6, t5
-	and	t6, t1, t6
-	bnez	t6, gap_step		# bit set → advance past
-
-	# Found first missing chunk at a6; extend a7 until set-bit or end.
-	mv	a7, a6
-gap_ext:
-	addi	a7, a7, 1
-	bge	a7, t2, gap_req
-	srli	t0, a7, 5
-	slli	t0, t0, 2
-	add	t0, s2, t0
-	lw	t1, 0(t0)
-	andi	t5, a7, 31
-	li	t6, 1
-	sll	t6, t6, t5
-	and	t6, t1, t6
-	beqz	t6, gap_ext
-
-gap_req:
-	# Gap is [a6, a7). Send REQ_RANGE(a6, a7-1) and resume scan at a7.
-	sw	a7, 0(sp)
-	mv	a0, a6
-	addi	a1, a7, -1
-	mv	a2, s4
-	li	gp, 1			# gp=1 → srr_ret_nack
-	j	send_req_range
-srr_ret_nack:
-	li	t0, RX_QUEUE_OFFSET
-	add	t3, s11, t0
-	li	t0, 4096
-	add	t4, t3, t0
-	j	gap_loop
-
-gap_step:
-	addi	a6, a6, 1
-	sw	a6, 0(sp)
-	j	gap_loop
-
-gap_done:
-	addi	sp, sp, 4
-	j	recv_loop
+aimd_grow:
+	# Clean round: slow-start doubles cwnd until ssthresh, then CA
+	# increments cwnd by 1 per round.
+	li	t1, DIAG_SSTHRESH
+	add	t1, s11, t1
+	lw	t0, 0(t1)
+	bge	s7, t0, aimd_ca
+	slli	s7, s7, 1
+	j	aimd_round
+aimd_ca:
+	addi	s7, s7, 1
+	j	aimd_round
 
 host_failed:
-	addi	sp, sp, 4
+	addi	sp, sp, 4			# pop NUM_CHUNKS
 	j	advance_host
 
 all_received:
@@ -628,24 +704,40 @@ all_received:
 	j	do_hash_verify
 
 got_packet:
-	# Check ARP (ethertype 08:06 at t3+536, opcode 00:01 at t3+544)
-	lbu	t0, 536(t3)
+	# Read desc id for the just-filled buffer from used.ring[s1 & MASK].
+	# Used-elem layout: { u32 id; u32 len } at used_base + 4 + slot*8.
+	# Buffer address = rx_buffers + id * 1536.
+	andi	t0, s1, RX_QUEUE_MASK
+	slli	t0, t0, 3
+	addi	t0, t0, 4
+	add	t0, t4, t0
+	lw	t6, 0(t0)			# t6 = desc id
+	slli	t0, t6, 10
+	slli	t1, t6, 9
+	add	t0, t0, t1			# id * 1536
+	li	t1, RX_BUFFERS_OFFSET
+	add	t0, t0, t1
+	add	a0, s11, t0			# a0 = buffer base
+
+	# ARP request? ethertype 0x0806 at +24..25, opcode 0x0001 at +32..33.
+	lbu	t0, 24(a0)
 	li	t1, 0x08
 	bne	t0, t1, not_arp
-	lbu	t0, 537(t3)
+	lbu	t0, 25(a0)
 	li	t1, 0x06
 	bne	t0, t1, not_arp
-	lbu	t0, 544(t3)
+	lbu	t0, 32(a0)
 	bnez	t0, not_arp
-	lbu	t0, 545(t3)
+	lbu	t0, 33(a0)
 	li	t1, 0x01
 	bne	t0, t1, not_arp
 
-	# ARP request -> send reply.
+	# ARP request → send reply (buffer addr already in a0).
 	li	gp, 0
 	j	send_arp_reply
 sar_ret_poll:
-	# Restore t3/t4.
+	# send_arp_reply clobbers a/t regs; reload queue pointers. id is
+	# re-read at repost_rx entry so we don't need to preserve t6.
 	li	t0, RX_QUEUE_OFFSET
 	add	t3, s11, t0
 	li	t0, 4096
@@ -653,67 +745,66 @@ sar_ret_poll:
 	j	repost_rx
 
 not_arp:
-	# Check FAMC RSP_CHUNK: IPv4 UDP with "FAMC\x82" payload.
-	lbu	t0, 536(t3)
+	# FAMC RSP_CHUNK: IPv4 UDP with "FAMC\x82" payload.
+	lbu	t0, 24(a0)
 	li	t1, 0x08
 	bne	t0, t1, repost_rx
-	lbu	t0, 537(t3)
+	lbu	t0, 25(a0)
 	bnez	t0, repost_rx
-	lbu	t0, 547(t3)		# IP protocol
-	li	t1, 17			# UDP
+	lbu	t0, 35(a0)			# IP protocol
+	li	t1, 17
 	bne	t0, t1, repost_rx
-	lbu	t0, 566(t3)		# "F"
+	lbu	t0, 54(a0)
 	li	t1, 'F'
 	bne	t0, t1, repost_rx
-	lbu	t0, 567(t3)
+	lbu	t0, 55(a0)
 	li	t1, 'A'
 	bne	t0, t1, repost_rx
-	lbu	t0, 568(t3)
+	lbu	t0, 56(a0)
 	li	t1, 'M'
 	bne	t0, t1, repost_rx
-	lbu	t0, 569(t3)
+	lbu	t0, 57(a0)
 	li	t1, 'C'
 	bne	t0, t1, repost_rx
-	lbu	t0, 570(t3)
+	lbu	t0, 58(a0)
 	li	t1, FAMC_CMD_RSP_CHUNK
 	bne	t0, t1, repost_rx
 
-	# Extract seq (big-endian u16 at t3+571).
-	lbu	t0, 571(t3)
-	lbu	t1, 572(t3)
+	# seq (big-endian u16 at +59..60).
+	lbu	t0, 59(a0)
+	lbu	t1, 60(a0)
 	slli	t0, t0, 8
-	or	t0, t0, t1		# t0 = seq
+	or	t0, t0, t1
 
-	# Bounds check against precomputed NUM_CHUNKS on stack.
-	lw	a3, 0(sp)		# NUM_CHUNKS
-	bge	t0, a3, repost_rx	# seq >= NUM_CHUNKS -> skip
+	# NUM_CHUNKS is 16 bytes below our batch frame.
+	lw	a3, 16(sp)
+	bge	t0, a3, repost_rx
 
-	# Bitmap check: skip if already received.
-	srli	a4, t0, 5		# word index
+	# Bitmap duplicate check.
+	srli	a4, t0, 5
 	slli	a4, a4, 2
 	add	a5, s2, a4
 	lw	a6, 0(a5)
-	andi	a7, t0, 31		# bit index
-	li	t6, 1
-	sll	t6, t6, a7
-	and	t5, a6, t6
-	bnez	t5, repost_rx		# already received
+	andi	a7, t0, 31
+	li	t5, 1
+	sll	t5, t5, a7
+	and	t5, a6, t5
+	bnez	t5, repost_rx
 
-	# Compute dst = data + seq * CHUNK_SIZE.
-	# CHUNK_SIZE=1400 = 1024+256+128-8 = (seq<<10)+(seq<<8)+(seq<<7)-(seq<<3)
+	# dst = data + seq * CHUNK_SIZE.  CHUNK_SIZE=1400 = 1024+256+128-8.
 	slli	a4, t0, 10
 	slli	a5, t0, 8
 	add	a4, a4, a5
 	slli	a5, t0, 7
 	add	a4, a4, a5
 	slli	a5, t0, 3
-	sub	a4, a4, a5		# a4 = seq * 1400
+	sub	a4, a4, a5			# a4 = seq * 1400
 	lla	a5, data
-	add	a5, a5, a4		# a5 = dst
+	add	a5, a5, a4
 
-	# Data length = UDP_length - 15 (8 UDP hdr + 7 FAMC hdr).
-	lbu	a7, 562(t3)
-	lbu	t1, 563(t3)
+	# data_len = UDP_length - 15 (8 UDP hdr + 7 FAMC hdr).
+	lbu	a7, 50(a0)
+	lbu	t1, 51(a0)
 	slli	a7, a7, 8
 	or	a7, a7, t1
 	addi	a7, a7, -15
@@ -721,45 +812,52 @@ not_arp:
 	li	t1, CHUNK_SIZE
 	bgt	a7, t1, repost_rx
 
-	# Clamp copy length to not exceed BIN_SIZE.
+	# Clamp to not exceed BIN_SIZE.
 	li	t1, BIN_SIZE
-	sub	t1, t1, a4		# t1 = BIN_SIZE - offset
-	bge	t1, a7, copy_ok
-	mv	a7, t1			# clamp to remaining bytes
-copy_ok:
+	sub	t1, t1, a4
+	bge	t1, a7, gp_copy_ok
+	mv	a7, t1
+gp_copy_ok:
 	ble	a7, zero, repost_rx
 
-	# Copy data from t3+573 to dst.
-	addi	t1, t3, 573
-chunk_copy:
-	beqz	a7, chunk_copy_done
-	lbu	t6, 0(t1)
-	sb	t6, 0(a5)
+	# Copy data from +61(a0) into dst.
+	addi	t1, a0, 61
+gp_chunk_copy:
+	beqz	a7, gp_chunk_copy_done
+	lbu	t5, 0(t1)
+	sb	t5, 0(a5)
 	addi	t1, t1, 1
 	addi	a5, a5, 1
 	addi	a7, a7, -1
-	j	chunk_copy
-chunk_copy_done:
+	j	gp_chunk_copy
+gp_chunk_copy_done:
 
-	# Mark received in bitmap.
-	lw	a6, 0(s2)		# reload (we used a6 as scratch above)
+	# Set bitmap bit.
 	srli	a4, t0, 5
 	slli	a4, a4, 2
 	add	a5, s2, a4
 	lw	a6, 0(a5)
 	andi	a7, t0, 31
-	li	t6, 1
-	sll	t6, t6, a7
-	or	a6, a6, t6
+	li	t5, 1
+	sll	t5, t5, a7
+	or	a6, a6, t5
 	sw	a6, 0(a5)
 
-	# Refresh last-chunk time so the idle-threshold counter stays at 0
-	# while the sender keeps streaming. recv_loop only triggers a NACK
-	# pass once s9 stops moving.
+	# Sender is still talking — reset idle anchor.
 	lw	s9, 0(s6)
 
-	# Count received.
+	# Running total of all received chunks.
 	addi	s3, s3, 1
+
+	# If seq is inside the current batch's requested range, count it
+	# toward batch completion so batch_recv_loop can exit early.
+	lw	a3, 0(sp)			# batch_start
+	lw	a4, 4(sp)			# batch_end
+	blt	t0, a3, repost_rx
+	blt	a4, t0, repost_rx
+	lw	a3, 8(sp)
+	addi	a3, a3, 1
+	sw	a3, 8(sp)
 	j	repost_rx
 
 	# -- Hash verify after all chunks received --
@@ -776,23 +874,37 @@ gh_ret_net:
 	j	check_hash
 ch_ret_net:
 	addi	sp, sp, 32
-	li	a1, 1			# a1=1: loaded from network
+	li	a1, 1				# a1=1: loaded from network
 	beqz	a0, exec_binary
 
-	# Hash mismatch after download -- try next host.
+	# Hash mismatch after download → try next host.
 	j	advance_host
 
 repost_rx:
-	# Advance last_used_idx, re-post RX descriptor, kick.
-	addi	s1, s1, 1
-	slli	s1, s1, 16
-	srli	s1, s1, 16		# wrap to u16
-	lhu	t5, 18(t3)
+	# Return the buffer we just consumed to the device. Re-read the
+	# desc id from used.ring[s1 & MASK] — t6 may have been clobbered
+	# by not_arp / FAMC processing — then drop it into the next avail
+	# slot. avail.idx lives at rx_q+258, ring entries start at +260.
+	andi	t0, s1, RX_QUEUE_MASK
+	slli	t0, t0, 3
+	addi	t0, t0, 4
+	add	t0, t4, t0
+	lw	t6, 0(t0)			# t6 = desc id
+	lhu	t5, 258(t3)			# avail.idx
+	andi	t2, t5, RX_QUEUE_MASK
+	slli	t2, t2, 1
+	addi	t2, t2, 260
+	add	t1, t3, t2
+	sh	t6, 0(t1)
 	addi	t5, t5, 1
-	sh	t5, 18(t3)
+	sh	t5, 258(t3)
 	.word	0x0110000F
 	sw	zero, VIO_QUEUE_NOTIFY(s0)
-	j	recv_loop
+	# Advance our last-seen used-ring idx (u16 wrap).
+	addi	s1, s1, 1
+	slli	s1, s1, 16
+	srli	s1, s1, 16
+	j	batch_recv_loop
 
 	# -- Execute verified binary -----------------------------------
 exec_binary:
@@ -921,11 +1033,9 @@ disk_read_disp:
 send_arp_reply:
 	addi	sp, sp, -4
 	sw	gp, 0(sp)
-
-	li	t0, RX_QUEUE_OFFSET
-	add	a0, s11, t0
-	addi	a0, a0, 512		# a0 = RX buffer
-
+	# Caller passes the RX buffer base in a0 (num=16 — buffer address
+	# depends on which desc the device picked). Just locate the TX
+	# buffer here.
 	li	a1, TX_QUEUE_OFFSET
 	add	a1, s11, a1
 	addi	a1, a1, 512		# a1 = TX buffer
@@ -1208,9 +1318,7 @@ tk_ret_req:
 	lw	s4, 16(sp)
 	addi	sp, sp, 20
 send_req_range_disp:
-	beqz	gp, srr_ret_init	# initial whole-file REQ
-	li	t0, 1
-	beq	gp, t0, srr_ret_nack	# per-gap NACK REQ
+	beqz	gp, srr_ret_aimd	# AIMD round REQ
 	j	dispatch_error
 
 # ==========================================================================
@@ -1479,9 +1587,11 @@ pp_s:
 	beqz	a0, pp_s
 	sb	t6, 0(t5)
 
-	# NUM_CHUNKS lives in the caller's frame at 4(sp) (caller's 0(sp) +
-	# the 4-byte gp save we pushed on entry).
-	lw	a0, 4(sp)
+	# NUM_CHUNKS is mirrored in the data region at DIAG_NUM_CHUNKS so we
+	# don't have to know the caller's (variable) stack-frame layout.
+	li	a0, DIAG_NUM_CHUNKS
+	add	a0, s11, a0
+	lw	a0, 0(a0)
 	li	gp, 16
 	j	emit_decimal
 ed_ret_pp_total:
