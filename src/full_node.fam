@@ -664,15 +664,16 @@ fn handle_famc(net, tx_q, rx_buf, tx_buf, image_base, bin_size, start_avail_idx)
 			total_len := 10 + 14 + 20 + udp_len;
 			net_send(net, tx_q, tx_buf, total_len, start_avail_idx + count);
 
-			// Pace ~200 µs between chunks so a client with a tiny
-			// (num=1) virtio-net RX queue doesn't drop most of a
-			// bulk burst. At 10 MHz mtime that's 2000 ticks. Without
-			// this, a downloading tabernacle sees ~80 % loss on the
-			// initial REQ for ~1200 chunks, and the NACK recovery
-			// rounds dominate the download time.
+			// Pace ~1 ms between chunks. At 10 MHz mtime that's 10000
+			// ticks. tabernacle's RX queue is num=1 and its chunk
+			// copy is still byte-by-byte, so on a slow emulator
+			// (OCI, busy laptop) per-chunk processing can exceed
+			// 200 µs and drop chunks; 1 ms leaves margin even then.
+			// Full download grows to ~1.2 s but loss — and the NACK
+			// re-request storm that follows — effectively vanishes.
 			delay_start := *(0x0200BFF8);
 			loop {
-				*(0x0200BFF8) - delay_start >= 2000 ? break 0;
+				*(0x0200BFF8) - delay_start >= 10000 ? break 0;
 			};
 
 			count += 1;
