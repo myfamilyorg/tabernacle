@@ -69,6 +69,37 @@ fn emit_hex2(b) {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+//  emit_dec — print n as a decimal number. `buf` is caller-provided
+//  scratch of at least 16 bytes; digits are extracted low-to-high via
+//  repeated subtract-by-10 (no M-extension divide), stashed in buf, then
+//  emitted in reverse. Self-recursion isn't used because famc resolves
+//  forward fn refs only across already-compiled bodies.
+// ──────────────────────────────────────────────────────────────────────
+fn emit_dec(n, buf) {
+	count := 0;
+	m := n;
+	loop {
+		q := 0;
+		r := m;
+		loop {
+			r < 10 ? break 0;
+			r -= 10;
+			q += 1;
+		};
+		@(buf + count) = '0' + r;
+		count += 1;
+		m = q;
+		m == 0 ? break 0;
+	};
+	loop {
+		count == 0 ? break 0;
+		count -= 1;
+		emit(@(buf + count));
+	};
+	0
+}
+
+// ──────────────────────────────────────────────────────────────────────
 //  find_mmio — scan the QEMU-virt virtio MMIO slot range for a device
 //  with the given device_id (1 = net, 2 = blk). Returns the device base
 //  address, or 0 if not found.
@@ -659,7 +690,7 @@ fn handle_famc(net, tx_q, rx_buf, tx_buf, image_base, bin_size, start_avail_idx)
 //      handle_famc. Everything else is silently dropped.
 //    - Repost the RX descriptor for the next frame.
 // ──────────────────────────────────────────────────────────────────────
-fn serve(image_base, bin_size) {
+fn serve(image_base, bin_size, start_time) {
 	net := find_mmio(1);
 	net == 0 ? emit('N') : {
 		// Page-aligned: virtio QUEUE_PFN encodes the queue base as a
@@ -669,10 +700,32 @@ fn serve(image_base, bin_size) {
 		tx_q := alloc_page(8192);
 		rx_buf := rx_q + 512;
 		tx_buf := tx_q + 512;
+		// Scratch for emit_dec: at most 10 decimal digits per u32.
+		dec_buf := alloc(16);
 
 		ok := net_init(net, rx_q, tx_q);
 		ok == 0 ? emit('F') : {
-			emit('S');
+			// "Server started in N ms\n". mtime runs at 10 MHz, so
+			// 10 000 ticks == 1 ms. Subtraction loop in lieu of divide.
+			startup_end := *(0x0200BFF8);
+			elapsed := startup_end - start_time;
+			ms := 0;
+			loop {
+				elapsed < 10000 ? break 0;
+				elapsed -= 10000;
+				ms += 1;
+			};
+			emit('S'); emit('e'); emit('r'); emit('v'); emit('e'); emit('r');
+			emit(' '); emit('s'); emit('t'); emit('a'); emit('r'); emit('t');
+			emit('e'); emit('d'); emit(' '); emit('i'); emit('n'); emit(' ');
+			emit_dec(ms, dec_buf);
+			emit(' '); emit('m'); emit('s');
+			emit(10);
+
+			total_reqs := 0;
+			total_chunks := 0;
+			last_report := *(0x0200BFF8);
+			prev_reqs := 0;
 
 			rx_avail_idx := 1;
 			tx_avail_idx := 0;
@@ -680,6 +733,24 @@ fn serve(image_base, bin_size) {
 			last_used := 0;
 
 			loop {
+				// 10-second activity summary. Silent when idle so the
+				// log doesn't spam — user can't scroll back in screen.
+				now := *(0x0200BFF8);
+				now - last_report >= 100000000 ? {
+					total_reqs > prev_reqs ? {
+						emit('r'); emit('e'); emit('q'); emit('s'); emit('=');
+						emit_dec(total_reqs, dec_buf);
+						emit(' ');
+						emit('c'); emit('h'); emit('u'); emit('n'); emit('k'); emit('s'); emit('=');
+						emit_dec(total_chunks, dec_buf);
+						emit(10);
+						prev_reqs = total_reqs;
+						0
+					} : 0;
+					last_report = now;
+					0
+				} : 0;
+
 				rx_len := net_poll_rx(rx_q, last_used);
 				rx_len == 0 ? 0 : {
 					// Ethertype at rx_buf + 10 (virtio_hdr) + 12 (eth).
@@ -701,6 +772,11 @@ fn serve(image_base, bin_size) {
 						proto == 17 && dp_hi == 0x0E && dp_lo == 0x99 ? {
 							sent := handle_famc(net, tx_q, rx_buf, tx_buf,
 								image_base, bin_size, tx_avail_idx + 1);
+							sent > 0 ? {
+								total_reqs += 1;
+								total_chunks += sent;
+								0
+							} : 0;
 							tx_avail_idx += sent;
 							0
 						} : 0;
@@ -746,6 +822,10 @@ fn debug_dump_hex20(ptr) {
 //                    (captured by init_env before gp was advanced)
 // ──────────────────────────────────────────────────────────────────────
 fn main(seed_list, boot_source, bin_size, image_base, payload_start) {
+	// Anchor startup timing at the earliest moment we can read mtime.
+	// Passed to serve() so it can report "Server started in N ms".
+	start_time := *(0x0200BFF8);
+
 	// Sanity-dump the first 20 bytes of the payload so a run can
 	// visually confirm the appended data is readable at the address
 	// init_env preserved for us.
@@ -759,6 +839,6 @@ fn main(seed_list, boot_source, bin_size, image_base, payload_start) {
 	};
 
 	// Become a FAMC chunk server. Never returns.
-	serve(image_base, bin_size);
+	serve(image_base, bin_size, start_time);
 	0
 }

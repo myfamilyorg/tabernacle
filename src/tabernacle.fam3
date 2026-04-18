@@ -73,7 +73,8 @@
 .equ	VIRT_DESC_OFFSET,	20480
 .equ	VIRT_DISK_STATUS,	25088
 .equ	VIRT_DISK_HEADER,	25090
-.equ	DATA_REGION_SIZE,		25108
+.equ	DIAG_LAST_REPORT,	25108		# mtime of last progress summary
+.equ	DATA_REGION_SIZE,	25112
 .equ	STACK_OFFSET,		0x400000
 
 # ==========================================================================
@@ -421,6 +422,12 @@ host_adv_done:
 try_next_host:
 	beqz	s5, all_hosts_failed
 
+	# Announce which host we're attempting. s4 already points at the
+	# 6-byte [ip:4, port:2 BE] entry; print_host reads it directly.
+	li	gp, 20
+	j	print_host
+ph_ret_tnh:
+
 	# Zero bitmap.
 	li	t0, BITMAP_WORDS
 	mv	t1, s2
@@ -464,6 +471,15 @@ div_nc_done:
 	lw	s9, 0(s6)
 	li	s7, IDLE_INITIAL_TICKS
 
+	# Anchor the 10-s progress-report timer at host-attempt start so the
+	# first "chunks=N/T" line can't fire before we've had a chance to
+	# receive anything. Stored in the data region because all s-regs are
+	# already booked.
+	li	t0, DIAG_LAST_REPORT
+	add	t0, s11, t0
+	lw	t1, 0(s6)
+	sw	t1, 0(t0)
+
 	# Set up RX queue pointers (persist across the loop).
 	li	t0, RX_QUEUE_OFFSET
 	add	t3, s11, t0
@@ -487,6 +503,27 @@ recv_loop:
 	.word	0x0220000F
 	lhu	t5, 2(t4)
 	bne	t5, s1, got_packet
+
+	# 10-second progress summary. Quiet by default: the check runs every
+	# poll cycle but print_progress only fires after 10 s of elapsed
+	# mtime. emit_decimal clobbers t3/t4, so we reload them before
+	# resuming recv_loop.
+	lw	t6, 0(s6)
+	li	t1, DIAG_LAST_REPORT
+	add	t1, s11, t1
+	lw	t0, 0(t1)
+	sub	t0, t6, t0
+	li	t2, 100000000
+	bltu	t0, t2, rl_no_prog
+	sw	t6, 0(t1)
+	li	gp, 21
+	j	print_progress
+pp_ret_recv:
+	li	t0, RX_QUEUE_OFFSET
+	add	t3, s11, t0
+	li	t0, 4096
+	add	t4, t3, t0
+rl_no_prog:
 	# Done?
 	lw	t2, 0(sp)
 	beq	s3, t2, all_received
@@ -1188,6 +1225,266 @@ tx_kick_disp:
 	beqz	gp, tk_ret_arp
 	li	t0, 1
 	beq	gp, t0, tk_ret_req
+	j	dispatch_error
+
+# ==========================================================================
+#  emit_decimal -- write a0 (u32) as decimal ASCII to the UART.
+#
+#  No M-extension in this build, so digits are extracted by subtractive
+#  mod/div-by-10. Digits are pushed onto the stack (low-to-high) with a
+#  zero sentinel underneath, then popped and emitted in reverse order so
+#  the printed string reads most-significant digit first.
+#
+#  Preserves all s-regs. Clobbers t0..t6, a0, a1. Saves/restores the
+#  caller's gp via the stack.
+#
+#  Dispatch: gp selects return site. Current callers are print_host
+#  (octets 10..13, port 14) and print_progress (chunks 15, total 16).
+# ==========================================================================
+emit_decimal:
+	addi	sp, sp, -4
+	sw	gp, 0(sp)
+
+	addi	sp, sp, -4
+	sw	zero, 0(sp)		# pop-loop sentinel
+
+	mv	a1, a0
+ed_push_loop:
+	li	t3, 10
+	mv	t2, a1
+ed_pmod:
+	blt	t2, t3, ed_pmod_done
+	sub	t2, t2, t3
+	j	ed_pmod
+ed_pmod_done:
+	sub	t4, a1, t2		# t4 = a1 - (a1 mod 10), divisible by 10
+	li	a1, 0
+ed_pdiv:
+	beqz	t4, ed_pdiv_done
+	sub	t4, t4, t3
+	addi	a1, a1, 1
+	j	ed_pdiv
+ed_pdiv_done:
+	addi	t2, t2, '0'
+	addi	sp, sp, -4
+	sw	t2, 0(sp)
+	bnez	a1, ed_push_loop
+
+	li	t5, UART_BASE
+ed_pop_loop:
+	lw	t2, 0(sp)
+	addi	sp, sp, 4
+	beqz	t2, ed_emit_done
+ed_tx_wait:
+	lbu	t6, UART_LSR(t5)
+	andi	t6, t6, UART_TX_READY
+	beqz	t6, ed_tx_wait
+	sb	t2, 0(t5)
+	j	ed_pop_loop
+ed_emit_done:
+	lw	gp, 0(sp)
+	addi	sp, sp, 4
+emit_decimal_disp:
+	li	t0, 10
+	beq	gp, t0, ed_ret_ph_o1
+	li	t0, 11
+	beq	gp, t0, ed_ret_ph_o2
+	li	t0, 12
+	beq	gp, t0, ed_ret_ph_o3
+	li	t0, 13
+	beq	gp, t0, ed_ret_ph_o4
+	li	t0, 14
+	beq	gp, t0, ed_ret_ph_port
+	li	t0, 15
+	beq	gp, t0, ed_ret_pp_chunks
+	li	t0, 16
+	beq	gp, t0, ed_ret_pp_total
+	j	dispatch_error
+
+# ==========================================================================
+#  print_host -- emit "-> A.B.C.D:PORT\n" for host pointed to by s4.
+#
+#  s4 layout: [ip0, ip1, ip2, ip3, port_hi, port_lo].
+#  Uses emit_decimal for numeric fields and inline UART writes for
+#  fixed separators. Only caller is try_next_host (gp=20).
+# ==========================================================================
+print_host:
+	addi	sp, sp, -4
+	sw	gp, 0(sp)
+
+	li	t5, UART_BASE
+	li	t6, '-'
+ph_w1:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, ph_w1
+	sb	t6, 0(t5)
+	li	t6, '>'
+ph_w2:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, ph_w2
+	sb	t6, 0(t5)
+	li	t6, ' '
+ph_w3:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, ph_w3
+	sb	t6, 0(t5)
+
+	lbu	a0, 0(s4)
+	li	gp, 10
+	j	emit_decimal
+ed_ret_ph_o1:
+	li	t5, UART_BASE
+	li	t6, '.'
+ph_d1:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, ph_d1
+	sb	t6, 0(t5)
+	lbu	a0, 1(s4)
+	li	gp, 11
+	j	emit_decimal
+ed_ret_ph_o2:
+	li	t5, UART_BASE
+	li	t6, '.'
+ph_d2:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, ph_d2
+	sb	t6, 0(t5)
+	lbu	a0, 2(s4)
+	li	gp, 12
+	j	emit_decimal
+ed_ret_ph_o3:
+	li	t5, UART_BASE
+	li	t6, '.'
+ph_d3:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, ph_d3
+	sb	t6, 0(t5)
+	lbu	a0, 3(s4)
+	li	gp, 13
+	j	emit_decimal
+ed_ret_ph_o4:
+	li	t5, UART_BASE
+	li	t6, ':'
+ph_co:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, ph_co
+	sb	t6, 0(t5)
+	lbu	a0, 4(s4)
+	lbu	t1, 5(s4)
+	slli	a0, a0, 8
+	or	a0, a0, t1
+	li	gp, 14
+	j	emit_decimal
+ed_ret_ph_port:
+	li	t5, UART_BASE
+	li	t6, 10
+ph_nl:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, ph_nl
+	sb	t6, 0(t5)
+
+	lw	gp, 0(sp)
+	addi	sp, sp, 4
+print_host_disp:
+	li	t0, 20
+	beq	gp, t0, ph_ret_tnh
+	j	dispatch_error
+
+# ==========================================================================
+#  print_progress -- emit "chunks=N/T\n" where N = s3 (chunks received)
+#  and T = NUM_CHUNKS (stashed at 0(sp) by the caller). The caller's own
+#  stack frame stays intact because print_progress saves gp first, which
+#  shifts NUM_CHUNKS up one slot (4(sp)) during this subroutine.
+#
+#  Only caller: recv_loop (gp=21).
+# ==========================================================================
+print_progress:
+	addi	sp, sp, -4
+	sw	gp, 0(sp)
+
+	li	t5, UART_BASE
+	li	t6, 'c'
+pp_w1:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, pp_w1
+	sb	t6, 0(t5)
+	li	t6, 'h'
+pp_w2:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, pp_w2
+	sb	t6, 0(t5)
+	li	t6, 'u'
+pp_w3:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, pp_w3
+	sb	t6, 0(t5)
+	li	t6, 'n'
+pp_w4:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, pp_w4
+	sb	t6, 0(t5)
+	li	t6, 'k'
+pp_w5:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, pp_w5
+	sb	t6, 0(t5)
+	li	t6, 's'
+pp_w6:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, pp_w6
+	sb	t6, 0(t5)
+	li	t6, '='
+pp_w7:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, pp_w7
+	sb	t6, 0(t5)
+
+	mv	a0, s3
+	li	gp, 15
+	j	emit_decimal
+ed_ret_pp_chunks:
+	li	t5, UART_BASE
+	li	t6, '/'
+pp_s:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, pp_s
+	sb	t6, 0(t5)
+
+	# NUM_CHUNKS lives in the caller's frame at 4(sp) (caller's 0(sp) +
+	# the 4-byte gp save we pushed on entry).
+	lw	a0, 4(sp)
+	li	gp, 16
+	j	emit_decimal
+ed_ret_pp_total:
+	li	t5, UART_BASE
+	li	t6, 10
+pp_nl:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, pp_nl
+	sb	t6, 0(t5)
+
+	lw	gp, 0(sp)
+	addi	sp, sp, 4
+print_progress_disp:
+	li	t0, 21
+	beq	gp, t0, pp_ret_recv
 	j	dispatch_error
 
 # ==========================================================================
