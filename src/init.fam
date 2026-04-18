@@ -70,15 +70,17 @@ fn _bootstrap() {
 	b := 0;
 	c := 0;
 	d := 0;
+	e := 0;
 	asm {
 		(a = a0)
 		(b = a1)
 		(c = a2)
 		(d = a3)
+		(e = a4)
 	};
 
 	payload_start := init_env();
-	main(a, b, c, d, payload_start)
+	main(a, b, c, d, payload_start, e)
 }
 
 // Top-level entry. famc's prologue has set gp = end-of-code and the

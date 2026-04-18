@@ -821,10 +821,11 @@ fn debug_dump_hex20(ptr) {
 //    payload_start : first byte of the appended payload in memory
 //                    (captured by init_env before gp was advanced)
 // ──────────────────────────────────────────────────────────────────────
-fn main(seed_list, boot_source, bin_size, image_base, payload_start) {
-	// Anchor startup timing at the earliest moment we can read mtime.
-	// Passed to serve() so it can report "Server started in N ms".
-	start_time := *(0x0200BFF8);
+fn main(seed_list, boot_source, bin_size, image_base, payload_start, start_time) {
+	// start_time is captured by tabernacle's _start just after its
+	// mem_zero loop, so "Server started in N ms" reports total wall
+	// time from boot entry to serve-ready (download + hash + exec +
+	// node init), not just the node-internal slice.
 
 	// Sanity-dump the first 20 bytes of the payload so a run can
 	// visually confirm the appended data is readable at the address

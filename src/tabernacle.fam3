@@ -74,7 +74,8 @@
 .equ	VIRT_DISK_STATUS,	25088
 .equ	VIRT_DISK_HEADER,	25090
 .equ	DIAG_LAST_REPORT,	25108		# mtime of last progress summary
-.equ	DATA_REGION_SIZE,	25112
+.equ	DIAG_START_TIME,	25112		# mtime at earliest tabernacle boot
+.equ	DATA_REGION_SIZE,	25116
 .equ	STACK_OFFSET,		0x400000
 
 # ==========================================================================
@@ -101,6 +102,15 @@ mem_zero:
 	sw	zero, 0(t0)
 	addi	t0, t0, 4
 	bltu	t0, t1, mem_zero
+
+	# Capture mtime as "boot start" so the node can report total wall
+	# time from tabernacle entry to serve-ready. Stashed in the data
+	# region (s11+DIAG_START_TIME), passed forward via a4 at exec_binary.
+	li	t0, MTIME_ADDR
+	lw	t1, 0(t0)
+	li	t0, DIAG_START_TIME
+	add	t0, s11, t0
+	sw	t1, 0(t0)
 
 	# -- Parse seed list from UART ---------------------------------
 	# Format: "ip:port ip:port ...\004"
@@ -790,6 +800,9 @@ exec_binary:
 	add	a0, a0, s11
 	li	a2, BIN_SIZE
 	lla	a3, data		# a3 = image_base (load address)
+	li	t0, DIAG_START_TIME
+	add	t0, s11, t0
+	lw	a4, 0(t0)		# a4 = tabernacle-entry mtime
 	j	data
 
 	# -- Advance to next host with wrap-around --
