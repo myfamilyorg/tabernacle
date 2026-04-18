@@ -28,59 +28,35 @@
 .equ	SHUTDOWN_VAL,		0x5555
 
 # Layout inside QEMU virt RAM (128 MiB starting at 0x80000000):
-#   0x80000000 .. ~0x80002000  our code + data (under 8 KiB)
-#   0x80100000 .. 0x80F00000    input buffer (14 MiB, plenty for any image)
+#   0x80000000 .. ~0x80002000   our code + data (under 8 KiB)
+#   0x80100000 .. 0x80F00000    input region (14 MiB cap)
+#       0x80100000 .. +4        u32 LE length prefix
+#       0x80100004 .. +length   payload bytes (what we hash)
 #   0x81000000                  initial sp (grows down)
+#
+# The input is loaded directly into RAM by QEMU's `-device loader`, not
+# streamed through the UART, which on modest hosts is ~100x faster for
+# payloads in the MiB range. See tools/refresh_bin_config.
 .equ	BUF_BASE,		0x80100000
-.equ	BUF_END,		0x80F00000
+.equ	BUF_MAX_LEN,		0x00E00000	# 14 MiB cap on payload
 .equ	STACK_TOP,		0x81000000
 
 # ══════════════════════════════════════════════════════════════════════════
-# _start: set up sp, read input, hash, format output, power off.
+# _start: sp, length+buffer from RAM, hash, format output, power off.
 # ══════════════════════════════════════════════════════════════════════════
 _start:
-	lui	sp, 0x81000		# sp = STACK_TOP (0x81000000)
+	lui	sp, 0x81000		# sp = STACK_TOP
 
-	# s0 = buffer base, s1 = write cursor, s2 = buffer end.
+	# Read length prefix from the first 4 bytes placed at BUF_BASE by
+	# QEMU's -device loader, then advance s0 past the prefix so it
+	# points at the payload.
 	lui	s0, 0x80100
-	addi	s1, s0, 0
-	lui	s2, 0x80F00
+	lw	s4, 0(s0)		# s4 = payload length
+	addi	s0, s0, 4		# s0 = payload start
 
-# -- Read 4-byte little-endian length prefix into s4. ---------------------
-	li	s4, 0			# accumulated length
-	li	s5, 0			# byte index 0..3
-read_len:
-	li	t0, UART_BASE
-rl_wait:
-	lbu	t1, UART_LSR(t0)
-	andi	t1, t1, UART_RX_READY
-	beqz	t1, rl_wait
-	lbu	t2, 0(t0)
-	slli	t3, s5, 3		# shift = byte_index * 8
-	sll	t2, t2, t3
-	or	s4, s4, t2
-	addi	s5, s5, 1
-	li	t0, 4
-	blt	s5, t0, read_len
-
-	# Sanity-check length against the 14 MiB buffer.
-	li	t0, 0x00E00000		# BUF_END - BUF_BASE = 14 MiB
+	# Sanity-check length vs. our 14 MiB ceiling.
+	li	t0, BUF_MAX_LEN
 	bgeu	s4, t0, input_too_big
-
-# -- Read exactly s4 bytes of payload. ------------------------------------
-	addi	s6, s4, 0		# bytes remaining
-read_loop:
-	beqz	s6, read_done
-	li	t0, UART_BASE
-rd_wait:
-	lbu	t1, UART_LSR(t0)
-	andi	t1, t1, UART_RX_READY
-	beqz	t1, rd_wait
-	lbu	t2, 0(t0)
-	sb	t2, 0(s1)
-	addi	s1, s1, 1
-	addi	s6, s6, -1
-	j	read_loop
 
 read_done:
 

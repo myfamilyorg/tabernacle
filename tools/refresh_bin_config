@@ -47,9 +47,14 @@ echo "Compiling src/full_node.fam + src/init.fam" >&2
 # Append compressed bible to the binary
 cat ./resources/bible.compressed >> ./bin/full_node
 
-# Build the input stream for gen_bin_config: 4-byte little-endian length
-# prefix followed by the node bytes. Pipe into QEMU; its UART stdout will
-# be the new bin_config.inc contents.
+# Build the gen_bin_config input image: a 4-byte little-endian length
+# prefix followed by bin/full_node. QEMU's `-device loader` copies the
+# whole thing into guest RAM at 0x80100000 before the CPU starts, so
+# gen_bin_config can hash straight out of memory instead of pulling
+# every byte through the virt UART. On a 1.7 MiB payload this cuts
+# generation from tens of seconds (and minutes on slow hosts) to well
+# under a second — the UART MMIO-per-byte was the bottleneck, not the
+# hash itself.
 echo "Generating src/bin_config.inc from bin/full_node" >&2
 SIZE=$(wc -c < bin/full_node)
 {
@@ -59,11 +64,16 @@ SIZE=$(wc -c < bin/full_node)
 		printf "\\$(printf '%03o' $byte)"
 	done
 	cat bin/full_node
-} | qemu-system-riscv32 \
+} > tmp/gen_input.bin
+
+qemu-system-riscv32 \
 	-machine virt -cpu "$CPU" \
 	-nographic -bios none \
 	-device loader,file=bin/gen_bin_config,addr=0x80000000 \
+	-device loader,file=tmp/gen_input.bin,addr=0x80100000 \
 	-serial stdio -monitor none 2>/dev/null > src/bin_config.inc
+
+rm -f tmp/gen_input.bin
 
 # Sanity-check: the output must start with a '#' comment header.
 FIRST=$(head -c 1 src/bin_config.inc)
