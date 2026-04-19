@@ -13000,6 +13000,9 @@ pk_ws_loop:
 pk_non_ws:
 	addi	t1, zero, '('
 	beq	t0, t1, pk_fn_call	# ident followed by '(' → function call
+	# Inside a deref prefix (@/*/#), '=' is a store, not a variable bind.
+	lw	t1, 4(sp)
+	bnez	t1, pk_read_ctx
 	# Check ':=' (mutable assign)
 	addi	t1, zero, ':'
 	beq	t0, t1, pk_chk_mut
@@ -13270,6 +13273,9 @@ ct_lbrace:
 	# cleanup needed since values live only in a0). A trailing ';' before '}'
 	# is allowed (the block still takes its value from the last expression —
 	# we don't distinguish "statement position" vs "tail expr" here).
+	addi	sp, sp, -4
+	sub	t0, s8, s7
+	sw	t0, 0(sp)
 	addi	s2, s2, 1
 ct_blk_loop:
 	# Leading peek: allow `{ }` (empty block) and trailing `;` before `}`.
@@ -13499,6 +13505,21 @@ sw_ct_blk_sep:
 	j	ct_blk_loop
 ct_blk_end:
 	addi	s2, s2, 1
+	lw	t0, 0(sp)
+	addi	sp, sp, 4
+	add	t0, s7, t0
+	addi	t1, s8, -40
+blk_cc_scan:
+	blt	t1, t0, blk_cc_done
+	lbu	t2, 38(t1)
+	addi	t3, zero, 2
+	bne	t2, t3, blk_cc_nxt
+	sb	zero, 0(t1)
+	sb	zero, 38(t1)
+blk_cc_nxt:
+	addi	t1, t1, -40
+	j	blk_cc_scan
+blk_cc_done:
 	lla	t0, lv_kind
 	sw	zero, 0(t0)
 	lla	t0, last_was_brace

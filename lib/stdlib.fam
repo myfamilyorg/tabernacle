@@ -2,7 +2,7 @@
 FILE: stdlib.fam
 */
 
-__UART = 0x10000000;
+const __UART = 0x10000000;
 fn puts(s) {
 	loop {
 		@s ? @__UART = @s++ : break;

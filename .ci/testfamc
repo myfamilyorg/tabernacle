@@ -1923,6 +1923,27 @@ test_error  "const undefined reference" \
 	"const X = NOPE + 1;" \
 	"Error:1:11 undefined variable"
 
+test_error  "const out of scope after block" \
+	"fn f() { { const X = 65; }; @0x10000000 = X; } f();" \
+	"Error:1:43 undefined variable"
+
+test_error  "const out of scope after loop" \
+	"fn f() { loop { const X = 65; break; }; @0x10000000 = X; } f();" \
+	"Error:1:55 undefined variable"
+
+test_error  "const in fn not visible at top level" \
+	"fn f() { const X = 65; } @0x10000000 = X;" \
+	"Error:1:40 undefined variable"
+
+test_output "const visible within same block" \
+	"fn f() { { const X = 86; @0x10000000 = X; }; } f();" "V"
+
+test_output "const in outer block visible in inner" \
+	"fn f() { const X = 87; { @0x10000000 = X; }; } f();" "W"
+
+test_output "sibling blocks can reuse const name" \
+	"fn f() { { const X = 88; @0x10000000 = X; }; { const X = 89; @0x10000000 = X; }; } f();" "XY"
+
 # ============================================================================
 echo "=== Macros ==="
 # Top-level `macro NAME(args) { body }` definitions invoked as `NAME(...);`
