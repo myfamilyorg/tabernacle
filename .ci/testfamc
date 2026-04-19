@@ -947,6 +947,40 @@ test_error   "block-scoped var: inner var not visible after block" \
 test_output  "block-scoped var: loop body scopes var" \
 	"fn f() { x := 0; loop { y = 1; x := x + y; x > 2 ? break; }; @0x10000000 = x + 62; } f();" "A"
 
+# Immutable shadow: `=` in an inner block shadows the outer binding;
+# the outer value is restored when the block ends. `:=` still modifies.
+test_output  "immut shadow: = in inner block shadows outer" \
+	"x = 65; { x = 66; @0x10000000 = x; }; @0x10000000 = x;" "BA"
+
+test_output  "immut shadow: := in inner block modifies outer" \
+	"x := 65; { x := 66; }; @0x10000000 = x;" "B"
+
+test_error   "immut shadow: = in same scope errors" \
+	"x = 1; x = 2;" \
+	"Error:1:8 cannot reassign immutable"
+
+test_output  "immut shadow: fn body shadows top-level" \
+	"$(cat <<'EOT'
+const UART = 0x10000000;
+fn print_str(s) {
+    loop {
+        loop @(UART+5) & 0x20 ? break;
+        @s ? @UART = @s++ : break;
+    }
+}
+s = "hello\n";
+print_str(s);
+{
+    s = "abc\n";
+    print_str(s);
+}
+print_str(s);
+EOT
+)" "$(printf 'hello\nabc\nhello\n')"
+
+test_output  "immut shadow: nested blocks restore correctly" \
+	"x = 65; { x = 66; { x = 67; }; @0x10000000 = x; }; @0x10000000 = x;" "BA"
+
 # ============================================================================
 echo "=== Char literals ==="
 test_output  "single char 'A'" \

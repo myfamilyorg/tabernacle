@@ -3163,6 +3163,15 @@ la_in_tok:
 	addi	t1, t1, 1
 	j	la_cmp
 la_match:
+	lla	t1, assign_is_mut
+	lw	t1, 0(t1)
+	bnez	t1, la_match_use
+	sub	t2, t0, s7
+	lla	t3, block_scope_base
+	lw	t3, 0(t3)
+	bge	t2, t3, la_match_use
+	j	la_new
+la_match_use:
 	lla	t1, last_ident_entry
 	sw	t0, 0(t1)
 	lla	t1, lookup_was_new
@@ -13001,6 +13010,8 @@ pk_non_ws:
 	addi	t1, zero, '='
 	beq	t0, t1, pk_read_ctx	# '==' is equality, read context
 pk_write_ctx:
+	lla	t1, assign_is_mut
+	sw	zero, 0(t1)
 	addi	gp, zero, 0
 	j	lookup_or_alloc
 pk_chk_mut:
@@ -13009,7 +13020,11 @@ pk_chk_mut:
 	lbu	t0, 0(t3)
 	addi	t1, zero, '='
 	bne	t0, t1, pk_read_ctx	# bare ':' → not assignment
-	j	pk_write_ctx		# ':=' → write context
+	lla	t1, assign_is_mut
+	addi	t0, zero, 1
+	sw	t0, 0(t1)
+	addi	gp, zero, 0
+	j	lookup_or_alloc
 pk_read_ctx:
 	addi	gp, zero, 0
 	j	lookup
@@ -13259,9 +13274,13 @@ ct_lbrace:
 	# cleanup needed since values live only in a0). A trailing ';' before '}'
 	# is allowed (the block still takes its value from the last expression —
 	# we don't distinguish "statement position" vs "tail expr" here).
-	addi	sp, sp, -4
+	addi	sp, sp, -8
 	sub	t0, s8, s7
 	sw	t0, 0(sp)
+	lla	t1, block_scope_base
+	lw	t2, 0(t1)
+	sw	t2, 4(sp)
+	sw	t0, 0(t1)
 	addi	s2, s2, 1
 ct_blk_loop:
 	# Leading peek: allow `{ }` (empty block) and trailing `;` before `}`.
@@ -13497,8 +13516,11 @@ blk_sep_chk_brace:
 ct_blk_end:
 	addi	s2, s2, 1
 	lw	t0, 0(sp)
-	addi	sp, sp, 4
+	lw	t1, 4(sp)
+	addi	sp, sp, 8
 	add	s8, s7, t0
+	lla	t0, block_scope_base
+	sw	t1, 0(t0)
 	lla	t0, lv_kind
 	sw	zero, 0(t0)
 	lla	t0, last_was_brace
@@ -18029,6 +18051,12 @@ current_fn:
 # pointer would dangle into abandoned memory after a grow. Offsets are
 # stable because the copy preserves relative positions.
 fn_scope_base:
+	.word	0
+
+# Byte offset (from s7) of s8 at the start of the current innermost block.
+# Used by lookup_or_alloc to detect whether a found entry is in the current
+# block scope or an outer one, so that `=` can shadow outer-scope bindings.
+block_scope_base:
 	.word	0
 
 # Set to 1 when an `asm { ... }` block is parsed in expression context (from
