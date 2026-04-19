@@ -71,12 +71,18 @@
 .equ	CWND_INIT,		4
 .equ	CWND_MIN,		2
 .equ	SSTHRESH_INIT,		128
-# Idle timeout: "server went quiet" detection. Set too long and every
-# lossy round costs this much dead time; set too short and chunks still
-# in flight get declared lost. 20 ms is comfortably above internet RTT +
-# per-chunk inter-arrival jitter and 5× shorter than the old 100 ms
-# default we started with.
+# Two timeouts drive batch completion:
+#   BATCH_IDLE_TICKS  - max gap between chunks once the batch has started
+#                       arriving. Short because chunks are paced by the
+#                       link and we don't want dead time.
+#   BATCH_FIRST_TICKS - max time to wait for the *first* chunk of a
+#                       batch. Must be > RTT + server start-up jitter
+#                       or slow WAN links get every batch declared a
+#                       "zero received → halve" congestion event.
+# batch_recv_loop picks whichever is appropriate based on
+# batch_received: 0 → FIRST, else → IDLE.
 .equ	BATCH_IDLE_TICKS,	200000		# 20 ms at 10 MHz
+.equ	BATCH_FIRST_TICKS,	3000000		# 300 ms at 10 MHz
 
 # Fast-fail: if no chunks at all have arrived after this long, the host
 # is almost certainly unreachable (dead, firewalled, bad IP). Don't burn
@@ -676,41 +682,37 @@ brl_no_prog:
 	lw	t1, 12(sp)			# batch_size
 	bge	t0, t1, batch_eval
 
-	# Idle threshold elapsed? Treat as end-of-batch with loss.
+	# Pick the idle threshold based on whether anything has arrived
+	# yet: short inter-chunk timeout once chunks are flowing, longer
+	# RTT-aware timeout while we're still waiting for the first one.
+	# Without this, a 50 ms-RTT link sees every batch time out before
+	# the first chunk lands and cwnd collapses to CWND_MIN.
+	li	t2, BATCH_IDLE_TICKS
+	bnez	t0, brl_idle_check
+	li	t2, BATCH_FIRST_TICKS
+brl_idle_check:
 	lw	t6, 0(s6)
 	sub	t6, t6, s9
-	li	t0, BATCH_IDLE_TICKS
-	bltu	t6, t0, batch_recv_loop
+	bltu	t6, t2, batch_recv_loop
 
 batch_eval:
-	# Evaluate this round and adjust cwnd before returning to
-	# aimd_round. Three cases:
+	# Three-way cwnd adjustment:
 	#   batch_received == batch_size → clean → grow (slow-start or CA)
-	#   batch_received == 0          → full loss → halve (real congestion)
-	#   0 < batch_received < size    → partial loss → clamp cwnd to what
-	#                                  actually fit through, pin ssthresh
-	#                                  so we move to CA instead of
-	#                                  re-overshooting.
-	# The "any loss halves" rule from the first cut here collapsed cwnd
-	# on any sporadic drop; proportional backoff tracks the link's real
-	# burst capacity.
+	#   batch_received == 0          → full loss → halve (congestion)
+	#   0 < batch_received < size    → partial → leave cwnd alone;
+	#                                  missing chunks will be picked up
+	#                                  next round via the bitmap scan.
+	# Earlier versions clamped cwnd to batch_received on partial loss,
+	# which created a grow/shrink cycle: clean-double → partial-clamp
+	# → back to min. "No change on partial" lets cwnd creep up toward
+	# the link's real burst capacity; only a fully empty batch counts
+	# as a real congestion signal.
 	lw	t5, 8(sp)
 	lw	t6, 12(sp)
 	addi	sp, sp, 16
 	bge	t5, t6, aimd_grow
 	beqz	t5, aimd_halve
-
-	# Partial: cwnd = max(batch_received, CWND_MIN).
-	mv	t0, t5
-	li	t1, CWND_MIN
-	bgeu	t0, t1, aimd_partial_ok
-	mv	t0, t1
-aimd_partial_ok:
-	mv	s7, t0
-	li	t1, DIAG_SSTHRESH
-	add	t1, s11, t1
-	sw	t0, 0(t1)
-	j	aimd_round
+	j	aimd_round			# partial: no change
 
 aimd_halve:
 	# Full loss: ssthresh = max(cwnd/2, CWND_MIN); cwnd = ssthresh.
