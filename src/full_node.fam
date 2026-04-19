@@ -265,10 +265,10 @@ fn blk_write_image(blk, bin_base, bin_size) {
 //
 //  MMIO offsets match virtio-blk; device_id for net is 1.
 // ──────────────────────────────────────────────────────────────────────
-fn net_init(net, rx_q, tx_q) {
+fn net_init(net, rx_q, tx_q, rx_buffers) {
 	// Zero both queue regions (8 KiB each: desc+avail page + used ring
-	// page). Fresh alloc memory can contain stale descriptor state from
-	// tabernacle's DATA_REGION, which would corrupt our used-ring reads.
+	// page). Fresh alloc memory can contain stale descriptor state,
+	// which would corrupt our used-ring reads and avail-ring posts.
 	i := 0;
 	loop {
 		i == 8192 ? break 0;
@@ -287,64 +287,53 @@ fn net_init(net, rx_q, tx_q) {
 	(*(net + 0x070) & 8) == 0 ? result = 0 : {
 		*(net + 0x028) = 4096;
 
-		// RX queue (queue 0). num=1 keeps the ring tiny; one in-flight
-		// descriptor at a time is plenty for our REQ/RSP workload.
+		// RX queue (queue 0): num=16. Absorbs bursts of concurrent
+		// REQ/NACK/ARP frames — the single-buffer queue would drop at
+		// the virtio layer whenever we were mid-handle_famc.
+		//
+		// Queue layout (legacy, num=16, queue_align=4096):
+		//   rx_q+0      desc[0..15]             (16 × 16 = 256 B)
+		//   rx_q+256    avail.flags:u16
+		//   rx_q+258    avail.idx:u16
+		//   rx_q+260    avail.ring[0..15]:u16   (32 B)
+		//   rx_q+4096   used.flags:u16
+		//   rx_q+4098   used.idx:u16
+		//   rx_q+4100   used.ring[0..15]:{id:u32,len:u32}  (128 B)
 		*(net + 0x030) = 0;
-		*(net + 0x038) = 1;
+		*(net + 0x038) = 16;
 		*(net + 0x03C) = 4096;
 		*(net + 0x040) = rx_q >>u 12;
 
-		// TX queue (queue 1).
+		// Populate desc[i] → rx_buffers + i*1536, WRITE, len=1536.
+		// avail.ring[i] = i so the device has 16 posted slots at start.
+		// 1536 = 1024+512 = (i<<10)+(i<<9).
+		i = 0;
+		loop {
+			i == 16 ? break 0;
+			d := rx_q + (i << 4);
+			*d = rx_buffers + (i << 10) + (i << 9);
+			*(d + 4) = 0;
+			*(d + 8) = 1536;
+			#(d + 12) = 2;                        // WRITE
+			#(d + 14) = 0;
+			#(rx_q + 260 + (i << 1)) = i;         // avail.ring[i] = i
+			i += 1;
+		};
+		#(rx_q + 256) = 0;                            // avail.flags
+		#(rx_q + 258) = 16;                           // avail.idx
+
+		// TX queue (queue 1): still num=1. We only ever have one
+		// outbound response in flight; net_send is blocking.
 		*(net + 0x030) = 1;
 		*(net + 0x038) = 1;
 		*(net + 0x03C) = 4096;
 		*(net + 0x040) = tx_q >>u 12;
 
 		*(net + 0x070) = 15;    // | DRIVER_OK
+		*(net + 0x050) = 0;     // kick RX so device picks up the 16 posts
 		result = 1;
 	};
 	result
-}
-
-// ──────────────────────────────────────────────────────────────────────
-//  net_post_rx — post a descriptor at desc[0] pointing at `buf`/`len`
-//  (device-write), bump avail_idx, notify queue 0.
-//
-//  Queue layout (legacy, num=1):
-//    rx_q+0      desc[0]    (16 bytes)
-//    rx_q+16     avail ring (flags:u16, idx:u16, ring[0]:u16, used_event:u16)
-//    rx_q+4096   used ring  (flags:u16, idx:u16, ring[0]:{id:u32,len:u32}, avail_event:u16)
-// ──────────────────────────────────────────────────────────────────────
-fn net_post_rx(net, rx_q, buf, len, avail_idx) {
-	// desc[0]: addr=buf, len=len, flags=WRITE (2), next=0
-	*rx_q = buf;
-	*(rx_q + 4) = 0;
-	*(rx_q + 8) = len;
-	#(rx_q + 12) = 2;           // WRITE
-	#(rx_q + 14) = 0;
-
-	// avail ring
-	a := rx_q + 16;
-	#a = 0;                     // flags
-	#(a + 4) = 0;               // ring[0] = desc index 0
-	#(a + 2) = avail_idx;       // idx (bumped by caller each post)
-
-	*(net + 0x050) = 0;         // QUEUE_NOTIFY queue 0
-	0
-}
-
-// ──────────────────────────────────────────────────────────────────────
-//  net_poll_rx — non-blocking check of RX used ring. Returns the bytes
-//  written by the device if a new entry is present, else 0. `last_used`
-//  is the caller's record of the last-consumed used-ring idx.
-// ──────────────────────────────────────────────────────────────────────
-fn net_poll_rx(rx_q, last_used) {
-	used := rx_q + 4096;
-	cur := #(used + 2);         // current used.idx (u16)
-	cur == last_used ? 0 : {
-		// used ring[0] = {id:u32 @ +4, len:u32 @ +8}. num=1 → slot 0.
-		*(used + 8)
-	}
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -694,10 +683,17 @@ fn handle_famc(net, tx_q, rx_buf, tx_buf, image_base, bin_size, start_avail_idx)
 
 // ──────────────────────────────────────────────────────────────────────
 //  serve — FAMC chunk server on port 3737. Infinite loop:
-//    - Poll RX used ring.
-//    - Dispatch on ethertype: ARP → handle_arp, IPv4/UDP/3737 →
-//      handle_famc. Everything else is silently dropped.
-//    - Repost the RX descriptor for the next frame.
+//    - Poll RX used ring for a new frame.
+//    - Extract the desc id the device wrote to, compute buffer addr,
+//      dispatch on ethertype (ARP → handle_arp, IPv4/UDP/3737 →
+//      handle_famc).
+//    - Re-post that same desc id into avail.ring for the device to
+//      reuse and notify the device.
+//
+//  num=16 RX queue absorbs bursts: if we're mid-handle_famc sending a
+//  128-chunk response to client A, concurrent REQ/NACK/ARP traffic from
+//  A or other clients lands on the spare buffers instead of being
+//  dropped at the virtio layer.
 // ──────────────────────────────────────────────────────────────────────
 fn serve(image_base, bin_size, start_time) {
 	net := find_mmio(1);
@@ -707,12 +703,13 @@ fn serve(image_base, bin_size, start_time) {
 		// boundary. Plain alloc() is only 4-byte aligned.
 		rx_q := alloc_page(8192);
 		tx_q := alloc_page(8192);
-		rx_buf := rx_q + 512;
 		tx_buf := tx_q + 512;
+		// 16 × 1536 B RX buffers, page-aligned region.
+		rx_buffers := alloc_page(24576);
 		// Scratch for emit_dec: at most 10 decimal digits per u32.
 		dec_buf := alloc(16);
 
-		ok := net_init(net, rx_q, tx_q);
+		ok := net_init(net, rx_q, tx_q, rx_buffers);
 		ok == 0 ? emit('F') : {
 			// "Server started in N ms\n". mtime runs at 10 MHz, so
 			// 10 000 ticks == 1 ms. Subtraction loop in lieu of divide.
@@ -736,9 +733,7 @@ fn serve(image_base, bin_size, start_time) {
 			last_report := *(0x0200BFF8);
 			prev_reqs := 0;
 
-			rx_avail_idx := 1;
 			tx_avail_idx := 0;
-			net_post_rx(net, rx_q, rx_buf, 1536, rx_avail_idx);
 			last_used := 0;
 
 			loop {
@@ -760,8 +755,17 @@ fn serve(image_base, bin_size, start_time) {
 					0
 				} : 0;
 
-				rx_len := net_poll_rx(rx_q, last_used);
-				rx_len == 0 ? 0 : {
+				// Poll used.idx. u16 compare handles wrap.
+				used_idx := #(rx_q + 4098);
+				used_idx == last_used ? 0 : {
+					// Read desc id the device wrote to from
+					// used.ring[last_used & 15]. Each used_elem is
+					// {id:u32 @+0, len:u32 @+4} at rx_q + 4100 + slot*8.
+					slot := last_used & 15;
+					id := *(rx_q + 4100 + (slot << 3));
+					// Buffer address = rx_buffers + id * 1536.
+					rx_buf := rx_buffers + (id << 10) + (id << 9);
+
 					// Ethertype at rx_buf + 10 (virtio_hdr) + 12 (eth).
 					eth_hi := @(rx_buf + 22);
 					eth_lo := @(rx_buf + 23);
@@ -792,9 +796,15 @@ fn serve(image_base, bin_size, start_time) {
 						0
 					} : 0;
 
+					// Repost the buffer we just consumed. Put id into
+					// avail.ring[avail.idx & 15] and bump avail.idx.
+					avail_idx := #(rx_q + 258);
+					avail_slot := avail_idx & 15;
+					#(rx_q + 260 + (avail_slot << 1)) = id;
+					#(rx_q + 258) = avail_idx + 1;
+					*(net + 0x050) = 0;
+
 					last_used = (last_used + 1) & 0xFFFF;
-					rx_avail_idx = (rx_avail_idx + 1) & 0xFFFF;
-					net_post_rx(net, rx_q, rx_buf, 1536, rx_avail_idx);
 					0
 				};
 			}

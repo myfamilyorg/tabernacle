@@ -71,7 +71,12 @@
 .equ	CWND_INIT,		4
 .equ	CWND_MIN,		2
 .equ	SSTHRESH_INIT,		128
-.equ	BATCH_IDLE_TICKS,	1000000		# 100 ms at 10 MHz
+# Idle timeout: "server went quiet" detection. Set too long and every
+# lossy round costs this much dead time; set too short and chunks still
+# in flight get declared lost. 20 ms is comfortably above internet RTT +
+# per-chunk inter-arrival jitter and 5× shorter than the old 100 ms
+# default we started with.
+.equ	BATCH_IDLE_TICKS,	200000		# 20 ms at 10 MHz
 
 # Fast-fail: if no chunks at all have arrived after this long, the host
 # is almost certainly unreachable (dead, firewalled, bad IP). Don't burn
@@ -679,18 +684,41 @@ brl_no_prog:
 
 batch_eval:
 	# Evaluate this round and adjust cwnd before returning to
-	# aimd_round. batch_received vs batch_size tells us if we lost any.
+	# aimd_round. Three cases:
+	#   batch_received == batch_size → clean → grow (slow-start or CA)
+	#   batch_received == 0          → full loss → halve (real congestion)
+	#   0 < batch_received < size    → partial loss → clamp cwnd to what
+	#                                  actually fit through, pin ssthresh
+	#                                  so we move to CA instead of
+	#                                  re-overshooting.
+	# The "any loss halves" rule from the first cut here collapsed cwnd
+	# on any sporadic drop; proportional backoff tracks the link's real
+	# burst capacity.
 	lw	t5, 8(sp)
 	lw	t6, 12(sp)
 	addi	sp, sp, 16
 	bge	t5, t6, aimd_grow
+	beqz	t5, aimd_halve
 
-	# Lossy: ssthresh = max(cwnd/2, CWND_MIN); cwnd = ssthresh.
+	# Partial: cwnd = max(batch_received, CWND_MIN).
+	mv	t0, t5
+	li	t1, CWND_MIN
+	bgeu	t0, t1, aimd_partial_ok
+	mv	t0, t1
+aimd_partial_ok:
+	mv	s7, t0
+	li	t1, DIAG_SSTHRESH
+	add	t1, s11, t1
+	sw	t0, 0(t1)
+	j	aimd_round
+
+aimd_halve:
+	# Full loss: ssthresh = max(cwnd/2, CWND_MIN); cwnd = ssthresh.
 	srli	t0, s7, 1
 	li	t1, CWND_MIN
-	bgeu	t0, t1, aimd_ss_ok
+	bgeu	t0, t1, aimd_halve_ok
 	mv	t0, t1
-aimd_ss_ok:
+aimd_halve_ok:
 	mv	s7, t0
 	li	t1, DIAG_SSTHRESH
 	add	t1, s11, t1
@@ -1435,6 +1463,8 @@ emit_decimal_disp:
 	beq	gp, t0, ed_ret_pp_chunks
 	li	t0, 16
 	beq	gp, t0, ed_ret_pp_total
+	li	t0, 17
+	beq	gp, t0, ed_ret_pp_cwnd
 	j	dispatch_error
 
 # ==========================================================================
@@ -1610,6 +1640,50 @@ pp_s:
 	li	gp, 16
 	j	emit_decimal
 ed_ret_pp_total:
+	# Emit " cwnd=" then the current AIMD window (s7). Lets us watch the
+	# controller on a real download rather than guessing.
+	li	t5, UART_BASE
+	li	t6, ' '
+pp_sp:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, pp_sp
+	sb	t6, 0(t5)
+	li	t6, 'c'
+pp_c:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, pp_c
+	sb	t6, 0(t5)
+	li	t6, 'w'
+pp_w:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, pp_w
+	sb	t6, 0(t5)
+	li	t6, 'n'
+pp_n:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, pp_n
+	sb	t6, 0(t5)
+	li	t6, 'd'
+pp_d:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, pp_d
+	sb	t6, 0(t5)
+	li	t6, '='
+pp_eq:
+	lbu	a0, UART_LSR(t5)
+	andi	a0, a0, UART_TX_READY
+	beqz	a0, pp_eq
+	sb	t6, 0(t5)
+
+	mv	a0, s7
+	li	gp, 17
+	j	emit_decimal
+ed_ret_pp_cwnd:
 	li	t5, UART_BASE
 	li	t6, 10
 pp_nl:
