@@ -174,6 +174,19 @@ _start:
 	sw	t2, 0(t1)
 	addi	tp, t2, 0
 
+	# ── Forward-call backpatch list: initial 32 × 8-byte entries ──
+	#    Stores (jal_addr, fn_entry_ptr) pairs for calls to functions
+	#    whose bodies haven't been compiled yet (entry_addr == 0).
+	lla	t1, fwd_call_base
+	sw	tp, 0(t1)
+	lla	t1, fwd_call_top
+	sw	tp, 0(t1)
+	addi	t0, zero, 256		# 32 × 8
+	add	t2, tp, t0
+	lla	t1, fwd_call_end
+	sw	t2, 0(t1)
+	addi	tp, t2, 0
+
 	# ── Master-dispatch patch list: initial 32 × 4-byte entries ────
 	lla	t1, md_patch_base
 	sw	tp, 0(t1)
@@ -309,6 +322,334 @@ rd_done:
 	add	t0, s4, t0
 	lla	t1, bin_end
 	sw	t0, 0(t1)
+
+# ── Pass 1: pre-register fn signatures for forward calls ────────────────
+# Scans the source for top-level `fn NAME(params) { body }` definitions
+# and allocates fn symtab entries with entry_addr=0 (placeholder).
+# Pass 2 fills in the real entry_addr when the body is compiled.
+# s2 walks from s1 to s3; reset to s1 before Phase 2.
+p1_loop:
+p1_ws:
+	bge	s2, s3, p1_done
+	lbu	t0, 0(s2)
+	addi	t1, zero, 33
+	blt	t0, t1, p1_ws_adv
+	addi	t1, zero, '/'
+	bne	t0, t1, p1_ws_end
+	addi	t2, s2, 1
+	bge	t2, s3, p1_ws_end
+	lbu	t3, 0(t2)
+	addi	t1, zero, '/'
+	beq	t3, t1, p1_lc
+	addi	t1, zero, '*'
+	beq	t3, t1, p1_bc
+	j	p1_ws_end
+p1_ws_adv:
+	addi	s2, s2, 1
+	j	p1_ws
+p1_lc:
+	addi	s2, s2, 2
+p1_lc_loop:
+	bge	s2, s3, p1_ws
+	lbu	t0, 0(s2)
+	addi	t1, zero, 10
+	addi	s2, s2, 1
+	bne	t0, t1, p1_lc_loop
+	j	p1_ws
+p1_bc:
+	addi	s2, s2, 2
+	addi	t4, zero, 1
+p1_bc_loop:
+	bge	s2, s3, p1_done
+	lbu	t0, 0(s2)
+	addi	s2, s2, 1
+	addi	t1, zero, '*'
+	beq	t0, t1, p1_bc_star
+	addi	t1, zero, '/'
+	beq	t0, t1, p1_bc_slash
+	j	p1_bc_loop
+p1_bc_star:
+	bge	s2, s3, p1_done
+	lbu	t0, 0(s2)
+	addi	t1, zero, '/'
+	bne	t0, t1, p1_bc_loop
+	addi	s2, s2, 1
+	addi	t4, t4, -1
+	bnez	t4, p1_bc_loop
+	j	p1_ws
+p1_bc_slash:
+	bge	s2, s3, p1_done
+	lbu	t0, 0(s2)
+	addi	t1, zero, '*'
+	bne	t0, t1, p1_bc_loop
+	addi	s2, s2, 1
+	addi	t4, t4, 1
+	j	p1_bc_loop
+
+p1_ws_end:
+	bge	s2, s3, p1_done
+	lbu	t0, 0(s2)
+	addi	t1, zero, 'f'
+	bne	t0, t1, p1_not_fn
+	addi	t2, s2, 1
+	bge	t2, s3, p1_skip_ident
+	lbu	t0, 0(t2)
+	addi	t1, zero, 'n'
+	bne	t0, t1, p1_skip_ident
+	addi	t2, t2, 1
+	bge	t2, s3, p1_found_fn
+	lbu	t0, 0(t2)
+	addi	t1, zero, '_'
+	beq	t0, t1, p1_skip_ident
+	addi	t1, zero, 'a'
+	blt	t0, t1, p1_fn_chk_uc
+	addi	t1, zero, 123
+	blt	t0, t1, p1_skip_ident
+p1_fn_chk_uc:
+	addi	t1, zero, 'A'
+	blt	t0, t1, p1_fn_chk_dig
+	addi	t1, zero, 91
+	blt	t0, t1, p1_skip_ident
+p1_fn_chk_dig:
+	addi	t1, zero, '0'
+	blt	t0, t1, p1_found_fn
+	addi	t1, zero, 58
+	blt	t0, t1, p1_skip_ident
+	j	p1_found_fn
+
+p1_not_fn:
+	addi	t1, zero, 34
+	beq	t0, t1, p1_skip_str
+	addi	t1, zero, '{'
+	beq	t0, t1, p1_skip_braces
+	addi	t1, zero, '_'
+	beq	t0, t1, p1_skip_ident
+	addi	t1, zero, 'a'
+	blt	t0, t1, p1_nf_chk_uc
+	addi	t1, zero, 123
+	blt	t0, t1, p1_skip_ident
+p1_nf_chk_uc:
+	addi	t1, zero, 'A'
+	blt	t0, t1, p1_adv
+	addi	t1, zero, 91
+	blt	t0, t1, p1_skip_ident
+p1_adv:
+	addi	s2, s2, 1
+	j	p1_loop
+
+p1_skip_ident:
+	addi	s2, s2, 1
+p1_si_loop:
+	bge	s2, s3, p1_loop
+	lbu	t0, 0(s2)
+	addi	t1, zero, '_'
+	beq	t0, t1, p1_si_take
+	addi	t1, zero, 'a'
+	blt	t0, t1, p1_si_uc
+	addi	t1, zero, 123
+	blt	t0, t1, p1_si_take
+p1_si_uc:
+	addi	t1, zero, 'A'
+	blt	t0, t1, p1_si_dig
+	addi	t1, zero, 91
+	blt	t0, t1, p1_si_take
+p1_si_dig:
+	addi	t1, zero, '0'
+	blt	t0, t1, p1_loop
+	addi	t1, zero, 58
+	blt	t0, t1, p1_si_take
+	j	p1_loop
+p1_si_take:
+	addi	s2, s2, 1
+	j	p1_si_loop
+
+p1_skip_str:
+	addi	s2, s2, 1
+p1_ss_loop:
+	bge	s2, s3, p1_done
+	lbu	t0, 0(s2)
+	addi	s2, s2, 1
+	addi	t1, zero, 92
+	beq	t0, t1, p1_ss_esc
+	addi	t1, zero, 34
+	beq	t0, t1, p1_loop
+	j	p1_ss_loop
+p1_ss_esc:
+	bge	s2, s3, p1_done
+	addi	s2, s2, 1
+	j	p1_ss_loop
+
+p1_skip_braces:
+	addi	s2, s2, 1
+	addi	t4, zero, 1
+p1_sb_loop:
+	bge	s2, s3, p1_done
+	lbu	t0, 0(s2)
+	addi	s2, s2, 1
+	addi	t1, zero, '{'
+	beq	t0, t1, p1_sb_open
+	addi	t1, zero, '}'
+	beq	t0, t1, p1_sb_close
+	addi	t1, zero, 34
+	beq	t0, t1, p1_sb_str
+	addi	t1, zero, '/'
+	beq	t0, t1, p1_sb_comment
+	j	p1_sb_loop
+p1_sb_open:
+	addi	t4, t4, 1
+	j	p1_sb_loop
+p1_sb_close:
+	addi	t4, t4, -1
+	bnez	t4, p1_sb_loop
+	j	p1_loop
+p1_sb_str:
+p1_sb_str_loop:
+	bge	s2, s3, p1_done
+	lbu	t0, 0(s2)
+	addi	s2, s2, 1
+	addi	t1, zero, 92
+	beq	t0, t1, p1_sb_str_esc
+	addi	t1, zero, 34
+	beq	t0, t1, p1_sb_loop
+	j	p1_sb_str_loop
+p1_sb_str_esc:
+	bge	s2, s3, p1_done
+	addi	s2, s2, 1
+	j	p1_sb_str_loop
+p1_sb_comment:
+	bge	s2, s3, p1_sb_loop
+	lbu	t0, 0(s2)
+	addi	t1, zero, '/'
+	beq	t0, t1, p1_sb_lc
+	addi	t1, zero, '*'
+	beq	t0, t1, p1_sb_bc
+	j	p1_sb_loop
+p1_sb_lc:
+	addi	s2, s2, 1
+p1_sb_lc_loop:
+	bge	s2, s3, p1_sb_loop
+	lbu	t0, 0(s2)
+	addi	t1, zero, 10
+	addi	s2, s2, 1
+	bne	t0, t1, p1_sb_lc_loop
+	j	p1_sb_loop
+p1_sb_bc:
+	addi	s2, s2, 1
+	addi	t5, zero, 1
+p1_sb_bc_loop:
+	bge	s2, s3, p1_done
+	lbu	t0, 0(s2)
+	addi	s2, s2, 1
+	addi	t1, zero, '*'
+	beq	t0, t1, p1_sb_bc_star
+	addi	t1, zero, '/'
+	beq	t0, t1, p1_sb_bc_slash
+	j	p1_sb_bc_loop
+p1_sb_bc_star:
+	bge	s2, s3, p1_done
+	lbu	t0, 0(s2)
+	addi	t1, zero, '/'
+	bne	t0, t1, p1_sb_bc_loop
+	addi	s2, s2, 1
+	addi	t5, t5, -1
+	bnez	t5, p1_sb_bc_loop
+	j	p1_sb_loop
+p1_sb_bc_slash:
+	bge	s2, s3, p1_done
+	lbu	t0, 0(s2)
+	addi	t1, zero, '*'
+	bne	t0, t1, p1_sb_bc_loop
+	addi	s2, s2, 1
+	addi	t5, t5, 1
+	j	p1_sb_bc_loop
+
+p1_found_fn:
+	addi	s2, s2, 2
+p1_fn_ws1:
+	bge	s2, s3, p1_done
+	lbu	t0, 0(s2)
+	addi	t1, zero, 33
+	bge	t0, t1, p1_fn_name
+	addi	s2, s2, 1
+	j	p1_fn_ws1
+p1_fn_name:
+	addi	s11, zero, 0
+p1_fn_pi:
+	bge	s2, s3, p1_fn_pi_done
+	lbu	t0, 0(s2)
+	addi	t1, zero, '_'
+	beq	t0, t1, p1_fn_pi_take
+	addi	t1, zero, 'a'
+	blt	t0, t1, p1_fn_pi_uc
+	addi	t1, zero, 123
+	blt	t0, t1, p1_fn_pi_take
+p1_fn_pi_uc:
+	addi	t1, zero, 'A'
+	blt	t0, t1, p1_fn_pi_dig
+	addi	t1, zero, 91
+	blt	t0, t1, p1_fn_pi_take
+p1_fn_pi_dig:
+	addi	t1, zero, '0'
+	blt	t0, t1, p1_fn_pi_done
+	addi	t1, zero, 58
+	blt	t0, t1, p1_fn_pi_take
+	j	p1_fn_pi_done
+p1_fn_pi_take:
+	addi	t2, zero, 32
+	bge	s11, t2, p1_fn_pi_done
+	add	t2, s10, s11
+	sb	t0, 0(t2)
+	addi	s11, s11, 1
+	addi	s2, s2, 1
+	j	p1_fn_pi
+p1_fn_pi_done:
+	beqz	s11, p1_loop
+p1_fn_ws2:
+	bge	s2, s3, p1_done
+	lbu	t0, 0(s2)
+	addi	t1, zero, 33
+	bge	t0, t1, p1_fn_lparen
+	addi	s2, s2, 1
+	j	p1_fn_ws2
+p1_fn_lparen:
+	addi	t1, zero, '('
+	bne	t0, t1, p1_loop
+	addi	s2, s2, 1
+	addi	t4, zero, 0
+p1_fn_param_ws:
+	bge	s2, s3, p1_done
+	lbu	t0, 0(s2)
+	addi	t1, zero, 33
+	blt	t0, t1, p1_fn_pw_adv
+	addi	t1, zero, ')'
+	beq	t0, t1, p1_fn_rparen
+	addi	t4, zero, 1
+	j	p1_fn_param_scan
+p1_fn_pw_adv:
+	addi	s2, s2, 1
+	j	p1_fn_param_ws
+p1_fn_param_scan:
+	bge	s2, s3, p1_done
+	lbu	t0, 0(s2)
+	addi	s2, s2, 1
+	addi	t1, zero, ')'
+	beq	t0, t1, p1_fn_alloc
+	addi	t1, zero, ','
+	bne	t0, t1, p1_fn_param_scan
+	addi	t4, t4, 1
+	j	p1_fn_param_scan
+p1_fn_rparen:
+	addi	s2, s2, 1
+p1_fn_alloc:
+	addi	a0, zero, 0
+	addi	a1, t4, 0
+	addi	gp, zero, 2		# fn_alloc site 2 = fna_ret_p1
+	j	fn_alloc
+fna_ret_p1:
+	j	p1_loop
+
+p1_done:
+	addi	s2, s1, 0
 
 # ── Phase 2: emit prologue (7 words, 28 bytes) ──────────────────────────────
 	# nop = addi x0, x0, 0 = 0x00000013
@@ -564,6 +905,36 @@ sw_cl_eoi:
 cs_after:
 	j	compile_loop
 compile_done:
+
+# ── Phase 3.5: backpatch forward function calls ─────────────────────────
+# Forward calls emitted `jal zero, 0` placeholders because the callee's
+# entry_addr wasn't known yet. Now that all fn bodies are compiled, we
+# iterate the forward-call list and patch each jal to the real target.
+	lla	t0, fwd_call_base
+	lw	t0, 0(t0)
+	lla	t1, fwd_call_top
+	lw	t1, 0(t1)
+fwd_patch_loop:
+	beq	t0, t1, fwd_patch_done
+	addi	sp, sp, -8
+	sw	t0, 0(sp)
+	sw	t1, 4(sp)
+	lw	t5, 0(t0)		# jal_addr
+	lw	t2, 4(t0)		# fn entry ptr
+	lw	t6, 32(t2)		# entry_addr (now known)
+	beqz	t6, fwd_patch_err
+	addi	gp, zero, 26		# patch_jtype site 26 = pjt_fwd_patch
+	j	patch_jtype
+pjt_fwd_patch:
+	lw	t0, 0(sp)
+	lw	t1, 4(sp)
+	addi	sp, sp, 8
+	addi	t0, t0, 8		# next pair
+	j	fwd_patch_loop
+fwd_patch_err:
+	addi	a0, zero, 3		# err 3: undefined variable (close enough)
+	j	report_err
+fwd_patch_done:
 
 # ── Phase 4: emit epilogue — QEMU-virt poweroff + safety hang ──────────────
 # Writes the magic value 0x5555 to the "test" device at 0x00100000, which
@@ -1087,7 +1458,15 @@ law_d2:
 	bnez	gp, law_d3
 	j	law_ret_md_patch
 law_d3:
+	addi	gp, gp, -1
+	bnez	gp, law_d4
 	j	law_ret_md_asm
+law_d4:
+	addi	gp, gp, -1
+	bnez	gp, law_d5
+	j	law_ret_fwd_addr
+law_d5:
+	j	law_ret_fwd_entry
 
 # ══════════════════════════════════════════════════════════════════════════════
 # skip_ws — advance s2 past chars with code < 33.
@@ -6736,7 +7115,11 @@ fn_alloc_disp:
 	bnez	gp, fna_d1
 	j	fna_ret_def
 fna_d1:
+	addi	gp, gp, -1
+	bnez	gp, fna_d2
 	j	fna_ret_asm
+fna_d2:
+	j	fna_ret_p1
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Struct symtab helpers: struct_lookup, struct_alloc, struct_field_lookup
@@ -8432,8 +8815,14 @@ cs_fn_name_ok:
 	addi	gp, zero, 0		# fn_lookup site 0 = fnlk_ret_def
 	j	fn_lookup
 fnlk_ret_def:
-	bnez	a0, cs_bad_fn_redefined
+	beqz	a0, cs_fn_new_alloc
+	# Pass 1 pre-registered this fn (entry_addr == 0 means placeholder).
+	# If entry_addr is already set, it's a true redefinition.
+	lw	t0, 32(a0)
+	bnez	t0, cs_bad_fn_redefined
+	j	fna_ret_def
 
+cs_fn_new_alloc:
 	# Allocate the fn symtab entry NOW, before parsing params. parse_ident
 	# will overwrite s10/s11 for each parameter, so we can't wait until
 	# after the parameter list to call fn_alloc — we'd be allocating with
@@ -11645,6 +12034,7 @@ ct_fn_call:
 	j	fn_lookup
 fnlk_ret_call:
 	beqz	a0, ct_bad_undef_fn
+	sw	a0, 16(sp)		# save fn entry ptr for forward-call backpatch
 	lw	t0, 32(a0)		# entry_addr
 	sw	t0, 0(sp)
 	lbu	t0, 36(a0)		# num_params
@@ -11810,6 +12200,25 @@ ew_ct_call_addi:
 ew_ct_call_jal:
 	addi	t5, s5, -4
 	lw	t6, 0(sp)		# fn entry_addr
+	bnez	t6, ct_call_patch_now
+	# Forward call: entry_addr not yet known. Record (jal_addr, fn_entry_ptr)
+	# in the forward-call list for backpatching after compile_done.
+	addi	a0, t5, 0
+	lla	a1, fwd_call_base
+	lla	a2, fwd_call_top
+	lla	a3, fwd_call_end
+	addi	gp, zero, 4		# list_append_word site 4 = law_ret_fwd_addr
+	j	list_append_word
+law_ret_fwd_addr:
+	lw	a0, 16(sp)		# fn entry ptr
+	lla	a1, fwd_call_base
+	lla	a2, fwd_call_top
+	lla	a3, fwd_call_end
+	addi	gp, zero, 5		# list_append_word site 5 = law_ret_fwd_entry
+	j	list_append_word
+law_ret_fwd_entry:
+	j	pjt_ct_call_jal
+ct_call_patch_now:
 	addi	gp, zero, 19		# patch_jtype site 19 = pjt_ct_call_jal
 	j	patch_jtype
 pjt_ct_call_jal:
@@ -16536,7 +16945,11 @@ pjt_d24:
 	bnez	gp, pjt_d25
 	j	pjt_cs_fn_save_jal
 pjt_d25:
+	addi	gp, gp, -1
+	bnez	gp, pjt_d26
 	j	pjt_cs_fn_restore_jal
+pjt_d26:
+	j	pjt_fwd_patch
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Error reporting. On any parse error, the site sets a0 = error code and jumps
@@ -17028,6 +17441,16 @@ fn_base:
 fn_top:
 	.word	0
 fn_end:
+	.word	0
+
+# Forward-call backpatch list: pairs of (jal_addr, fn_entry_ptr) for calls
+# to functions whose bodies haven't been compiled yet. Patched after
+# compile_done when all entry_addr values are known.
+fwd_call_base:
+	.word	0
+fwd_call_top:
+	.word	0
+fwd_call_end:
 	.word	0
 
 # Ret-site list: one entry per function call site in the program, indexed by
