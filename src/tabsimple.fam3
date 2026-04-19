@@ -1,30 +1,198 @@
-# tabsimple.fam3 -- hash a string with Gimli and print the 32-byte result.
+# tabsimple.fam3 -- read a binary from virtio-blk, hash it with Gimli,
+# verify the hash against expected values, and print the result.
 #
-# Usage:
-#   ./tools/fam3 src/tabsimple.fam3 bin/tabsimple
-#   ./tools/q32 bin/tabsimple
+# BIN_SIZE and BIN_HASH0..7 are defined in src/tabsimple_config.inc and
+# concatenated onto the front of this file by the build command.
+#
+# Build:
+#   Create a test payload and its config, then:
+#   ./tools/fam3 <(cat src/tabsimple_config.inc src/tabsimple.fam3) bin/tabsimple
+#   ./tools/q32 --disk=tmp/test.img bin/tabsimple
+#
+# Usage: run <assembler> <source...>
 
 .equ	UART_BASE,		0x10000000
 .equ	UART_LSR,		5
 .equ	UART_TX_READY,		0x20
 .equ	SHUTDOWN_ADDR,		0x00100000
 .equ	SHUTDOWN_VAL,		0x5555
+
+# ── Virtio MMIO slot scan range ────────────────────────────────────────
+.equ	VIO_SCAN_START,		0x10008000
+.equ	VIO_SCAN_END,		0x10001000
+.equ	PAGE_SIZE,		0x1000
+.equ	NEG_PAGE_SIZE,		0xFFFFF000
+.equ	PAGE_MASK,		0xFFF
+
+# ── Virtio MMIO (legacy interface) ──────────────────────────────────────
+.equ	VIO_MAGIC,		0x000
+.equ	VIO_DEVICE_ID,		0x008
+.equ	VIO_DRIVER_FEATURES,	0x020
+.equ	VIO_GUEST_PAGE_SIZE,	0x028
+.equ	VIO_QUEUE_SEL,		0x030
+.equ	VIO_QUEUE_NUM,		0x038
+.equ	VIO_QUEUE_ALIGN,	0x03C
+.equ	VIO_QUEUE_PFN,		0x040
+.equ	VIO_QUEUE_NOTIFY,	0x050
+.equ	VIO_STATUS,		0x070
+.equ	VIRT_MAGIC,		0x74726976
+
+# ── Memory layout (offsets from s11) ────────────────────────────────────
+# s11 = data region base, page-aligned.
+# Virtio queue occupies first 16 KiB:
+#   +0x0000  descriptor table (16 × 16 bytes)
+#   +0x0100  available ring
+#   +0x1000  used ring
+#   +0x1200  disk status byte
+#   +0x1202  request header (16 bytes)
+# Payload buffer starts at +0x4000 (16 KiB past queue).
+.equ	VIRT_DESC,		0
+.equ	VIRT_STATUS,		4608
+.equ	VIRT_REQ_HDR,		4610
+.equ	PAYLOAD_OFFSET,		16384
+.equ	SECTOR_SIZE,		512
+.equ	NEG_SECTOR_SIZE,	0xFFFFFE00
+.equ	DISK_CHUNK_SIZE,	65536
 .equ	STACK_SIZE,		0x100000
 
+# ══════════════════════════════════════════════════════════════════════════
+# _start
+# ══════════════════════════════════════════════════════════════════════════
 _start:
-	lla	t0, data
+	# sp = end of data + 1 MiB stack
+	lla	s11, endmark
 	li	sp, STACK_SIZE
-	add	sp, sp, t0
+	add	sp, sp, s11
 
-	# gimli_hash(data=message, len=13, out=sp-32)
+	# s11 = page-aligned data region (right after code+data)
+	li	t0, PAGE_MASK
+	add	s11, s11, t0
+	li	t0, NEG_PAGE_SIZE
+	and	s11, s11, t0
+
+	# Zero 16 KiB queue region (4096 words).
+	mv	t0, s11
+	li	t1, PAGE_SIZE
+zero_loop:
+	sw	zero, 0(t0)
+	addi	t0, t0, 4
+	addi	t1, t1, -1
+	bnez	t1, zero_loop
+
+	# Scan QEMU-virt virtio MMIO slots for device_id=2 (blk).
+	li	s0, VIO_SCAN_START
+scan_disk:
+	li	t0, VIO_SCAN_END
+	blt	s0, t0, no_disk
+	lw	t1, VIO_MAGIC(s0)
+	li	t2, VIRT_MAGIC
+	bne	t1, t2, scan_next
+	lw	t1, VIO_DEVICE_ID(s0)
+	li	t2, 2
+	beq	t1, t2, found_disk
+scan_next:
+	li	t0, NEG_PAGE_SIZE
+	add	s0, s0, t0
+	j	scan_disk
+
+found_disk:
+	# Legacy virtio-blk handshake.
+	sw	zero, VIO_STATUS(s0)
+	li	t1, 1
+	sw	t1, VIO_STATUS(s0)
+	lw	t1, VIO_STATUS(s0)
+	ori	t1, t1, 2
+	sw	t1, VIO_STATUS(s0)
+	sw	zero, VIO_DRIVER_FEATURES(s0)
+	lw	t1, VIO_STATUS(s0)
+	ori	t1, t1, 8
+	sw	t1, VIO_STATUS(s0)
+	lw	t1, VIO_STATUS(s0)
+	andi	t2, t1, 8
+	beqz	t2, no_disk
+	li	t1, PAGE_SIZE
+	sw	t1, VIO_GUEST_PAGE_SIZE(s0)
+	sw	zero, VIO_QUEUE_SEL(s0)
+	li	t1, 16
+	sw	t1, VIO_QUEUE_NUM(s0)
+	li	t1, PAGE_SIZE
+	sw	t1, VIO_QUEUE_ALIGN(s0)
+	srli	t1, s11, 12
+	sw	t1, VIO_QUEUE_PFN(s0)
+	lw	t1, VIO_STATUS(s0)
+	ori	t1, t1, 4
+	sw	t1, VIO_STATUS(s0)
+
+	# -- Read binary from disk (64 KiB blocks) --
+	addi	sp, sp, -4
+	sw	s0, 0(sp)		# stash disk base
+	li	t0, PAYLOAD_OFFSET
+	add	s0, s11, t0		# dest ptr
+	li	s1, BIN_SIZE		# bytes remaining
+	li	s2, 0			# sector number
+	li	s6, 0			# avail idx
+read_loop:
+	beqz	s1, read_done
+	li	a3, DISK_CHUNK_SIZE
+	bge	s1, a3, read_go
+	addi	a3, s1, 511
+	li	t0, NEG_SECTOR_SIZE
+	and	a3, a3, t0		# round up to sector boundary
+read_go:
+	mv	a0, s2			# starting sector
+	addi	s6, s6, 1
+	mv	a1, s6			# avail idx
+	mv	a2, s0			# dest buffer
+	lw	s3, 0(sp)		# disk base
+	addi	sp, sp, -4
+	sw	a3, 0(sp)		# save chunk size
+	li	gp, 0
+	j	disk_read
+dr_ret_main:
+	lw	t0, 0(sp)		# recover chunk size
+	addi	sp, sp, 4
+	srli	t1, t0, 9		# sectors in this chunk
+	add	s2, s2, t1
+	bge	s1, t0, read_full
+	mv	t0, s1
+read_full:
+	add	s0, s0, t0
+	sub	s1, s1, t0
+	j	read_loop
+read_done:
+	addi	sp, sp, 4
+
+	# Hash the loaded binary.
 	addi	sp, sp, -32
-	lla	a0, message
-	li	a1, 13
+	li	t0, PAYLOAD_OFFSET
+	add	a0, s11, t0
+	li	a1, BIN_SIZE
 	mv	a2, sp
 	li	gp, 0
 	j	gimli_hash
 gh_ret:
-	# Print 8 hex words separated by spaces.
+	# Verify hash.
+	mv	a0, sp
+	li	gp, 0
+	j	check_hash
+ch_ret:
+	addi	sp, sp, 32
+	bnez	a0, hash_fail
+
+	# Hash OK — print success.
+	lla	a0, msg_ok
+	li	gp, 0
+	j	emit_str
+es_ret_ok:
+	# Print the 8 hash words.
+	addi	sp, sp, -32
+	li	t0, PAYLOAD_OFFSET
+	add	a0, s11, t0
+	li	a1, BIN_SIZE
+	mv	a2, sp
+	li	gp, 1
+	j	gimli_hash
+gh_ret_print:
 	mv	s0, sp
 	li	s1, 0
 print_loop:
@@ -50,15 +218,60 @@ sep_wait:
 	addi	s0, s0, 4
 	addi	s1, s1, 1
 	j	print_loop
-
 print_done:
 	addi	sp, sp, 32
+	j	shutdown
+
+hash_fail:
+	lla	a0, msg_fail
+	li	gp, 1
+	j	emit_str
+es_ret_fail:
+	j	shutdown
+
+no_disk:
+	lla	a0, msg_no_disk
+	li	gp, 2
+	j	emit_str
+es_ret_nd:
+
+shutdown:
 	li	t0, SHUTDOWN_ADDR
 	li	t1, SHUTDOWN_VAL
 	sw	t1, 0(t0)
 hang:
 	wfi
 	j	hang
+
+# ══════════════════════════════════════════════════════════════════════════
+# emit_str -- write null-terminated string at a0 to the UART.
+# Dispatch: gp=0 → es_ret_ok, gp=1 → es_ret_fail, gp=2 → es_ret_nd.
+# ══════════════════════════════════════════════════════════════════════════
+emit_str:
+	mv	t3, a0
+	li	t2, UART_BASE
+es_loop:
+	lbu	t0, 0(t3)
+	beqz	t0, es_done
+es_wait:
+	lbu	t1, UART_LSR(t2)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, es_wait
+	sb	t0, 0(t2)
+	addi	t3, t3, 1
+	j	es_loop
+es_done:
+emit_str_disp:
+	bnez	gp, esd_1
+	j	es_ret_ok
+esd_1:
+	li	t0, 1
+	bne	gp, t0, esd_2
+	j	es_ret_fail
+esd_2:
+	li	t0, 2
+	bne	gp, t0, dispatch_error
+	j	es_ret_nd
 
 # ══════════════════════════════════════════════════════════════════════════
 # emit_hex8 -- write 32-bit word in a0 as 8 uppercase hex digits.
@@ -94,9 +307,110 @@ emit_hex8_disp:
 	j	eh_ret
 
 # ══════════════════════════════════════════════════════════════════════════
+# check_hash -- compare 32 bytes at a0 against BIN_HASH0..7.
+# Returns a0=0 on match, a0=1 on mismatch.
+# Dispatch: gp=0 → ch_ret.
+# ══════════════════════════════════════════════════════════════════════════
+check_hash:
+	li	t0, BIN_HASH0
+	lw	t1, 0(a0)
+	bne	t0, t1, ch_fail
+	li	t0, BIN_HASH1
+	lw	t1, 4(a0)
+	bne	t0, t1, ch_fail
+	li	t0, BIN_HASH2
+	lw	t1, 8(a0)
+	bne	t0, t1, ch_fail
+	li	t0, BIN_HASH3
+	lw	t1, 12(a0)
+	bne	t0, t1, ch_fail
+	li	t0, BIN_HASH4
+	lw	t1, 16(a0)
+	bne	t0, t1, ch_fail
+	li	t0, BIN_HASH5
+	lw	t1, 20(a0)
+	bne	t0, t1, ch_fail
+	li	t0, BIN_HASH6
+	lw	t1, 24(a0)
+	bne	t0, t1, ch_fail
+	li	t0, BIN_HASH7
+	lw	t1, 28(a0)
+	bne	t0, t1, ch_fail
+	li	a0, 0
+	j	check_hash_disp
+ch_fail:
+	li	a0, 1
+check_hash_disp:
+	bnez	gp, dispatch_error
+	j	ch_ret
+
+# ══════════════════════════════════════════════════════════════════════════
+# disk_read -- read sectors via virtio-blk.
+#   Input: a0 = starting sector, a1 = avail_idx,
+#          a2 = dest buffer, a3 = byte count
+#          s3 = disk base address, s11 = data region base
+#   Clobbers: t0..t5
+# Dispatch: gp=0 → dr_ret_main.
+# ══════════════════════════════════════════════════════════════════════════
+disk_read:
+	li	t5, VIRT_DESC
+	add	t1, s11, t5
+	li	t3, VIRT_STATUS
+	add	t3, s11, t3
+	addi	t2, t3, 2
+
+	sw	zero, 0(t2)
+	sw	zero, 4(t2)
+	sw	a0, 8(t2)
+	sw	zero, 12(t2)
+
+	sw	t2, 0(t1)
+	sw	zero, 4(t1)
+	li	t4, 16
+	sw	t4, 8(t1)
+	li	t4, 1
+	sh	t4, 12(t1)
+	sh	t4, 14(t1)
+
+	sw	a2, 16(t1)
+	sw	zero, 20(t1)
+	sw	a3, 24(t1)
+	li	t4, 3
+	sh	t4, 28(t1)
+	li	t4, 2
+	sh	t4, 30(t1)
+
+	sw	t3, 32(t1)
+	sw	zero, 36(t1)
+	li	t4, 1
+	sw	t4, 40(t1)
+	li	t4, 2
+	sh	t4, 44(t1)
+	sh	zero, 46(t1)
+
+	addi	t4, t1, 256
+	sh	zero, 0(t4)
+	li	t5, 0xFF
+	sb	t5, 0(t3)
+	sh	a1, 2(t4)
+	sh	zero, 4(t4)
+
+	.word	0x0110000F
+	sw	zero, VIO_QUEUE_NOTIFY(s3)
+
+	li	t5, 0xFF
+dr_poll:
+	lbu	t4, 0(t3)
+	beq	t4, t5, dr_poll
+	.word	0x0220000F
+disk_read_disp:
+	bnez	gp, dispatch_error
+	j	dr_ret_main
+
+# ══════════════════════════════════════════════════════════════════════════
 # gimli_hash -- Gimli-Hash sponge (rate=16, output=32).
 #   a0 = data ptr, a1 = length, a2 = 32-byte output buffer
-# Dispatch: gp=0 → gh_ret.
+# Dispatch: gp=0 → gh_ret, gp=1 → gh_ret_print.
 # ══════════════════════════════════════════════════════════════════════════
 gimli_hash:
 	addi	sp, sp, -24
@@ -225,14 +539,16 @@ gpr_squeeze:
 	lw	s4, 20(sp)
 	addi	sp, sp, 24
 gimli_hash_disp:
-	bnez	gp, dispatch_error
+	bnez	gp, ghd_1
 	j	gh_ret
+ghd_1:
+	li	t0, 1
+	bne	gp, t0, dispatch_error
+	j	gh_ret_print
 
 # ══════════════════════════════════════════════════════════════════════════
 # gimli_permute -- 24-round Gimli-384 permutation (memory-based, looped).
 #   a0 = pointer to 48-byte state
-#   State layout: 3 rows × 4 columns, row-major:
-#     row 0: state[0..12], row 1: state[16..28], row 2: state[32..44]
 # Internal dispatch: gp=0 → gpr_absorb, gp=1 → gpr_pad, gp=2 → gpr_squeeze.
 # ══════════════════════════════════════════════════════════════════════════
 gimli_permute:
@@ -240,36 +556,31 @@ gimli_permute:
 	sw	gp, 0(sp)
 	sw	s0, 4(sp)
 	sw	s1, 8(sp)
-	sw	a0, 12(sp)		# state pointer
-	li	s0, 24			# round counter
+	sw	a0, 12(sp)
+	li	s0, 24
 gp_round:
 	lw	a0, 12(sp)
-	li	s1, 0			# column counter
+	li	s1, 0
 gp_col:
-	lw	t3, 0(a0)		# row0
-	lw	t4, 16(a0)		# row1
-	lw	t5, 32(a0)		# row2
-	# x = rot_left(row0, 24)
+	lw	t3, 0(a0)
+	lw	t4, 16(a0)
+	lw	t5, 32(a0)
 	slli	t0, t3, 24
 	srli	t1, t3, 8
 	or	t0, t0, t1
-	# y = rot_left(row1, 9)
 	slli	t1, t4, 9
 	srli	t2, t4, 23
 	or	t1, t1, t2
-	# new row0 = ((x & y) << 3) ^ z ^ y
 	and	t3, t0, t1
 	slli	t3, t3, 3
 	xor	t3, t3, t5
 	xor	t3, t3, t1
 	sw	t3, 0(a0)
-	# new row1 = ((x | z) << 1) ^ y ^ x
 	or	t4, t0, t5
 	slli	t4, t4, 1
 	xor	t4, t4, t1
 	xor	t4, t4, t0
 	sw	t4, 16(a0)
-	# new row2 = (z << 1) ^ x ^ ((y & z) << 2)
 	and	t2, t1, t5
 	slli	t2, t2, 2
 	slli	t5, t5, 1
@@ -280,7 +591,6 @@ gp_col:
 	addi	s1, s1, 1
 	li	t0, 4
 	blt	s1, t0, gp_col
-	# Swaps on row 0 only.
 	lw	a0, 12(sp)
 	andi	t0, s0, 3
 	beqz	t0, gp_small_swap
@@ -336,7 +646,15 @@ dispatch_error:
 # ══════════════════════════════════════════════════════════════════════════
 # Data
 # ══════════════════════════════════════════════════════════════════════════
-message:
-	.ascii	"Hello, world!"
+msg_ok:
+	.ascii	"Hash verified OK\n"
+	.byte	0
+msg_fail:
+	.ascii	"Hash verification FAILED\n"
+	.byte	0
+msg_no_disk:
+	.ascii	"No virtio-blk device found\n"
+	.byte	0
 
-data:
+endmark:
+	.byte	0
