@@ -1318,6 +1318,21 @@ test_output  "11 vars summed (mixed reg + frame homes)" \
 # local register allocation simultaneously.
 test_output  "fn with 8 args + 4 locals" \
 	"fn many(a,b,c,d,e,f,g,h) { x := 1; y := 2; z := 3; w := 4; a+b+c+d+e+f+g+h+x+y+z+w } @0x10000000 = many(1,2,3,4,5,6,7,8) + 19;" "A"
+# Symtab growth across fn bodies: two back-to-back fns each with enough
+# locals to trigger a symtab reallocation (>32 entries). Before the fix,
+# the stack-saved s8 and fn_scope_base were absolute pointers that went
+# stale after a grow, causing the next fn's locals to be written into
+# abandoned memory — which happened to overlap fn_symtab and silently
+# corrupted earlier fn name entries. Keep two fns × 40 locals.
+test_output  "symtab-grow spanning two fns (40 locals each)" \
+	"$(python3 -c "
+for fi in range(2):
+    print(f'fn g{fi}(x) {{', end=' ')
+    for i in range(40):
+        print(f'C{i} = {i+1};', end=' ')
+    print('x + 1 }', end=' ')
+print('@0x10000000 = g0(32) + g1(31);')
+")" "A"
 
 # Error cases
 test_error "undefined function" \

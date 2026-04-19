@@ -2734,17 +2734,16 @@ lookup_or_alloc:
 	# without destroying the outer `x` — the for-loop allocates a new entry
 	# via `j la_new` and, on exit, restores s8 to "forget" it.
 	#
-	# Compute effective scan lower bound = max(s7, fn_scope_base) into the
-	# memory global lookup_lower_bound. Inside a fn body, fn_scope_base
-	# hides outer-scope entries (functions are not closures). At top level,
-	# fn_scope_base=0 → bound = s7. Using memory (not a reg) because a-regs
-	# are callee-visible and we mustn't clobber them on this path.
-	addi	t0, s7, 0
+	# Compute effective scan lower bound = s7 + fn_scope_base into the
+	# memory global lookup_lower_bound. fn_scope_base is a byte offset
+	# from s7 (0 at top level → bound = s7; nonzero inside a fn body →
+	# bound = s7 + offset, hiding outer-scope entries). Storing as an
+	# offset means the bound survives a symtab reallocation unchanged.
+	# Using memory (not a reg) because a-regs are callee-visible and we
+	# mustn't clobber them on this path.
 	lla	t1, fn_scope_base
 	lw	t1, 0(t1)
-	beqz	t1, la_bound_set
-	addi	t0, t1, 0
-la_bound_set:
+	add	t0, s7, t1
 	lla	t1, lookup_lower_bound
 	sw	t0, 0(t1)
 	addi	t0, s8, -40		# scan ptr = last entry
@@ -2789,12 +2788,9 @@ lookup:
 	# Same effective lower bound as lookup_or_alloc: hide outer scope when
 	# inside a fn body so referencing a top-level var errors cleanly
 	# (undefined variable) rather than silently reading the wrong frame.
-	addi	t0, s7, 0
 	lla	t1, fn_scope_base
 	lw	t1, 0(t1)
-	beqz	t1, lo_bound_set
-	addi	t0, t1, 0
-lo_bound_set:
+	add	t0, s7, t1
 	lla	t1, lookup_lower_bound
 	sw	t0, 0(t1)
 	addi	t0, s8, -40
@@ -6144,7 +6140,10 @@ ct_kw_for:
 	lla	t0, loop_start
 	lw	t1, 0(t0)
 	sw	t1, 136(sp)
-	sw	s8, 140(sp)
+	# Save outer s8 as (s8 - s7): symtab may grow during the loop body,
+	# invalidating any absolute pointer saved here.
+	sub	t1, s8, s7
+	sw	t1, 140(sp)
 
 	# Skip ws, parse the loop-variable identifier.
 	addi	gp, zero, 35		# skip_ws site 35 = sw_ct_for_name
@@ -6537,7 +6536,10 @@ ct_for_break_patch_done:
 	lw	t1, 136(sp)
 	lla	t0, loop_start
 	sw	t1, 0(t0)
-	lw	s8, 140(sp)		# restore symtab write ptr (forget shadow)
+	# Restore s8 from saved offset: s8 = s7 + offset (symtab may have
+	# been reallocated; s7 is current).
+	lw	t0, 140(sp)
+	add	s8, s7, t0
 
 	addi	sp, sp, 192
 	lla	t0, lv_kind
@@ -8260,14 +8262,21 @@ cs_kw_fn:
 	bnez	t1, cs_bad_fn_nested
 
 	addi	sp, sp, -80
-	sw	s8, 0(sp)
+	# Save outer s8 as a byte offset from s7 (not an absolute pointer).
+	# A symtab grow inside the fn body reallocates at a new base; an
+	# absolute saved pointer would dangle into abandoned memory, causing
+	# the next fn's locals to be written into fn_symtab and silently
+	# corrupt previously-defined function names.
+	sub	t0, s8, s7
+	sw	t0, 0(sp)
 	sw	s9, 4(sp)
-	# Hide outer scope from this fn body: set fn_scope_base = current s8,
-	# so lookup/lookup_or_alloc can't see entries below this boundary.
+	# Hide outer scope from this fn body: fn_scope_base = (s8 - s7), so
+	# lookup/lookup_or_alloc compute bound = s7 + offset. Same offset-
+	# based rationale as the stack save above.
 	# Functions are not closures — the only way for outer-scope state to
 	# reach a fn body is through explicit parameters.
-	lla	t0, fn_scope_base
-	sw	s8, 0(t0)
+	lla	t1, fn_scope_base
+	sw	t0, 0(t1)
 	# Slots 32/36/40 are new for the value-stack save area:
 	#   32(sp): saved outer expr_max_depth
 	#   36(sp): save_area_addr  (start of the 9 nop save slots in prologue)
@@ -9021,7 +9030,11 @@ cs_fn_save_done:
 pjt_cs_fn_skip:
 
 	# ── Restore outer scope ────────────────────────────────────────
-	lw	s8, 0(sp)
+	# Restore s8 from the saved byte offset (s8 = s7 + offset). The
+	# symtab may have been reallocated during the fn body; s7 is
+	# current, so this lands in the live symtab regardless.
+	lw	t0, 0(sp)
+	add	s8, s7, t0
 	lw	s9, 4(sp)
 	lla	t0, current_fn
 	sw	zero, 0(t0)
@@ -17094,11 +17107,17 @@ asm_fix_end:
 current_fn:
 	.word	0
 
-# Symtab boundary for the currently-compiling function. Set to the outer s8
-# value at fn body entry. Any symtab entry whose address is < fn_scope_base
-# belongs to an enclosing (top-level) scope; referencing such entries from
-# inside a function body is a compile error — functions are not closures.
-# 0 when we're at top level (no boundary check needed).
+# Symtab boundary for the currently-compiling function, stored as a byte
+# offset from s7 (not an absolute pointer). Set to (s8 - s7) at fn body
+# entry; any symtab entry whose address is < s7 + fn_scope_base belongs
+# to an enclosing (top-level) scope. Referencing such entries from inside
+# a function body is a compile error — functions are not closures. 0 when
+# we're at top level (effective bound = s7).
+#
+# Rationale for offsets vs. absolute: the symtab is reallocated at a new
+# heap block when it overflows (see la_new grow path). An absolute saved
+# pointer would dangle into abandoned memory after a grow. Offsets are
+# stable because the copy preserves relative positions.
 fn_scope_base:
 	.word	0
 
