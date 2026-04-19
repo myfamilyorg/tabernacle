@@ -984,6 +984,96 @@ test_output  "immut shadow: nested blocks restore correctly" \
 test_output  "immut shadow: = to mutable outer modifies (no shadow)" \
 	"x := 65; { x = 66; }; @0x10000000 = x;" "B"
 
+# ── Comprehensive scope interaction tests ──
+# Immutable (=) in fn body
+test_output  "scope: immut var in fn body, read inside loop" \
+	"fn f() { x = 65; loop { @0x10000000 = x; break; } } f();" "A"
+
+test_output  "scope: immut shadow in fn loop body" \
+	"fn f() { x = 65; loop { x = 66; @0x10000000 = x; break; }; @0x10000000 = x; } f();" "BA"
+
+test_error   "scope: immut rebind in fn same scope" \
+	"fn f() { x = 1; x = 2; } f();" \
+	"Error:1:17 cannot reassign immutable"
+
+# Mutable (:=) across scopes
+test_output  "scope: := in loop body modifies fn-level var" \
+	"fn f() { x := 65; loop { x := 66; break; }; @0x10000000 = x; } f();" "B"
+
+test_output  "scope: := in ternary branch modifies outer" \
+	"fn f() { x := 65; 1 > 0 ? { x := 66; }; @0x10000000 = x; } f();" "B"
+
+test_output  "scope: = in ternary on mutable outer modifies" \
+	"fn f() { x := 65; 1 > 0 ? { x = 66; }; @0x10000000 = x; } f();" "B"
+
+test_output  "scope: += in inner block modifies outer" \
+	"fn f() { x := 60; { x += 5; }; @0x10000000 = x; } f();" "A"
+
+# Const across scopes
+test_output  "scope: const visible in loop body" \
+	"fn f() { const X = 65; loop { @0x10000000 = X; break; } } f();" "A"
+
+test_output  "scope: const visible in nested fn block" \
+	"const X = 65; fn f() { { @0x10000000 = X; } } f();" "A"
+
+test_output  "scope: const shadows outer const in inner block" \
+	"fn f() { const X = 65; { const X = 66; @0x10000000 = X; }; @0x10000000 = X; } f();" "BA"
+
+test_error   "scope: const not visible after loop body" \
+	"fn f() { loop { const X = 1; break; } @0x10000000 = X; } f();" \
+	"Error:1:53 undefined variable"
+
+# Mixed const + var interactions
+test_output  "scope: var shadows const in inner block" \
+	"const X = 65; fn f() { x := 66; @0x10000000 = x; } f(); @0x10000000 = X;" "BA"
+
+test_output  "scope: const and immut var coexist" \
+	"const C = 10; fn f() { x = C + 55; @0x10000000 = x; } f();" "A"
+
+# Nested function scope isolation
+test_error   "scope: fn body cannot read outer var" \
+	"x = 65; fn f() { @0x10000000 = x; } f();" \
+	"Error:1:32 undefined variable"
+
+# Deep nesting: block inside loop inside fn
+test_output  "scope: deep nesting — shadow + restore" \
+	"$(cat <<'EOT'
+fn f() {
+    x = 65;
+    loop {
+        x = 66;
+        {
+            x = 67;
+            @0x10000000 = x;
+        }
+        @0x10000000 = x;
+        break;
+    }
+    @0x10000000 = x;
+}
+f();
+EOT
+)" "CBA"
+
+# For-loop iterator scoping
+test_output  "scope: for iterator shadows immut outer" \
+	"i = 99; for i in 0..3 { @0x10000000 = '0' + i; }; @0x10000000 = i + 48 == 147 ? 'Y' : 'N';" "012Y"
+
+test_output  "scope: for iterator not visible after loop" \
+	"s := 0; for i in 1..=5 s += i; @0x10000000 = s == 15 ? 'Y' : 'N';" "Y"
+
+# Sibling ternary branches with = (the P5 motivating case)
+test_output  "scope: sibling ternary branches reuse name with =" \
+	"$(cat <<'EOT'
+fn f(cond) {
+    cond > 0 ? { x = 65; @0x10000000 = x; }
+             : { x = 66; @0x10000000 = x; };
+}
+f(1);
+f(0);
+EOT
+)" "AB"
+
 # ============================================================================
 echo "=== Char literals ==="
 test_output  "single char 'A'" \
