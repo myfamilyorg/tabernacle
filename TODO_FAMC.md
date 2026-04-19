@@ -107,35 +107,16 @@ bumps the offset to the next multiple of N before placing the array.
 
 ---
 
-## P5 — Block-level variable scoping (currently fn-level)
+## ~~P5 — Block-level variable scoping (currently fn-level)~~ ✓ DONE
 
-**Gap.** Variable bindings are scoped to the **enclosing function**, not
-to the nearest `{}`. Consequence: two sibling branches that each do
-`sent = foo(...)` both refer to the same implicitly-promoted binding,
-and the second one hits `Error: cannot reassign immutable` unless the
-first was written with `:=`.
-
-Confirmed empirically:
-```
-y > 0 ? { x = 65; @0x10000000 = x; }
-      : { x = 66; @0x10000000 = x; };      // Error: cannot reassign immutable
-y > 0 ? { x := 65; @0x10000000 = x; }
-      : { x := 66; @0x10000000 = x; };     // OK — each branch gets its own local
-```
-
-In real code this surfaced when the RX-dispatch loop in `serve()` had
-two ternary branches, one for ARP and one for IPv4, each wanting its
-own `sent` count. With fn-scoped `=`, the IPv4 branch can't redeclare
-`sent`; `:=` is required even though the two bindings are disjoint in
-lifetime.
-
-**Fix.** Make `=` (and `:=`) scope to the nearest enclosing `{}`. A
-binding introduced inside a branch goes out of scope at `}`, so a
-sibling branch is free to use the same name.
-
-**Effort:** medium. Symbol-table changes plus care around the block /
-fn-body boundary (fn params and the fn's outermost frame stay as they
-are).
+Implemented block-level scoping: `ct_lbrace` saves the symtab write
+pointer (s8) as a byte offset on the stack; `ct_blk_end` restores it,
+so all bindings introduced inside `{ }` go out of scope at `}`. Sibling
+blocks can freely reuse the same name with plain `=`. Inner blocks can
+still read/write outer-scope variables via `:=`. 11 tests added (5
+block-scoping + 6 const-scoping). Also fixed deref-write context: `@`
+prefix now forces read context at `pk_non_ws`, preventing `@UNDEF = v`
+from silently creating a new variable.
 
 ---
 

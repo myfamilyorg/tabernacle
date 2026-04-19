@@ -13507,19 +13507,7 @@ ct_blk_end:
 	addi	s2, s2, 1
 	lw	t0, 0(sp)
 	addi	sp, sp, 4
-	add	t0, s7, t0
-	addi	t1, s8, -40
-blk_cc_scan:
-	blt	t1, t0, blk_cc_done
-	lbu	t2, 38(t1)
-	addi	t3, zero, 2
-	bne	t2, t3, blk_cc_nxt
-	sb	zero, 0(t1)
-	sb	zero, 38(t1)
-blk_cc_nxt:
-	addi	t1, t1, -40
-	j	blk_cc_scan
-blk_cc_done:
+	add	s8, s7, t0
 	lla	t0, lv_kind
 	sw	zero, 0(t0)
 	lla	t0, last_was_brace

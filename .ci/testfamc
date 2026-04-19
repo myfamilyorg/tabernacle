@@ -922,6 +922,31 @@ test_output  "block expression-statement (value discarded)" \
 test_output  "double-nested block via deref store target" \
 	"p = 0x10000000; @p = { { 65 } };" "A"
 
+# Block-level variable scoping (P5): bindings introduced inside { } go out
+# of scope at }, so sibling blocks may reuse names independently.
+test_output  "block-scoped var: sibling blocks reuse name" \
+	"$(cat <<'EOT'
+fn f() {
+  1 > 0 ? { x = 65; @0x10000000 = x; }
+        : { x = 66; @0x10000000 = x; };
+}
+f();
+EOT
+)" "A"
+
+test_output  "block-scoped var: outer var survives inner block" \
+	"x = 65; { y = 1; }; @0x10000000 = x;" "A"
+
+test_output  "block-scoped var: inner block modifies outer via :=" \
+	"x := 60; { x := x + 5; }; @0x10000000 = x;" "A"
+
+test_error   "block-scoped var: inner var not visible after block" \
+	"fn f() { { y = 65; }; @0x10000000 = y; } f();" \
+	"Error:1:37 undefined variable"
+
+test_output  "block-scoped var: loop body scopes var" \
+	"fn f() { x := 0; loop { y = 1; x := x + y; x > 2 ? break; }; @0x10000000 = x + 62; } f();" "A"
+
 # ============================================================================
 echo "=== Char literals ==="
 test_output  "single char 'A'" \
