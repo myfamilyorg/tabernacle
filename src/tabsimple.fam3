@@ -1,0 +1,342 @@
+# tabsimple.fam3 -- hash a string with Gimli and print the 32-byte result.
+#
+# Usage:
+#   ./tools/fam3 src/tabsimple.fam3 bin/tabsimple
+#   ./tools/q32 bin/tabsimple
+
+.equ	UART_BASE,		0x10000000
+.equ	UART_LSR,		5
+.equ	UART_TX_READY,		0x20
+.equ	SHUTDOWN_ADDR,		0x00100000
+.equ	SHUTDOWN_VAL,		0x5555
+.equ	STACK_SIZE,		0x100000
+
+_start:
+	lla	t0, data
+	li	sp, STACK_SIZE
+	add	sp, sp, t0
+
+	# gimli_hash(data=message, len=13, out=sp-32)
+	addi	sp, sp, -32
+	lla	a0, message
+	li	a1, 13
+	mv	a2, sp
+	li	gp, 0
+	j	gimli_hash
+gh_ret:
+	# Print 8 hex words separated by spaces.
+	mv	s0, sp
+	li	s1, 0
+print_loop:
+	li	t0, 8
+	bge	s1, t0, print_done
+	lw	a0, 0(s0)
+	li	gp, 0
+	j	emit_hex8
+eh_ret:
+	li	t0, 7
+	beq	s1, t0, print_nl
+	li	a0, 32
+	j	print_sep
+print_nl:
+	li	a0, 10
+print_sep:
+	li	t0, UART_BASE
+sep_wait:
+	lbu	t1, UART_LSR(t0)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, sep_wait
+	sb	a0, 0(t0)
+	addi	s0, s0, 4
+	addi	s1, s1, 1
+	j	print_loop
+
+print_done:
+	addi	sp, sp, 32
+	li	t0, SHUTDOWN_ADDR
+	li	t1, SHUTDOWN_VAL
+	sw	t1, 0(t0)
+hang:
+	wfi
+	j	hang
+
+# ══════════════════════════════════════════════════════════════════════════
+# emit_hex8 -- write 32-bit word in a0 as 8 uppercase hex digits.
+# Dispatch: gp=0 → eh_ret.
+# ══════════════════════════════════════════════════════════════════════════
+emit_hex8:
+	addi	sp, sp, -4
+	sw	gp, 0(sp)
+	li	t4, 7
+	li	t2, UART_BASE
+eh_loop:
+	slli	t3, t4, 2
+	srl	t0, a0, t3
+	andi	t0, t0, 0xF
+	li	t1, 10
+	blt	t0, t1, eh_digit
+	addi	t0, t0, 55
+	j	eh_emit
+eh_digit:
+	addi	t0, t0, 48
+eh_emit:
+eh_wait:
+	lbu	t1, UART_LSR(t2)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, eh_wait
+	sb	t0, 0(t2)
+	addi	t4, t4, -1
+	bgez	t4, eh_loop
+	lw	gp, 0(sp)
+	addi	sp, sp, 4
+emit_hex8_disp:
+	bnez	gp, dispatch_error
+	j	eh_ret
+
+# ══════════════════════════════════════════════════════════════════════════
+# gimli_hash -- Gimli-Hash sponge (rate=16, output=32).
+#   a0 = data ptr, a1 = length, a2 = 32-byte output buffer
+# Dispatch: gp=0 → gh_ret.
+# ══════════════════════════════════════════════════════════════════════════
+gimli_hash:
+	addi	sp, sp, -24
+	sw	gp, 0(sp)
+	sw	s0, 4(sp)
+	sw	s1, 8(sp)
+	sw	s2, 12(sp)
+	sw	s3, 16(sp)
+	sw	s4, 20(sp)
+	mv	s1, a0
+	mv	s2, a1
+	mv	s3, a2
+	addi	sp, sp, -48
+	mv	s0, sp
+	sw	zero, 0(s0)
+	sw	zero, 4(s0)
+	sw	zero, 8(s0)
+	sw	zero, 12(s0)
+	sw	zero, 16(s0)
+	sw	zero, 20(s0)
+	sw	zero, 24(s0)
+	sw	zero, 28(s0)
+	sw	zero, 32(s0)
+	sw	zero, 36(s0)
+	sw	zero, 40(s0)
+	sw	zero, 44(s0)
+gh_absorb:
+	li	t0, 16
+	blt	s2, t0, gh_pad
+	lw	t0, 0(s1)
+	lw	t1, 0(s0)
+	xor	t1, t1, t0
+	sw	t1, 0(s0)
+	lw	t0, 4(s1)
+	lw	t1, 4(s0)
+	xor	t1, t1, t0
+	sw	t1, 4(s0)
+	lw	t0, 8(s1)
+	lw	t1, 8(s0)
+	xor	t1, t1, t0
+	sw	t1, 8(s0)
+	lw	t0, 12(s1)
+	lw	t1, 12(s0)
+	xor	t1, t1, t0
+	sw	t1, 12(s0)
+	mv	a0, s0
+	li	gp, 0
+	j	gimli_permute
+gpr_absorb:
+	addi	s1, s1, 16
+	addi	s2, s2, -16
+	j	gh_absorb
+gh_pad:
+	addi	sp, sp, -16
+	mv	s4, sp
+	sw	zero, 0(s4)
+	sw	zero, 4(s4)
+	sw	zero, 8(s4)
+	sw	zero, 12(s4)
+	mv	t0, s1
+	mv	t1, s4
+	mv	t2, s2
+	beqz	t2, gh_pad_mark
+gh_copy:
+	lbu	t3, 0(t0)
+	sb	t3, 0(t1)
+	addi	t0, t0, 1
+	addi	t1, t1, 1
+	addi	t2, t2, -1
+	bnez	t2, gh_copy
+gh_pad_mark:
+	add	t0, s4, s2
+	lbu	t1, 0(t0)
+	xori	t1, t1, 0x01
+	sb	t1, 0(t0)
+	lbu	t1, 15(s4)
+	xori	t1, t1, 0x80
+	sb	t1, 15(s4)
+	lw	t0, 0(s4)
+	lw	t1, 0(s0)
+	xor	t1, t1, t0
+	sw	t1, 0(s0)
+	lw	t0, 4(s4)
+	lw	t1, 4(s0)
+	xor	t1, t1, t0
+	sw	t1, 4(s0)
+	lw	t0, 8(s4)
+	lw	t1, 8(s0)
+	xor	t1, t1, t0
+	sw	t1, 8(s0)
+	lw	t0, 12(s4)
+	lw	t1, 12(s0)
+	xor	t1, t1, t0
+	sw	t1, 12(s0)
+	addi	sp, sp, 16
+	mv	a0, s0
+	li	gp, 1
+	j	gimli_permute
+gpr_pad:
+	lw	t0, 0(s0)
+	sw	t0, 0(s3)
+	lw	t0, 4(s0)
+	sw	t0, 4(s3)
+	lw	t0, 8(s0)
+	sw	t0, 8(s3)
+	lw	t0, 12(s0)
+	sw	t0, 12(s3)
+	mv	a0, s0
+	li	gp, 2
+	j	gimli_permute
+gpr_squeeze:
+	lw	t0, 0(s0)
+	sw	t0, 16(s3)
+	lw	t0, 4(s0)
+	sw	t0, 20(s3)
+	lw	t0, 8(s0)
+	sw	t0, 24(s3)
+	lw	t0, 12(s0)
+	sw	t0, 28(s3)
+	addi	sp, sp, 48
+	lw	gp, 0(sp)
+	lw	s0, 4(sp)
+	lw	s1, 8(sp)
+	lw	s2, 12(sp)
+	lw	s3, 16(sp)
+	lw	s4, 20(sp)
+	addi	sp, sp, 24
+gimli_hash_disp:
+	bnez	gp, dispatch_error
+	j	gh_ret
+
+# ══════════════════════════════════════════════════════════════════════════
+# gimli_permute -- 24-round Gimli-384 permutation (memory-based, looped).
+#   a0 = pointer to 48-byte state
+#   State layout: 3 rows × 4 columns, row-major:
+#     row 0: state[0..12], row 1: state[16..28], row 2: state[32..44]
+# Internal dispatch: gp=0 → gpr_absorb, gp=1 → gpr_pad, gp=2 → gpr_squeeze.
+# ══════════════════════════════════════════════════════════════════════════
+gimli_permute:
+	addi	sp, sp, -16
+	sw	gp, 0(sp)
+	sw	s0, 4(sp)
+	sw	s1, 8(sp)
+	sw	a0, 12(sp)		# state pointer
+	li	s0, 24			# round counter
+gp_round:
+	lw	a0, 12(sp)
+	li	s1, 0			# column counter
+gp_col:
+	lw	t3, 0(a0)		# row0
+	lw	t4, 16(a0)		# row1
+	lw	t5, 32(a0)		# row2
+	# x = rot_left(row0, 24)
+	slli	t0, t3, 24
+	srli	t1, t3, 8
+	or	t0, t0, t1
+	# y = rot_left(row1, 9)
+	slli	t1, t4, 9
+	srli	t2, t4, 23
+	or	t1, t1, t2
+	# new row0 = ((x & y) << 3) ^ z ^ y
+	and	t3, t0, t1
+	slli	t3, t3, 3
+	xor	t3, t3, t5
+	xor	t3, t3, t1
+	sw	t3, 0(a0)
+	# new row1 = ((x | z) << 1) ^ y ^ x
+	or	t4, t0, t5
+	slli	t4, t4, 1
+	xor	t4, t4, t1
+	xor	t4, t4, t0
+	sw	t4, 16(a0)
+	# new row2 = (z << 1) ^ x ^ ((y & z) << 2)
+	and	t2, t1, t5
+	slli	t2, t2, 2
+	slli	t5, t5, 1
+	xor	t5, t5, t0
+	xor	t5, t5, t2
+	sw	t5, 32(a0)
+	addi	a0, a0, 4
+	addi	s1, s1, 1
+	li	t0, 4
+	blt	s1, t0, gp_col
+	# Swaps on row 0 only.
+	lw	a0, 12(sp)
+	andi	t0, s0, 3
+	beqz	t0, gp_small_swap
+	li	t1, 2
+	beq	t0, t1, gp_big_swap
+	j	gp_round_end
+gp_small_swap:
+	lw	t0, 0(a0)
+	lw	t1, 4(a0)
+	sw	t1, 0(a0)
+	sw	t0, 4(a0)
+	lw	t0, 8(a0)
+	lw	t1, 12(a0)
+	sw	t1, 8(a0)
+	sw	t0, 12(a0)
+	li	t0, 0x9e377900
+	or	t0, t0, s0
+	lw	t1, 0(a0)
+	xor	t1, t1, t0
+	sw	t1, 0(a0)
+	j	gp_round_end
+gp_big_swap:
+	lw	t0, 0(a0)
+	lw	t1, 8(a0)
+	sw	t1, 0(a0)
+	sw	t0, 8(a0)
+	lw	t0, 4(a0)
+	lw	t1, 12(a0)
+	sw	t1, 4(a0)
+	sw	t0, 12(a0)
+gp_round_end:
+	addi	s0, s0, -1
+	bnez	s0, gp_round
+	lw	gp, 0(sp)
+	lw	s0, 4(sp)
+	lw	s1, 8(sp)
+	addi	sp, sp, 16
+gimli_permute_disp:
+	bnez	gp, gpd_1
+	j	gpr_absorb
+gpd_1:
+	li	t0, 1
+	bne	gp, t0, gpd_2
+	j	gpr_pad
+gpd_2:
+	li	t0, 2
+	bne	gp, t0, dispatch_error
+	j	gpr_squeeze
+
+dispatch_error:
+	j	dispatch_error
+
+# ══════════════════════════════════════════════════════════════════════════
+# Data
+# ══════════════════════════════════════════════════════════════════════════
+message:
+	.ascii	"Hello, world!"
+
+data:
