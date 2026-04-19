@@ -55,7 +55,7 @@
 .equ	DISK_CHUNK_SIZE,	65536
 .equ	STACK_SIZE,		0x100000
 .equ	MTIME_ADDR,		0x0200BFF8
-.equ	SEED_LIST_OFFSET,	16384
+.equ	SEED_LIST_OFFSET,	20480
 .equ	MAX_SEEDS,		16
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -305,6 +305,9 @@ ch_ret:
 hash_fail:
 	li	a0, 69
 	j	emit_code
+disk_error:
+	li	a0, 68
+	j	emit_code
 no_disk:
 	li	a0, 78
 
@@ -427,6 +430,7 @@ dr_poll:
 	lbu	t4, 0(t3)
 	beq	t4, t5, dr_poll
 	.word	0x0220000F
+	bnez	t4, disk_error
 disk_read_disp:
 	bnez	gp, dispatch_error
 	j	dr_ret_main
