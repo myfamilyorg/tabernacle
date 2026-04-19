@@ -132,29 +132,13 @@ nested blocks no longer need a trailing `;` before the next statement.
 
 ---
 
-## P7 — Single-expression body for `loop` / `for` (no braces required)
+## ~~P7 — Single-expression body for `loop` / `for` (no braces required)~~ ✓ DONE
 
-**Gap.** `loop` and `for` always require a braced block even when the
-body is a single expression. Minor papercut but it forces noise around
-one-liner control flow:
-
-```
-loop { x > y ? break : { x++; y--; }; };
-```
-
-The outer `{ }` adds nothing — `loop` already terminates at the end of
-its expression body.
-
-**Fix.** Accept `loop <expr>;` and `for IDENT in RANGE <expr>;` as
-valid single-statement forms, with braces still allowed for multi-line
-bodies. Same rule Rust / Python / many modern languages use.
-
-```
-loop x > y ? break : { x++; y--; };
-for i in 0..N @arr[i] = 0;
-```
-
-**Effort:** small. Parser tweak at the loop/for production.
+Removed the `{` requirement from both `sw_ct_loop_lbrace` and
+`sw_ct_for_lbrace`. The body is now compiled via `compile_expr_p`
+directly — if the next token is `{`, it enters `ct_lbrace` (block);
+otherwise it parses a single expression. Braces still work for multi-
+statement bodies. 6 tests added.
 
 ---
 

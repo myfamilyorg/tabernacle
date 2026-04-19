@@ -1145,6 +1145,19 @@ test_output  "asm without semicolon inside fn body" \
 	"fn f() { v := 0; asm { li t0, 65 (v=t0) } @0x10000000 = v; } f();" "A"
 test_output  "nested blocks no semicolons" \
 	"fn f() { loop { break } for i in 0..1 { @0x10000000 = 'A'; } } f();" "A"
+# Single-expression bodies (P7): loop/for accept an expression without braces.
+test_output  "loop single-expr body with break" \
+	"x := 64; loop x > 65 ? break : x++; @0x10000000 = x;" "B"
+test_output  "loop single-expr body — break with value" \
+	"v = loop 1 > 0 ? break 65; @0x10000000 = v;" "A"
+test_output  "for single-expr body" \
+	"for i in 0..3 @0x10000000 = 'A' + i;" "ABC"
+test_output  "for single-expr body — accumulate" \
+	"s := 0; for i in 1..=10 s += i; @0x10000000 = s == 55 ? 'Y' : 'N';" "Y"
+test_output  "loop braceless inside fn body" \
+	"fn f() { x := 0; loop x >= 3 ? break : x++; @0x10000000 = x + 62; } f();" "A"
+test_output  "for braceless inside fn body" \
+	"fn f() { for i in 0..3 @0x10000000 = 'X'; } f();" "XXX"
 
 # ============================================================================
 echo "=== Arrays ==="

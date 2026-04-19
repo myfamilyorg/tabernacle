@@ -5716,25 +5716,19 @@ ct_kw_loop:
 	lla	t0, break_count
 	sw	zero, 0(t0)
 
-	# Expect '{' after "loop".
-	addi	gp, zero, 32		# skip_ws site 32 = sw_ct_loop_lbrace
-	j	skip_ws
-sw_ct_loop_lbrace:
-	bge	s2, s3, ct_bad_loop_lbrace
-	lbu	t0, 0(s2)
-	addi	t1, zero, '{'
-	bne	t0, t1, ct_bad_loop_lbrace
-
 	# Record loop_start = s5 (before we emit any body code).
 	sw	s5, 8(sp)
 	lla	t0, loop_start
 	sw	s5, 0(t0)
 
-	# Compile the body as a block primary. min_bp=-2 is the statement-
-	# context sentinel — compile_expr_p stops after the block's '}' so
-	# any following binary operator (e.g. `loop{break 5} * 2`) is left
-	# to the outer expression parser rather than being absorbed as part
-	# of the loop body.
+	# Compile the body. If next char is '{', compile_expr_p enters
+	# ct_lbrace (block). Otherwise a single expression is the body.
+	# min_bp=-2 is the statement-context sentinel so a brace-terminated
+	# body stops at '}' without absorbing a trailing binop.
+	addi	gp, zero, 32		# skip_ws site 32 = sw_ct_loop_lbrace
+	j	skip_ws
+sw_ct_loop_lbrace:
+	bge	s2, s3, ct_bad_loop_lbrace
 	addi	t6, zero, -2
 	addi	gp, zero, 26		# compile_expr site 26 = ce_ct_loop_body
 	j	compile_expr_p
@@ -6944,19 +6938,11 @@ ew_ct_for_exit_jal:
 	addi	t1, t1, 1
 	sw	t1, 0(t0)
 
-	# Parse the body — must be a `{ … }` block.
+	# Parse the body. Accepts `{ … }` block or a single expression.
 	addi	gp, zero, 38		# skip_ws site 38 = sw_ct_for_lbrace
 	j	skip_ws
 sw_ct_for_lbrace:
 	bge	s2, s3, ct_bad_loop_lbrace
-	lbu	t0, 0(s2)
-	addi	t1, zero, '{'
-	bne	t0, t1, ct_bad_loop_lbrace
-	# Recurse compile_expr_p — the nud sees '{' and dispatches into
-	# ct_lbrace, which parses the block and returns with a0 = last expr.
-	# min_bp=-2 is the statement-context sentinel so the for-loop body's
-	# compile_expr_p stops after the block's '}' and doesn't absorb a
-	# trailing binary operator meant for the outer expression.
 	addi	t6, zero, -2
 	addi	gp, zero, 31		# compile_expr site 31 = ce_ct_for_body
 	j	compile_expr_p
