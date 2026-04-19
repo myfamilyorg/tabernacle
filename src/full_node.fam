@@ -1,46 +1,81 @@
 // FILE: full_node.fam
 //
-// Defines `fn main(seed_list, boot_source, bin_size)` — the node entry
-// invoked by stdlib_node.fam's _bootstrap after sp/tp/s1 are configured
-// and gp has been advanced past the appended payload.
+// Defines `fn main(seed_list, boot_source, bin_size, image_base,
+// payload_start, start_time)` — the node entry invoked by init.fam's
+// _bootstrap after sp/tp/s1 are configured and gp points past the image.
 //
-// Entry contract (from tabernacle, via stdlib_node):
-//   seed_list   = pointer to [count:u8][ip:4 port:2]* (unused here)
-//   boot_source = 0 -> loaded from disk, 1 -> loaded from network
-//   bin_size    = full image size (code + appended payload)
-//   a3          = image_base (captured inline from the register)
+// Memory discipline: by default every piece of working memory is a
+// stack-local fam array (`@arr[N]`). For page-aligned regions required
+// by virtio QUEUE_PFN, over-allocate and align the array pointer:
 //
-// Post-stdlib memory layout: gp is at end-of-image (4 KiB aligned) and
-// points at heap-growable memory. All per-request scratch (virtio queues,
-// packet buffers) is obtained from alloc().
+//     @region[N + 4095];
+//     region = (region + 4095) & 0xFFFFF000;
+//
+// alloc / alloc_page remain available as primitive gp-bump tools, but
+// they are NOT malloc. Do not call them directly from application code.
+// They exist so a slab / pool allocator can be built on top later; the
+// current code should reach zero direct call sites.
 //
 // fam note: top-level `X = Y` constants are not visible inside `fn`
 // bodies (famc scoping), so platform/protocol magic numbers are inlined
 // at the use site.
 
 // ──────────────────────────────────────────────────────────────────────
-//  alloc — 4-byte-aligned bump allocator backed by gp. Returns the old
-//  gp (i.e. the caller's newly reserved region) and advances gp by the
-//  rounded-up size.
+//  heap_guard — shared OOM terminator for alloc/alloc_page. Emits
+//  "OOM\n" via raw UART pokes (can't call emit() because fam is
+//  single-pass; emit is defined below this point in the file) then
+//  writes the QEMU virt shutdown register and halts. Unrecoverable —
+//  there is no sane pointer to return to the caller.
+// ──────────────────────────────────────────────────────────────────────
+fn heap_guard() {
+	asm {
+		li   t0, 0x10000000
+		li   t1, 'O'
+		sb   t1, 0(t0)
+		sb   t1, 0(t0)
+		li   t1, 'M'
+		sb   t1, 0(t0)
+		li   t1, 10
+		sb   t1, 0(t0)
+		li   t0, 0x00100000
+		li   t1, 0x5555
+		sw   t1, 0(t0)
+	};
+	loop { 0 };
+	0
+}
+
+// ──────────────────────────────────────────────────────────────────────
+//  alloc — 4-byte-aligned bump primitive. Reserved for slab/pool
+//  construction. NOT a general-purpose allocator — every direct call
+//  site is a leak waiting to happen because there is no free(). Trips
+//  heap_guard if the bump crosses the s1 stack-bottom line set by
+//  init.fam.
 // ──────────────────────────────────────────────────────────────────────
 fn alloc(n) {
 	n_aligned := (n + 3) & 0xFFFFFFFC;
 	old_gp := 0;
 	asm { (old_gp = gp) };
 	new_gp := old_gp + n_aligned;
+	guard := 0;
+	asm { (guard = s1) };
+	new_gp >= guard ? heap_guard() : 0;
 	asm { (gp = new_gp) };
 	old_gp
 }
 
-// Allocate n bytes at a 4 KiB boundary. Rounds gp up to the next page
-// before reserving. Required for virtio QUEUE_PFN, which takes a page
-// frame number (queue_base >>u 12) and thus ignores any sub-page offset.
+// Page-aligned variant. Same rules: slab/pool primitive only, no direct
+// app-level calls. Virtio QUEUE_PFN takes base >>u 12 so the region
+// must start on a 4 KiB boundary.
 fn alloc_page(n) {
 	n_pages := (n + 4095) & 0xFFFFF000;
 	old_gp := 0;
 	asm { (old_gp = gp) };
 	aligned_gp := (old_gp + 4095) & 0xFFFFF000;
 	new_gp := aligned_gp + n_pages;
+	guard := 0;
+	asm { (guard = s1) };
+	new_gp >= guard ? heap_guard() : 0;
 	asm { (gp = new_gp) };
 	aligned_gp
 }
@@ -69,13 +104,13 @@ fn emit_hex2(b) {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-//  emit_dec — print n as a decimal number. `buf` is caller-provided
-//  scratch of at least 16 bytes; digits are extracted low-to-high via
-//  repeated subtract-by-10 (no M-extension divide), stashed in buf, then
-//  emitted in reverse. Self-recursion isn't used because famc resolves
-//  forward fn refs only across already-compiled bodies.
+//  emit_dec — print n as a decimal number. Digits are extracted
+//  low-to-high via repeated subtract-by-10 (no M-extension divide)
+//  into a 16-byte stack-local buffer, then emitted in reverse so the
+//  printed string reads MSD first. A u32 never exceeds 10 digits.
 // ──────────────────────────────────────────────────────────────────────
-fn emit_dec(n, buf) {
+fn emit_dec(n) {
+	@buf[16];
 	count := 0;
 	m := n;
 	loop {
@@ -86,7 +121,7 @@ fn emit_dec(n, buf) {
 			r -= 10;
 			q += 1;
 		};
-		@(buf + count) = '0' + r;
+		@buf[count] = '0' + r;
 		count += 1;
 		m = q;
 		m == 0 ? break 0;
@@ -94,7 +129,7 @@ fn emit_dec(n, buf) {
 	loop {
 		count == 0 ? break 0;
 		count -= 1;
-		emit(@(buf + count));
+		emit(@buf[count]);
 	};
 	0
 }
@@ -128,19 +163,12 @@ fn find_mmio(device_id) {
 //    0x038 QUEUE_NUM        0x03C QUEUE_ALIGN      0x040 QUEUE_PFN
 //    0x050 QUEUE_NOTIFY     0x070 STATUS
 // ──────────────────────────────────────────────────────────────────────
-fn blk_init(blk) {
-	// Virtio QUEUE_PFN takes a page frame number, so the virtqueue
-	// base must be 4 KiB aligned. 16 KiB gives room for desc + avail
-	// (first page), used ring (second page, padded via queue_align),
-	// the request header (offset 8192), and the status byte.
-	scratch := alloc_page(16384);
-
-	// Zero the whole scratch region. blk_write_one always sets
-	// avail.ring[0] (not ring[avail_idx & 15]), so every subsequent
-	// request relies on the other ring slots already being 0 to route
-	// back to desc 0's chain. alloc_page returns uninitialised memory,
-	// so without this zeroing the second write gets an IOERR from the
-	// device chasing a bogus desc index.
+fn blk_init(blk, scratch) {
+	// Caller provides a 16 KiB, page-aligned scratch region. Zero it
+	// because blk_write_one only ever updates avail.ring[0]; every
+	// subsequent request depends on the other ring slots already being
+	// 0 so the device routes back to desc 0's chain. Uninitialised
+	// scratch gives the device a bogus desc index on the second write.
 	i := 0;
 	loop {
 		i == 16384 ? break 0;
@@ -164,7 +192,7 @@ fn blk_init(blk) {
 		*(blk + 0x03C) = 4096;
 		*(blk + 0x040) = scratch >>u 12;
 		*(blk + 0x070) = 15;     // | DRIVER_OK
-		result = scratch;
+		result = 1;
 	};
 	result
 }
@@ -227,8 +255,14 @@ fn blk_write_one(blk, scratch, src, bs, sector, avail_idx) {
 //  success, 'X' on any device error.
 // ──────────────────────────────────────────────────────────────────────
 fn blk_write_image(blk, bin_base, bin_size) {
-	scratch := blk_init(blk);
-	scratch == 0 ? emit('E') : {
+	// 16 KiB page-aligned scratch: desc table + avail/used rings +
+	// request header + status byte. Over-allocate by 4 KiB so we can
+	// round the base pointer up to the next page boundary — alignment
+	// is required because virtio QUEUE_PFN takes base >>u 12.
+	@scratch[20479];                // 16384 + 4095 alignment slack
+	scratch = (scratch + 4095) & 0xFFFFF000;
+	ok := blk_init(blk, scratch);
+	ok == 0 ? emit('E') : {
 		src := bin_base;
 		sector := 0;
 		remaining := bin_size;
@@ -698,16 +732,20 @@ fn handle_famc(net, tx_q, rx_buf, tx_buf, image_base, bin_size, start_avail_idx)
 fn serve(image_base, bin_size, start_time) {
 	net := find_mmio(1);
 	net == 0 ? emit('N') : {
-		// Page-aligned: virtio QUEUE_PFN encodes the queue base as a
-		// page frame number, so the queue MUST start on a 4 KiB
-		// boundary. Plain alloc() is only 4-byte aligned.
-		rx_q := alloc_page(8192);
-		tx_q := alloc_page(8192);
+		// Single page-aligned region for the net subsystem:
+		//   +0     rx_q        (8 KiB desc/avail page + used page)
+		//   +8192  tx_q        (8 KiB)
+		//   +16384 rx_buffers  (24 KiB: 16 × 1536 B, see net_init)
+		// Over-allocate by 4 KiB so we can round the base up to the
+		// next page boundary. serve() never returns, so the frame
+		// sticks around forever — same effect as a static reservation
+		// without needing the bump allocator.
+		@net_region[53247];             // 49152 + 4095 alignment slack
+		net_region = (net_region + 4095) & 0xFFFFF000;
+		rx_q := net_region;
+		tx_q := net_region + 8192;
+		rx_buffers := net_region + 16384;
 		tx_buf := tx_q + 512;
-		// 16 × 1536 B RX buffers, page-aligned region.
-		rx_buffers := alloc_page(24576);
-		// Scratch for emit_dec: at most 10 decimal digits per u32.
-		dec_buf := alloc(16);
 
 		ok := net_init(net, rx_q, tx_q, rx_buffers);
 		ok == 0 ? emit('F') : {
@@ -724,7 +762,7 @@ fn serve(image_base, bin_size, start_time) {
 			emit('S'); emit('e'); emit('r'); emit('v'); emit('e'); emit('r');
 			emit(' '); emit('s'); emit('t'); emit('a'); emit('r'); emit('t');
 			emit('e'); emit('d'); emit(' '); emit('i'); emit('n'); emit(' ');
-			emit_dec(ms, dec_buf);
+			emit_dec(ms);
 			emit(' '); emit('m'); emit('s');
 			emit(10);
 
@@ -743,10 +781,10 @@ fn serve(image_base, bin_size, start_time) {
 				now - last_report >= 100000000 ? {
 					total_reqs > prev_reqs ? {
 						emit('r'); emit('e'); emit('q'); emit('s'); emit('=');
-						emit_dec(total_reqs, dec_buf);
+						emit_dec(total_reqs);
 						emit(' ');
 						emit('c'); emit('h'); emit('u'); emit('n'); emit('k'); emit('s'); emit('=');
-						emit_dec(total_chunks, dec_buf);
+						emit_dec(total_chunks);
 						emit(10);
 						prev_reqs = total_reqs;
 						0

@@ -42,7 +42,19 @@ echo "Compiling src/full_node.fam + src/init.fam" >&2
 	-machine virt -cpu "$CPU" \
 	-nographic -bios none \
 	-device loader,file=bin/famc,addr=0x80000000 > bin/full_node
- 
+
+# famc writes error messages to stdout (which we capture as the binary).
+# A successful RV32 binary starts with the 0x00000013 nop; any error
+# text begins with 'E' (0x45 = "Error..."). Catch that here so a compile
+# failure halts the build instead of silently producing garbage bytes.
+FIRST=$(head -c 1 bin/full_node)
+if [ "$FIRST" = "E" ]; then
+	echo "tools/refresh_bin_config: famc compile failed:" >&2
+	head -c 512 bin/full_node >&2
+	echo "" >&2
+	rm -f bin/full_node
+	exit 1
+fi
 
 # Append compressed bible to the binary
 cat ./resources/bible.compressed >> ./bin/full_node
