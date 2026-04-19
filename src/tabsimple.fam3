@@ -14,6 +14,7 @@
 .equ	UART_BASE,		0x10000000
 .equ	UART_LSR,		5
 .equ	UART_TX_READY,		0x20
+.equ	UART_RX_READY,		0x01
 .equ	SHUTDOWN_ADDR,		0x00100000
 .equ	SHUTDOWN_VAL,		0x5555
 
@@ -49,26 +50,31 @@
 .equ	VIRT_DESC,		0
 .equ	VIRT_STATUS,		4608
 .equ	VIRT_REQ_HDR,		4610
-.equ	PAYLOAD_OFFSET,		16384
 .equ	SECTOR_SIZE,		512
 .equ	NEG_SECTOR_SIZE,	0xFFFFFE00
 .equ	DISK_CHUNK_SIZE,	65536
 .equ	STACK_SIZE,		0x100000
+.equ	MTIME_ADDR,		0x0200BFF8
+.equ	SEED_LIST_OFFSET,	16384
+.equ	MAX_SEEDS,		16
 
 # ══════════════════════════════════════════════════════════════════════════
 # _start
 # ══════════════════════════════════════════════════════════════════════════
 _start:
-	# sp = end of data + 1 MiB stack
+	# s11 = data region base, past the binary load area.
+	# Binary loads at endmark (end of file).
 	lla	s11, endmark
-	li	sp, STACK_SIZE
-	add	sp, sp, s11
-
-	# s11 = page-aligned data region (right after code+data)
+	li	t0, BIN_SIZE
+	add	s11, s11, t0
 	li	t0, PAGE_MASK
 	add	s11, s11, t0
 	li	t0, NEG_PAGE_SIZE
 	and	s11, s11, t0
+
+	# sp = s11 + 1 MiB
+	li	sp, STACK_SIZE
+	add	sp, sp, s11
 
 	# Zero 16 KiB queue region (4096 words).
 	mv	t0, s11
@@ -78,6 +84,108 @@ zero_loop:
 	addi	t0, t0, 4
 	addi	t1, t1, -1
 	bnez	t1, zero_loop
+
+	# -- Parse bind port + seed list from UART --------------------
+	# Format: "bind_port ip:port ip:port ...\004"
+	# Bind port saved in s4. Seeds stored at s11+SEED_LIST_OFFSET:
+	# [u8 count][6-byte entries × N]
+	li	t5, UART_BASE
+	li	s4, 0			# bind port accumulator
+	li	s6, 0			# digit accumulator
+
+	# Phase 1: read bind port (digits until space or EOT).
+port_wait:
+	lbu	t0, UART_LSR(t5)
+	andi	t0, t0, UART_RX_READY
+	beqz	t0, port_wait
+	lbu	t0, 0(t5)
+	li	t1, 4
+	beq	t0, t1, port_eot
+	li	t1, 48
+	blt	t0, t1, port_done	# non-digit = separator
+	li	t1, 58
+	bge	t0, t1, port_done
+	addi	t0, t0, -48
+	slli	t1, s6, 3
+	slli	t4, s6, 1
+	add	s6, t1, t4
+	add	s6, s6, t0
+	j	port_wait
+port_eot:
+	mv	s4, s6
+	j	parse_done
+port_done:
+	mv	s4, s6
+
+	# Phase 2: parse seed list (same as tabernacle).
+	li	t2, SEED_LIST_OFFSET
+	add	t2, s11, t2
+	addi	t2, t2, 1		# skip count byte
+	li	s5, 0			# seed count
+	li	s6, 0			# accumulator
+	li	t3, 0			# field (0-3=IP octets, 4=port)
+seed_loop:
+seed_wait:
+	lbu	t0, UART_LSR(t5)
+	andi	t0, t0, UART_RX_READY
+	beqz	t0, seed_wait
+	lbu	t0, 0(t5)
+
+	li	t1, 4			# EOT
+	beq	t0, t1, seed_eot
+
+	li	t1, 48
+	blt	t0, t1, seed_sep
+	li	t1, 58
+	bge	t0, t1, seed_sep
+	addi	t0, t0, -48
+	slli	t1, s6, 3
+	slli	t4, s6, 1
+	add	s6, t1, t4
+	add	s6, s6, t0
+	j	seed_loop
+
+seed_sep:
+	li	t1, 46
+	beq	t0, t1, seed_dot
+	li	t1, 58
+	beq	t0, t1, seed_colon
+	# Space: if field==4 we just finished a port.
+	li	t1, 4
+	bne	t3, t1, seed_reset
+	li	t1, MAX_SEEDS
+	bge	s5, t1, seed_reset
+	sh	s6, 4(t2)
+	addi	s5, s5, 1
+	addi	t2, t2, 6
+seed_reset:
+	li	s6, 0
+	li	t3, 0
+	j	seed_loop
+seed_dot:
+	li	t1, 3
+	bge	t3, t1, seed_loop
+	j	store_octet
+seed_colon:
+	li	t1, 3
+	bne	t3, t1, seed_loop
+store_octet:
+	add	t4, t2, t3
+	sb	s6, 0(t4)
+	addi	t3, t3, 1
+	li	s6, 0
+	j	seed_loop
+seed_eot:
+	li	t1, 4
+	bne	t3, t1, parse_done
+	li	t1, MAX_SEEDS
+	bge	s5, t1, parse_done
+	sh	s6, 4(t2)
+	addi	s5, s5, 1
+parse_done:
+	li	t0, SEED_LIST_OFFSET
+	add	t0, s11, t0
+	sb	s5, 0(t0)
 
 	# Scan QEMU-virt virtio MMIO slots for device_id=2 (blk).
 	li	s0, VIO_SCAN_START
@@ -126,8 +234,7 @@ found_disk:
 	# -- Read binary from disk (64 KiB blocks) --
 	addi	sp, sp, -4
 	sw	s0, 0(sp)		# stash disk base
-	li	t0, PAYLOAD_OFFSET
-	add	s0, s11, t0		# dest ptr
+	lla	s0, endmark		# dest ptr
 	li	s1, BIN_SIZE		# bytes remaining
 	li	s2, 0			# sector number
 	li	s6, 0			# avail idx
@@ -164,8 +271,7 @@ read_done:
 
 	# Hash the loaded binary.
 	addi	sp, sp, -32
-	li	t0, PAYLOAD_OFFSET
-	add	a0, s11, t0
+	lla	a0, endmark
 	li	a1, BIN_SIZE
 	mv	a2, sp
 	li	gp, 0
@@ -179,61 +285,42 @@ ch_ret:
 	addi	sp, sp, 32
 	bnez	a0, hash_fail
 
-	# Hash OK — print success.
-	lla	a0, msg_ok
-	li	gp, 0
-	j	emit_str
-es_ret_ok:
-	# Print the 8 hash words.
-	addi	sp, sp, -32
-	li	t0, PAYLOAD_OFFSET
+	# -- Set up args and jump to loaded binary --
+	# a0 = seed list pointer
+	li	t0, SEED_LIST_OFFSET
 	add	a0, s11, t0
-	li	a1, BIN_SIZE
-	mv	a2, sp
-	li	gp, 1
-	j	gimli_hash
-gh_ret_print:
-	mv	s0, sp
-	li	s1, 0
-print_loop:
-	li	t0, 8
-	bge	s1, t0, print_done
-	lw	a0, 0(s0)
-	li	gp, 0
-	j	emit_hex8
-eh_ret:
-	li	t0, 7
-	beq	s1, t0, print_nl
-	li	a0, 32
-	j	print_sep
-print_nl:
-	li	a0, 10
-print_sep:
-	li	t0, UART_BASE
-sep_wait:
-	lbu	t1, UART_LSR(t0)
-	andi	t1, t1, UART_TX_READY
-	beqz	t1, sep_wait
-	sb	a0, 0(t0)
-	addi	s0, s0, 4
-	addi	s1, s1, 1
-	j	print_loop
-print_done:
-	addi	sp, sp, 32
-	j	shutdown
+	# a1 = boot source (0 = disk)
+	li	a1, 0
+	# a2 = BIN_SIZE
+	li	a2, BIN_SIZE
+	# a3 = image base (endmark)
+	lla	a3, endmark
+	# a4 = boot start mtime
+	li	t0, MTIME_ADDR
+	lw	a4, 0(t0)
+	# a5 = bind port (parsed from UART)
+	mv	a5, s4
+	j	endmark
 
 hash_fail:
-	lla	a0, msg_fail
-	li	gp, 1
-	j	emit_str
-es_ret_fail:
-	j	shutdown
-
+	li	a0, 69
+	j	emit_code
 no_disk:
-	lla	a0, msg_no_disk
-	li	gp, 2
-	j	emit_str
-es_ret_nd:
+	li	a0, 78
+
+emit_code:
+	li	t0, UART_BASE
+ec_wait:
+	lbu	t1, UART_LSR(t0)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, ec_wait
+	sb	a0, 0(t0)
+ec_nl:
+	lbu	t1, UART_LSR(t0)
+	andi	t1, t1, UART_TX_READY
+	beqz	t1, ec_nl
+	li	t1, 10
+	sb	t1, 0(t0)
 
 shutdown:
 	li	t0, SHUTDOWN_ADDR
@@ -242,69 +329,6 @@ shutdown:
 hang:
 	wfi
 	j	hang
-
-# ══════════════════════════════════════════════════════════════════════════
-# emit_str -- write null-terminated string at a0 to the UART.
-# Dispatch: gp=0 → es_ret_ok, gp=1 → es_ret_fail, gp=2 → es_ret_nd.
-# ══════════════════════════════════════════════════════════════════════════
-emit_str:
-	mv	t3, a0
-	li	t2, UART_BASE
-es_loop:
-	lbu	t0, 0(t3)
-	beqz	t0, es_done
-es_wait:
-	lbu	t1, UART_LSR(t2)
-	andi	t1, t1, UART_TX_READY
-	beqz	t1, es_wait
-	sb	t0, 0(t2)
-	addi	t3, t3, 1
-	j	es_loop
-es_done:
-emit_str_disp:
-	bnez	gp, esd_1
-	j	es_ret_ok
-esd_1:
-	li	t0, 1
-	bne	gp, t0, esd_2
-	j	es_ret_fail
-esd_2:
-	li	t0, 2
-	bne	gp, t0, dispatch_error
-	j	es_ret_nd
-
-# ══════════════════════════════════════════════════════════════════════════
-# emit_hex8 -- write 32-bit word in a0 as 8 uppercase hex digits.
-# Dispatch: gp=0 → eh_ret.
-# ══════════════════════════════════════════════════════════════════════════
-emit_hex8:
-	addi	sp, sp, -4
-	sw	gp, 0(sp)
-	li	t4, 7
-	li	t2, UART_BASE
-eh_loop:
-	slli	t3, t4, 2
-	srl	t0, a0, t3
-	andi	t0, t0, 0xF
-	li	t1, 10
-	blt	t0, t1, eh_digit
-	addi	t0, t0, 55
-	j	eh_emit
-eh_digit:
-	addi	t0, t0, 48
-eh_emit:
-eh_wait:
-	lbu	t1, UART_LSR(t2)
-	andi	t1, t1, UART_TX_READY
-	beqz	t1, eh_wait
-	sb	t0, 0(t2)
-	addi	t4, t4, -1
-	bgez	t4, eh_loop
-	lw	gp, 0(sp)
-	addi	sp, sp, 4
-emit_hex8_disp:
-	bnez	gp, dispatch_error
-	j	eh_ret
 
 # ══════════════════════════════════════════════════════════════════════════
 # check_hash -- compare 32 bytes at a0 against BIN_HASH0..7.
@@ -410,7 +434,7 @@ disk_read_disp:
 # ══════════════════════════════════════════════════════════════════════════
 # gimli_hash -- Gimli-Hash sponge (rate=16, output=32).
 #   a0 = data ptr, a1 = length, a2 = 32-byte output buffer
-# Dispatch: gp=0 → gh_ret, gp=1 → gh_ret_print.
+# Dispatch: gp=0 → gh_ret.
 # ══════════════════════════════════════════════════════════════════════════
 gimli_hash:
 	addi	sp, sp, -24
@@ -539,12 +563,8 @@ gpr_squeeze:
 	lw	s4, 20(sp)
 	addi	sp, sp, 24
 gimli_hash_disp:
-	bnez	gp, ghd_1
+	bnez	gp, dispatch_error
 	j	gh_ret
-ghd_1:
-	li	t0, 1
-	bne	gp, t0, dispatch_error
-	j	gh_ret_print
 
 # ══════════════════════════════════════════════════════════════════════════
 # gimli_permute -- 24-round Gimli-384 permutation (memory-based, looped).
@@ -643,18 +663,4 @@ gpd_2:
 dispatch_error:
 	j	dispatch_error
 
-# ══════════════════════════════════════════════════════════════════════════
-# Data
-# ══════════════════════════════════════════════════════════════════════════
-msg_ok:
-	.ascii	"Hash verified OK\n"
-	.byte	0
-msg_fail:
-	.ascii	"Hash verification FAILED\n"
-	.byte	0
-msg_no_disk:
-	.ascii	"No virtio-blk device found\n"
-	.byte	0
-
 endmark:
-	.byte	0
