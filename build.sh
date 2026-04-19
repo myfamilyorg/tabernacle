@@ -5,17 +5,16 @@
 #
 # Stages:
 #   fam0 → fam1 → fam2 → fam3 → famc    (compiler toolchain)
-#   gen_bin_config                      (self-hosted gimli-hash + config
-#                                        generator, used by
-#                                        tools/refresh_bin_config)
+#   gen_bin_config                      (gimli-hash config generator;
+#                                        reads full_node from virtio-blk)
 #   full_node                           (the node image, compiled from
 #                                        src/full_node.fam via famc)
 #   tabernacle                          (node loader, assembled by fam3
 #                                        against the current bin_config.inc)
 #
-# Usage: run <assembler> <source...>
+# Usage: run <assembler> [--disk <image>] <source...>
 # Multiple source files are concatenated before piping to the assembler.
-# This is how tabernacle gets bin_config.inc in scope without .include.
+# --disk attaches a raw disk image via virtio-blk.
 set -e
 
 CPU="rv32,m=false,a=false,f=false,d=false,c=false,\
@@ -25,13 +24,20 @@ zcd=false,zcf=false,zcmp=false,zcmt=false,zicsr=false,zifencei=false"
 run() {
 	asm="$1"
 	shift
+	disk_args=""
+	if [ "$1" = "--disk" ]; then
+		disk_args="-drive file=$2,format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0"
+		shift 2
+	fi
 	echo "Compiling $*" >&2
-	(cat "$@"; printf '\004') | qemu-system-riscv32 \
+	([ $# -gt 0 ] && cat "$@"; printf '\004') | qemu-system-riscv32 \
 		-machine virt -cpu "$CPU" \
 		-nographic -bios none \
-		-device loader,file="$asm",addr=0x80000000
+		-device loader,file="$asm",addr=0x80000000 \
+		$disk_args
 }
 
+# Build bootstrap tool chain
 run fam0.seed src/fam0.fam0 > bin/fam0
 cmp ./bin/fam0 ./fam0.seed || { echo "fam0: binaries don't match!"; exit 1; }
 run bin/fam0 src/fam1.fam0 > bin/fam1
@@ -39,22 +45,30 @@ run bin/fam1 src/fam2.fam1 > bin/fam2
 run bin/fam2 src/fam3.fam2 > bin/fam3
 run bin/fam3 src/famc.fam3 > bin/famc
 
-# Self-hosted gimli-hash + bin_config generator (used by
-# tools/refresh_bin_config to regenerate src/bin_config.inc without python).
+# Build config and full node
 run bin/fam3 src/gen_bin_config.fam3 > bin/gen_bin_config
+run bin/famc src/full_node.fam src/init.fam > bin/full_node
 
-# Compile the node binary with the freshly-built famc. Pass the source
-# directly (no stdlib prepend) — full_node.fam emits its own UART helper
-# and doesn't need stdlib's puts.
-#run bin/famc src/full_node.fam > bin/full_node
+# Append compressed bible payload.
+cat ./resources/bible.compressed >> ./bin/full_node
 
-# Update bin config
-./tools/refresh_bin_config
+# Build raw disk image: sector 0 = 4-byte LE size header, sectors 1+ = payload.
+echo "Generating src/bin_config.inc" >&2
+SIZE=$(wc -c < bin/full_node)
+{
+	for i in 0 8 16 24; do
+		byte=$(( (SIZE >> i) & 0xFF ))
+		printf "\\$(printf '%03o' $byte)"
+	done
+	dd if=/dev/zero bs=1 count=508 2>/dev/null
+	cat bin/full_node
+} > tmp/full_node.img
 
-# Tabernacle is compiled against the checked-in src/bin_config.inc. If
-# full_node.fam has changed in a way that shifts its hash or size, the
-# checked-in bin_config is stale — run tools/refresh_bin_config and then
-# re-run build.sh.
+run bin/gen_bin_config --disk tmp/full_node.img > src/bin_config.inc
+
+rm -f tmp/full_node.img
+
+# Rebuild tabernacle against the updated bin_config.
 run bin/fam3 src/bin_config.inc src/tabernacle.fam3 > bin/tabernacle
 
 echo "Success!"

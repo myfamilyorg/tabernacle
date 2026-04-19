@@ -1,71 +1,166 @@
-# gen_bin_config.fam3 -- self-hosted replacement for tools/gen_bin_config.py.
+# gen_bin_config.fam3 -- reads full_node binary from a virtio-blk disk,
+# computes Gimli-hash, and writes bin_config.inc to stdout (UART TX).
 #
-# Reads a binary from stdin (UART RX) as a 4-byte little-endian length
-# prefix followed by exactly that many bytes, computes the Gimli-hash, and
-# writes a bin_config.inc file to stdout (UART TX).
+# Disk image layout (created by build.sh):
+#   Sector 0:  4-byte LE payload length at offset 0, rest zero-padded
+#   Sector 1+: raw payload bytes, last sector zero-padded to 512
 #
-# A length prefix (rather than an EOT sentinel like famc uses for text
-# input) is necessary here because every byte value is valid inside the
-# binary we're hashing.
-#
-# Usage (see tools/refresh_bin_config for the invocation):
-#   emit_len4 <binary>
-#   cat <binary>
-# piped into qemu with -device loader,file=bin/gen_bin_config and
-# -serial mon:stdio > src/bin_config.inc.
-#
-# The Gimli implementation (gimli_hash + gimli_permute) is a straight copy
-# of the one in tabernacle.fam3 — dispatch is via gp-based return sites,
-# matching the "no jalr, static jumps only" invariant enforced by
-# tools/no-jalr and checked against every binary we ship.
+# Usage (see build.sh):
+#   qemu-system-riscv32 ... \
+#     -device loader,file=bin/gen_bin_config,addr=0x80000000 \
+#     -drive file=tmp/full_node.img,format=raw,if=none,id=hd0 \
+#     -device virtio-blk-device,drive=hd0
 
 # ── Platform constants ───────────────────────────────────────────────────
 .equ	UART_BASE,		0x10000000
 .equ	UART_LSR,		5
 .equ	UART_TX_READY,		0x20
-.equ	UART_RX_READY,		0x01
 .equ	SHUTDOWN_ADDR,		0x00100000
 .equ	SHUTDOWN_VAL,		0x5555
 
-# Layout inside QEMU virt RAM (128 MiB starting at 0x80000000):
-#   0x80000000 .. ~0x80002000   our code + data (under 8 KiB)
-#   0x80100000 .. 0x80F00000    input region (14 MiB cap)
-#       0x80100000 .. +4        u32 LE length prefix
-#       0x80100004 .. +length   payload bytes (what we hash)
-#   0x81000000                  initial sp (grows down)
-#
-# The input is loaded directly into RAM by QEMU's `-device loader`, not
-# streamed through the UART, which on modest hosts is ~100x faster for
-# payloads in the MiB range. See tools/refresh_bin_config.
+# ── Virtio MMIO (legacy interface) ──────────────────────────────────────
+.equ	VIO_MAGIC,		0x000
+.equ	VIO_DEVICE_ID,		0x008
+.equ	VIO_DRIVER_FEATURES,	0x020
+.equ	VIO_GUEST_PAGE_SIZE,	0x028
+.equ	VIO_QUEUE_SEL,		0x030
+.equ	VIO_QUEUE_NUM,		0x038
+.equ	VIO_QUEUE_ALIGN,	0x03C
+.equ	VIO_QUEUE_PFN,		0x040
+.equ	VIO_QUEUE_NOTIFY,	0x050
+.equ	VIO_STATUS,		0x070
+.equ	VIRT_MAGIC,		0x74726976
+
+# ── Memory layout ───────────────────────────────────────────────────────
+# Virtio queue at QUEUE_BASE (page-aligned):
+#   +0x0000  descriptor table (16 × 16 bytes)
+#   +0x0100  available ring
+#   +0x1000  used ring
+#   +0x1200  disk status byte
+#   +0x1202  request header (16 bytes)
+.equ	QUEUE_BASE,		0x80004000
+.equ	VIRT_DESC,		0
+.equ	VIRT_STATUS,		4608
+.equ	VIRT_REQ_HDR,		4610
 .equ	BUF_BASE,		0x80100000
-.equ	BUF_MAX_LEN,		0x00E00000	# 14 MiB cap on payload
+.equ	BUF_MAX_LEN,		0x00E00000
 .equ	STACK_TOP,		0x81000000
 
 # ══════════════════════════════════════════════════════════════════════════
-# _start: sp, length+buffer from RAM, hash, format output, power off.
+# _start: init virtio-blk, read payload from disk, hash, format, shutdown.
 # ══════════════════════════════════════════════════════════════════════════
 _start:
-	lui	sp, 0x81000		# sp = STACK_TOP
+	lui	sp, 0x81000
 
-	# Read length prefix from the first 4 bytes placed at BUF_BASE by
-	# QEMU's -device loader, then advance s0 past the prefix so it
-	# points at the payload.
-	lui	s0, 0x80100
-	lw	s4, 0(s0)		# s4 = payload length
-	addi	s0, s0, 4		# s0 = payload start
+	# s11 = virtio queue base (page-aligned, used by disk_read)
+	lui	s11, 0x80004
 
-	# Sanity-check length vs. our 14 MiB ceiling.
+	# Zero 16 KiB queue region (4096 words).
+	addi	t0, s11, 0
+	li	t1, 4096
+zero_loop:
+	sw	zero, 0(t0)
+	addi	t0, t0, 4
+	addi	t1, t1, -1
+	bnez	t1, zero_loop
+
+	# Scan QEMU-virt virtio MMIO slots for device_id=2 (blk).
+	li	s3, 0x10008000
+scan_disk:
+	li	t0, 0x10001000
+	blt	s3, t0, no_disk
+	lw	t1, VIO_MAGIC(s3)
+	li	t2, VIRT_MAGIC
+	bne	t1, t2, scan_next
+	lw	t1, VIO_DEVICE_ID(s3)
+	li	t2, 2
+	beq	t1, t2, found_disk
+scan_next:
+	li	t0, -4096
+	add	s3, s3, t0
+	j	scan_disk
+
+found_disk:
+	# Legacy virtio-blk handshake (same sequence as tabernacle.fam3).
+	sw	zero, VIO_STATUS(s3)
+	li	t1, 1
+	sw	t1, VIO_STATUS(s3)
+	lw	t1, VIO_STATUS(s3)
+	ori	t1, t1, 2
+	sw	t1, VIO_STATUS(s3)
+	sw	zero, VIO_DRIVER_FEATURES(s3)
+	lw	t1, VIO_STATUS(s3)
+	ori	t1, t1, 8
+	sw	t1, VIO_STATUS(s3)
+	lw	t1, VIO_STATUS(s3)
+	andi	t2, t1, 8
+	beqz	t2, no_disk
+	li	t1, 4096
+	sw	t1, VIO_GUEST_PAGE_SIZE(s3)
+	sw	zero, VIO_QUEUE_SEL(s3)
+	li	t1, 16
+	sw	t1, VIO_QUEUE_NUM(s3)
+	li	t1, 4096
+	sw	t1, VIO_QUEUE_ALIGN(s3)
+	srli	t1, s11, 12
+	sw	t1, VIO_QUEUE_PFN(s3)
+	lw	t1, VIO_STATUS(s3)
+	ori	t1, t1, 4
+	sw	t1, VIO_STATUS(s3)
+
+	# -- Phase 1: read sector 0 to get payload length --
+	li	a0, 0			# sector 0
+	li	a1, 1			# avail_idx
+	lui	a2, 0x80100		# dest = BUF_BASE
+	li	a3, 512
+	li	gp, 0
+	j	disk_read
+dr_ret_hdr:
+	lui	t0, 0x80100
+	lw	s4, 0(t0)		# s4 = payload length
 	li	t0, BUF_MAX_LEN
 	bgeu	s4, t0, input_too_big
 
-read_done:
+	# -- Phase 2: read payload from sectors 1+ into BUF_BASE --
+	lui	s0, 0x80100		# dest ptr
+	addi	s1, s4, 511
+	li	t0, -512
+	and	s1, s1, t0		# bytes remaining (sector-rounded)
+	li	s2, 1			# starting sector
+	li	s6, 1			# avail idx (1 already used)
+read_loop:
+	beqz	s1, read_done
+	li	a3, 65536
+	bge	s1, a3, read_go
+	addi	a3, s1, 0
+read_go:
+	addi	a0, s2, 0		# sector
+	addi	s6, s6, 1
+	addi	a1, s6, 0		# avail idx
+	addi	a2, s0, 0		# dest
+	addi	sp, sp, -4
+	sw	a3, 0(sp)		# save chunk size
+	li	gp, 1
+	j	disk_read
+dr_ret_data:
+	lw	t0, 0(sp)		# recover chunk size
+	addi	sp, sp, 4
+	srli	t1, t0, 9		# sectors in this chunk
+	add	s2, s2, t1
+	bge	s1, t0, read_full
+	addi	t0, s1, 0
+read_full:
+	add	s0, s0, t0
+	sub	s1, s1, t0
+	j	read_loop
 
+read_done:
 	# Allocate 32-byte hash output on the stack.
 	addi	sp, sp, -32
 	addi	s3, sp, 0		# s3 = hash output ptr
 
-	# Call gimli_hash(data=s0, len=s4, out=s3).
-	addi	a0, s0, 0
+	# Call gimli_hash(data=BUF_BASE, len=s4, out=s3).
+	lui	a0, 0x80100
 	addi	a1, s4, 0
 	addi	a2, s3, 0
 	li	gp, 0			# gp=0 → gh_ret
@@ -144,6 +239,16 @@ es_ret_err:
 	sw	t1, 0(t0)
 	j	hang
 
+no_disk:
+	lla	a0, err_no_disk
+	li	gp, 6			# gp=6 → es_ret_nd
+	j	emit_str
+es_ret_nd:
+	li	t0, SHUTDOWN_ADDR
+	li	t1, SHUTDOWN_VAL
+	sw	t1, 0(t0)
+	j	hang
+
 # ══════════════════════════════════════════════════════════════════════════
 # emit_char -- write the byte in a0 (low 8 bits) to the UART.
 # Dispatch sites: gp=0 ec_ret_nlsz, gp=1 ec_ret_dig, gp=2 ec_ret_nlh.
@@ -166,7 +271,7 @@ emit_char_disp:
 
 # ══════════════════════════════════════════════════════════════════════════
 # emit_str -- write the null-terminated string at a0 to the UART.
-# Dispatch sites: gp=0..5 (see uses above).
+# Dispatch sites: gp=0..6 (see uses above).
 # Clobbers: t0, t1, t2, t3.
 # ══════════════════════════════════════════════════════════════════════════
 emit_str:
@@ -195,21 +300,19 @@ emit_str_disp:
 	beq	gp, t0, es_ret_hm
 	li	t0, 5
 	beq	gp, t0, es_ret_err
+	li	t0, 6
+	beq	gp, t0, es_ret_nd
 	j	dispatch_error
 
 # ══════════════════════════════════════════════════════════════════════════
 # emit_dec -- write the unsigned decimal value in a0 to the UART.
 # Dispatch sites: gp=0 ed_ret.
-# Strategy: repeated subtraction-by-10 to peel digits into a stack buffer
-# (LSB first), then emit in reverse. Max 10 digits for 32-bit unsigned;
-# we allocate 16 bytes of scratch.
 # Clobbers: t0..t6, a0.
 # ══════════════════════════════════════════════════════════════════════════
 emit_dec:
 	addi	sp, sp, -20
 	sw	gp, 16(sp)
 	bnez	a0, ed_nonzero
-	# Special-case: v=0 → emit single '0'.
 	li	a0, 48
 	li	t2, UART_BASE
 ed_zero_wait:
@@ -219,12 +322,10 @@ ed_zero_wait:
 	sb	a0, 0(t2)
 	j	ed_epilogue
 ed_nonzero:
-	addi	t3, sp, 16		# write ptr (grows downward inside buf)
+	addi	t3, sp, 16		# write ptr (grows downward)
 	li	t4, 0			# digit count
 ed_gen:
 	beqz	a0, ed_emit
-	# divmod by 10 via subtraction loop (max 10 iterations: a0 ∈ [0, 9]
-	# after at most 10 subtracts since remainder < 10).
 	addi	t5, zero, 0		# quotient
 	addi	t6, a0, 0		# remainder
 ed_div:
@@ -234,7 +335,6 @@ ed_div:
 	addi	t5, t5, 1
 	j	ed_div
 ed_div_done:
-	# t5 = a0/10, t6 = a0%10
 	addi	t3, t3, -1
 	addi	t6, t6, 48		# '0' + digit
 	sb	t6, 0(t3)
@@ -296,10 +396,71 @@ emit_hex8_disp:
 	j	dispatch_error
 
 # ══════════════════════════════════════════════════════════════════════════
+# disk_read -- read sectors via virtio-blk (duplicated from tabernacle).
+#   Input: a0 = starting sector, a1 = avail_idx,
+#          a2 = dest buffer, a3 = byte count
+#          s3 = disk base address, s11 = queue base
+#   Clobbers: t0..t5
+# ══════════════════════════════════════════════════════════════════════════
+disk_read:
+	li	t5, VIRT_DESC
+	add	t1, s11, t5
+	li	t3, VIRT_STATUS
+	add	t3, s11, t3
+	addi	t2, t3, 2
+
+	sw	zero, 0(t2)
+	sw	zero, 4(t2)
+	sw	a0, 8(t2)
+	sw	zero, 12(t2)
+
+	sw	t2, 0(t1)
+	sw	zero, 4(t1)
+	li	t4, 16
+	sw	t4, 8(t1)
+	li	t4, 1
+	sh	t4, 12(t1)
+	sh	t4, 14(t1)
+
+	sw	a2, 16(t1)
+	sw	zero, 20(t1)
+	sw	a3, 24(t1)
+	li	t4, 3
+	sh	t4, 28(t1)
+	li	t4, 2
+	sh	t4, 30(t1)
+
+	sw	t3, 32(t1)
+	sw	zero, 36(t1)
+	li	t4, 1
+	sw	t4, 40(t1)
+	li	t4, 2
+	sh	t4, 44(t1)
+	sh	zero, 46(t1)
+
+	addi	t4, t1, 256
+	sh	zero, 0(t4)
+	li	t5, 0xFF
+	sb	t5, 0(t3)
+	sh	a1, 2(t4)
+	sh	zero, 4(t4)
+
+	.word	0x0110000F
+	sw	zero, VIO_QUEUE_NOTIFY(s3)
+
+	li	t5, 0xFF
+dr_poll:
+	lbu	t4, 0(t3)
+	beq	t4, t5, dr_poll
+	.word	0x0220000F
+disk_read_disp:
+	beqz	gp, dr_ret_hdr
+	li	t0, 1
+	beq	gp, t0, dr_ret_data
+	j	dispatch_error
+
+# ══════════════════════════════════════════════════════════════════════════
 # gimli_hash -- Gimli-Hash sponge (rate=16, output=32).
-# Unchanged from tabernacle.fam3 except that only gp=0 (gh_ret_main) is a
-# real caller — the internal permute calls (gpr_absorb / gpr_pad /
-# gpr_squeeze) are the same as tabernacle's.
 # ══════════════════════════════════════════════════════════════════════════
 gimli_hash:
 	addi	sp, sp, -24
@@ -433,8 +594,6 @@ gimli_hash_disp:
 
 # ══════════════════════════════════════════════════════════════════════════
 # gimli_permute -- 24-round Gimli-384 permutation.
-# Register-based; state loaded from a0 at entry, stored back at exit.
-# Dispatch sites: gp=0 gpr_absorb, gp=1 gpr_pad, gp=2 gpr_squeeze.
 # ══════════════════════════════════════════════════════════════════════════
 gimli_permute:
 	addi	sp, sp, -48
@@ -607,7 +766,7 @@ dispatch_error:
 # Data: null-terminated output strings.
 # ══════════════════════════════════════════════════════════════════════════
 hdr1:
-	.ascii	"# bin_config.inc -- auto-generated by tools/refresh_bin_config\n"
+	.ascii	"# bin_config.inc -- auto-generated by gen_bin_config\n"
 	.byte	0
 hdr2:
 	.ascii	"# Hash function: gimli-hash (rate=16, capacity=32, output=32)\n"
@@ -623,4 +782,7 @@ hash_mid:
 	.byte	0
 err_too_big:
 	.ascii	"Error: input exceeds 14 MiB buffer\n"
+	.byte	0
+err_no_disk:
+	.ascii	"Error: no virtio-blk device found\n"
 	.byte	0
