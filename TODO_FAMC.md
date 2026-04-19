@@ -37,24 +37,14 @@ front-end.
 
 ---
 
-## P2 — Constants visible in fn bodies
+## ~~P2 — Constants visible in fn bodies~~ ✓ DONE
 
-**Gap.** Top-level `X = Y` assignments aren't reachable from inside fn
-bodies. `lookup_or_alloc` computes the scan floor as
-`max(s7, fn_scope_base)` (`famc.fam3:2737-2743`), so symbols below
-`fn_scope_base` are invisible. Consequence: every magic number
-(`0x10000000` UART_BASE, `0x0200BFF8` mtime, virtio MMIO offsets, eth /
-IP protocol numbers, AIMD constants…) is inlined at every call site.
-Comment apologizing for it at `full_node.fam:17`.
-
-**Workaround that works.** `macro UART { 0x10000000 }` and reference as
-`@UART()`. Ugly parentheses but functional.
-
-**Fix.** Add a dedicated `const NAME = expr;` form that bypasses the
-`fn_scope_base` cutoff. Values substitute as integer literals at use
-sites. Parse-time only; no storage, no codegen.
-
-**Effort:** small. One new keyword, one bypass in the lookup predicate.
+Implemented `const NAME = EXPR;` — compile-time constant definitions.
+Values are substituted as literals at every use site (preprocessor model,
+no runtime storage). Supports arithmetic expressions with `+ - * << >> & | ^ ~ ()`,
+hex/decimal literals, and references to previously-defined consts. Both
+`lookup` and `lookup_or_alloc` scan below `fn_scope_base` for `is_const=2`
+entries so consts are visible inside fn bodies. 21 tests added.
 
 ---
 

@@ -1844,6 +1844,86 @@ test_output "asm lla over 4 KiB distance (upper20 patch)" \
 	"asm { lla t0, msg j skip $(for i in $(seq 1 1500); do printf 'nop '; done) msg: .word 67 skip: lw t1, 0(t0) lui t2, 0x10000 sb t1, 0(t2) }" "C"
 
 # ============================================================================
+echo "=== Constants ==="
+# Top-level `const NAME = EXPR;` — compile-time constant. Value is
+# substituted as a literal at every use site (no runtime storage).
+
+test_output "const simple integer" \
+	"const X = 65; @0x10000000 = X;" "A"
+
+test_output "const hex value" \
+	"const UART = 0x10000000; @UART = 66;" "B"
+
+test_output "const arithmetic +" \
+	"const X = 60 + 7; @0x10000000 = X;" "C"
+
+test_output "const arithmetic -" \
+	"const X = 70 - 2; @0x10000000 = X;" "D"
+
+test_output "const arithmetic *" \
+	"const X = 5 * 13 + 4; @0x10000000 = X;" "E"
+
+test_output "const bitwise &" \
+	"const X = 0xFF & 70; @0x10000000 = X;" "F"
+
+test_output "const bitwise |" \
+	"const X = 64 | 7; @0x10000000 = X;" "G"
+
+test_output "const bitwise ^" \
+	"const X = 105 ^ 33; @0x10000000 = X;" "H"
+
+test_output "const shift <<" \
+	"const X = 1 << 6 + 9; @0x10000000 = X;" "I"
+
+test_output "const shift >>" \
+	"const X = 296 >> 2; @0x10000000 = X;" "J"
+
+test_output "const unary -" \
+	"const X = -(-75); @0x10000000 = X;" "K"
+
+test_output "const unary ~" \
+	"const X = ~0xFFFFFFB3; @0x10000000 = X;" "L"
+
+test_output "const parenthesized expression" \
+	"const X = (10 + 3) * 5; @0x10000000 = X;" "A"
+
+test_output "const referencing another const" \
+	"const A = 60; const B = A + 18; @0x10000000 = B;" "N"
+
+test_output "const chain of references" \
+	"const A = 10; const B = A * 7; const C = B + 9; @0x10000000 = C;" "O"
+
+test_output "const visible inside fn body" \
+	"const UART = 0x10000000; const CH = 80; fn f() { @UART = CH; } f();" "P"
+
+test_output "const multiple use sites" \
+	"const V = 81; @0x10000000 = V; @0x10000000 = V;" "QQ"
+
+test_output "const local shadows const" \
+	"const X = 65; fn f() { x := 82; @0x10000000 = x; } f();" "R"
+
+test_output "const inside fn body" \
+	"fn f() { const X = 83; @0x10000000 = X; } f();" "S"
+
+test_output "const inside fn referencing top-level const" \
+	"const BASE = 0x10000000; fn f() { const CH = 84; @BASE = CH; } f();" "T"
+
+test_output "const inside nested block" \
+	"fn f() { { const X = 85; @0x10000000 = X; }; } f();" "U"
+
+test_error  "const missing =" \
+	"const X 42;" \
+	"Error:1:9 expected '=' in const"
+
+test_error  "const bad expression token" \
+	"const X = @;" \
+	"Error:1:11 bad const expression"
+
+test_error  "const undefined reference" \
+	"const X = NOPE + 1;" \
+	"Error:1:11 undefined variable"
+
+# ============================================================================
 echo "=== Macros ==="
 # Top-level `macro NAME(args) { body }` definitions invoked as `NAME(...);`
 # at statement level. Body is C-style cut-and-paste: it can contain any

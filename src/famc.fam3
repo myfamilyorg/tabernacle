@@ -2191,7 +2191,15 @@ sw_d122:
 	bnez	gp, sw_d123
 	j	sw_cs_rept_high_after_skip
 sw_d123:
+	addi	gp, gp, -1
+	bnez	gp, sw_d124
 	j	sw_cs_rept_lbrace
+sw_d124:
+	addi	gp, gp, -1
+	bnez	gp, sw_d125
+	j	sw_const_name
+sw_d125:
+	j	sw_const_eq
 
 # ══════════════════════════════════════════════════════════════════════════════
 # emit_word — store a0 as 4 bytes at s5, advance s5.
@@ -2881,7 +2889,11 @@ pid_28:
 	bnez	gp, pid_29
 	j	pi_cs_macro_arg
 pid_29:
+	addi	gp, gp, -1
+	bnez	gp, pid_30
 	j	pi_cs_rept
+pid_30:
+	j	pi_cs_const
 
 # ══════════════════════════════════════════════════════════════════════════════
 # parse_num — parse decimal or hex at s2, returns value in a0.
@@ -3100,7 +3112,11 @@ pn_d7:
 	bnez	gp, pn_d8
 	j	pn_cs_rept_low
 pn_d8:
+	addi	gp, gp, -1
+	bnez	gp, pn_d9
 	j	pn_cs_rept_high
+pn_d9:
+	j	pn_const_eval
 
 # ══════════════════════════════════════════════════════════════════════════════
 # lookup_or_alloc — find/allocate a variable slot.
@@ -3129,7 +3145,7 @@ lookup_or_alloc:
 la_scan:
 	lla	t1, lookup_lower_bound
 	lw	t1, 0(t1)
-	blt	t0, t1, la_new
+	blt	t0, t1, la_chk_const
 	addi	t1, zero, 0
 la_cmp:
 	addi	t2, zero, 32
@@ -3156,6 +3172,41 @@ la_match:
 la_next:
 	addi	t0, t0, -40
 	j	la_scan
+
+la_chk_const:
+	# Name not found above fn_scope_base. Before allocating a new entry,
+	# scan below fn_scope_base for an is_const=2 entry. If found, return
+	# it as an existing entry (prevents shadowing a top-level const when
+	# the peek logic misidentifies the context as write).
+	lla	t1, fn_scope_base
+	lw	t1, 0(t1)
+	beqz	t1, la_new
+	add	t2, s7, t1
+	addi	t0, t2, -40
+la_chk_c_scan:
+	blt	t0, s7, la_new
+	lbu	t1, 38(t0)
+	addi	t2, zero, 2
+	bne	t1, t2, la_chk_c_nxt
+	addi	t1, zero, 0
+la_chk_c_cmp:
+	addi	t2, zero, 32
+	beq	t1, t2, la_match
+	add	t3, t0, t1
+	lbu	t4, 0(t3)
+	blt	t1, s11, la_chk_c_in
+	bnez	t4, la_chk_c_nxt
+	addi	t1, t1, 1
+	j	la_chk_c_cmp
+la_chk_c_in:
+	add	t5, s10, t1
+	lbu	t6, 0(t5)
+	bne	t4, t6, la_chk_c_nxt
+	addi	t1, t1, 1
+	j	la_chk_c_cmp
+la_chk_c_nxt:
+	addi	t0, t0, -40
+	j	la_chk_c_scan
 
 # ══════════════════════════════════════════════════════════════════════════════
 # lookup — like lookup_or_alloc but errors with "undefined variable" when the
@@ -3202,8 +3253,44 @@ lo_next:
 	addi	t0, t0, -40
 	j	lo_scan
 lo_notfound:
-	# Rewind s2 to the ident's start so the reported column points at
-	# the offending name rather than past it.
+	# Before giving up, scan below fn_scope_base for is_const entries.
+	# Top-level consts must be visible inside fn bodies even though
+	# fn_scope_base normally hides the outer scope.
+	lla	t1, fn_scope_base
+	lw	t1, 0(t1)
+	beqz	t1, lo_truly_nf
+	add	t2, s7, t1
+	addi	t0, t2, -40
+lo_const_scan:
+	blt	t0, s7, lo_truly_nf
+	lbu	t1, 38(t0)
+	addi	t2, zero, 2
+	bne	t1, t2, lo_const_nxt
+	addi	t1, zero, 0
+lo_const_cmp:
+	addi	t2, zero, 32
+	beq	t1, t2, lo_const_hit
+	add	t3, t0, t1
+	lbu	t4, 0(t3)
+	blt	t1, s11, lo_const_in
+	bnez	t4, lo_const_nxt
+	addi	t1, t1, 1
+	j	lo_const_cmp
+lo_const_in:
+	add	t5, s10, t1
+	lbu	t6, 0(t5)
+	bne	t4, t6, lo_const_nxt
+	addi	t1, t1, 1
+	j	lo_const_cmp
+lo_const_hit:
+	lla	t1, last_ident_entry
+	sw	t0, 0(t1)
+	lw	a0, 32(t0)
+	j	lookup_or_alloc_disp
+lo_const_nxt:
+	addi	t0, t0, -40
+	j	lo_const_scan
+lo_truly_nf:
 	lla	t0, ident_start
 	lw	s2, 0(t0)
 	addi	a0, zero, 35		# err 35: undefined variable
@@ -3317,7 +3404,11 @@ la_d8:
 	bnez	gp, la_d9
 	j	la_asm_out_tok1
 la_d9:
+	addi	gp, gp, -1
+	bnez	gp, la_d10
 	j	la_asm_in
+la_d10:
+	j	la_const_alloc
 
 # ══════════════════════════════════════════════════════════════════════════════
 # emit_li — emit "li a0, imm". imm passed in a0.
@@ -8638,6 +8729,361 @@ cs_bad_rept_scratch:
 	addi	a0, zero, 83		# err 83: scratch buffer overflow
 	j	report_err
 
+# ══════════════════════════════════════════════════════════════════════════════
+# cs_kw_const — compile-time constant definition.
+#   const NAME = EXPR;
+# Allocates a symtab entry with is_const=1. No frame slot; value is
+# substituted as a literal at every use site (preprocessor model).
+# ══════════════════════════════════════════════════════════════════════════════
+cs_kw_const:
+	addi	sp, sp, -4
+	sw	zero, 0(sp)		# context marker: 0 = statement level
+	addi	gp, zero, 124		# skip_ws site 124 = sw_const_name
+	j	skip_ws
+blk_kw_const:
+	addi	sp, sp, -4
+	addi	t0, zero, 1
+	sw	t0, 0(sp)		# context marker: 1 = block level
+	addi	gp, zero, 124
+	j	skip_ws
+sw_const_name:
+	addi	gp, zero, 30		# parse_ident site 30 = pi_cs_const
+	j	parse_ident
+pi_cs_const:
+	addi	gp, zero, 10		# lookup_or_alloc site 10 = la_const_alloc
+	j	la_new
+la_const_alloc:
+	addi	s9, s9, -4		# reclaim frame slot (const has no runtime storage)
+	lla	t0, last_ident_entry
+	lw	t0, 0(t0)
+	addi	sp, sp, -4
+	sw	t0, 0(sp)		# save entry ptr
+	addi	gp, zero, 125		# skip_ws site 125 = sw_const_eq
+	j	skip_ws
+sw_const_eq:
+	bge	s2, s3, cs_const_bad_eq
+	lbu	t0, 0(s2)
+	addi	t1, zero, '='
+	bne	t0, t1, cs_const_bad_eq
+	addi	s2, s2, 1
+	j	ct_const_eval
+cce_ret_const:
+	lw	t0, 0(sp)		# entry ptr
+	sw	a0, 32(t0)		# store const value
+	addi	t1, zero, 2
+	sb	t1, 38(t0)		# is_const=2 (explicit const, visible across fn scope)
+	addi	sp, sp, 4		# pop entry ptr
+	lw	t0, 0(sp)		# context marker
+	addi	sp, sp, 4		# pop marker
+	bnez	t0, ct_blk_loop		# block context → back to block loop
+	j	cs_done			# statement context → compile_stmt done
+cs_const_bad_eq:
+	addi	a0, zero, 89		# err 89: expected '=' in const
+	j	report_err
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ct_const_eval — evaluate a compile-time constant expression.
+#   Supports: integer literals (dec/hex), const name references,
+#             binary + - * << >> & | ^, unary - ~, parentheses.
+#   Left-to-right evaluation (no precedence; use parens to override).
+#   Entry: s2 at start of expression.
+#   Exit:  a0 = result value, jumps to cce_ret_const.
+#   Stack frame per nesting level: 12 bytes (acc, op, unary_flag).
+#   Top-level frame: 8 bytes (acc, op) — no unary at top.
+# ══════════════════════════════════════════════════════════════════════════════
+ct_const_eval:
+	addi	sp, sp, -8
+	sw	zero, 0(sp)		# acc = 0
+	addi	t0, zero, '+'
+	sw	t0, 4(sp)		# pending_op = '+' (first val adds to 0)
+cce_loop:
+	bge	s2, s3, cce_err_eof
+	lbu	t0, 0(s2)
+	addi	t1, zero, ' '
+	beq	t0, t1, cce_ws
+	addi	t1, zero, 9
+	beq	t0, t1, cce_ws
+	addi	t1, zero, 10
+	beq	t0, t1, cce_ws
+	addi	t1, zero, 13
+	beq	t0, t1, cce_ws
+	j	cce_dispatch
+cce_ws:
+	addi	s2, s2, 1
+	j	cce_loop
+cce_dispatch:
+	addi	a1, zero, 0		# unary flag: 0=none
+	addi	t1, zero, '-'
+	beq	t0, t1, cce_set_neg
+	addi	t1, zero, '~'
+	beq	t0, t1, cce_set_not
+	j	cce_primary
+cce_set_neg:
+	addi	a1, zero, 1		# 1=negate
+	addi	s2, s2, 1
+	j	cce_after_unary
+cce_set_not:
+	addi	a1, zero, 2		# 2=bitwise not
+	addi	s2, s2, 1
+cce_after_unary:
+	bge	s2, s3, cce_err_eof
+	lbu	t0, 0(s2)
+	addi	t1, zero, ' '
+	beq	t0, t1, cce_au_ws
+	addi	t1, zero, 9
+	beq	t0, t1, cce_au_ws
+	addi	t1, zero, 10
+	beq	t0, t1, cce_au_ws
+	addi	t1, zero, 13
+	beq	t0, t1, cce_au_ws
+	j	cce_primary
+cce_au_ws:
+	addi	s2, s2, 1
+	j	cce_after_unary
+cce_primary:
+	addi	t1, zero, '('
+	beq	t0, t1, cce_lparen
+	addi	t1, zero, '0'
+	blt	t0, t1, cce_try_id
+	addi	t1, zero, 58
+	blt	t0, t1, cce_num
+cce_try_id:
+	addi	t1, zero, '_'
+	beq	t0, t1, cce_ident
+	addi	t1, zero, 'a'
+	blt	t0, t1, cce_try_uc
+	addi	t1, zero, 123
+	blt	t0, t1, cce_ident
+cce_try_uc:
+	addi	t1, zero, 'A'
+	blt	t0, t1, cce_err_tok
+	addi	t1, zero, 91
+	blt	t0, t1, cce_ident
+	j	cce_err_tok
+
+cce_lparen:
+	addi	s2, s2, 1
+	addi	sp, sp, -12
+	sw	zero, 0(sp)		# new acc = 0
+	addi	t0, zero, '+'
+	sw	t0, 4(sp)		# new op = '+'
+	sw	a1, 8(sp)		# save outer unary flag
+	j	cce_loop
+
+cce_num:
+	addi	gp, zero, 9		# parse_num site 9 = pn_const_eval
+	j	parse_num
+pn_const_eval:
+	j	cce_apply_unary
+
+cce_ident:
+	addi	t3, s2, 0		# ident start
+cce_id_scan:
+	bge	s2, s3, cce_id_end
+	lbu	t0, 0(s2)
+	addi	t1, zero, '_'
+	beq	t0, t1, cce_id_adv
+	addi	t1, zero, 'a'
+	blt	t0, t1, cce_id_uc
+	addi	t1, zero, 123
+	blt	t0, t1, cce_id_adv
+cce_id_uc:
+	addi	t1, zero, 'A'
+	blt	t0, t1, cce_id_dig
+	addi	t1, zero, 91
+	blt	t0, t1, cce_id_adv
+cce_id_dig:
+	addi	t1, zero, '0'
+	blt	t0, t1, cce_id_end
+	addi	t1, zero, 58
+	blt	t0, t1, cce_id_adv
+	j	cce_id_end
+cce_id_adv:
+	addi	s2, s2, 1
+	j	cce_id_scan
+cce_id_end:
+	sub	t4, s2, t3		# t4 = ident length
+	beqz	t4, cce_err_tok
+	addi	t5, s8, -40
+cce_sym_scan:
+	blt	t5, s7, cce_sym_nf
+	lbu	t6, 38(t5)
+	addi	t0, zero, 2
+	bne	t6, t0, cce_sym_nxt
+	addi	t6, zero, 0
+cce_sym_cmp:
+	addi	t0, zero, 32
+	beq	t6, t0, cce_sym_hit
+	add	t0, t5, t6
+	lbu	t1, 0(t0)
+	blt	t6, t4, cce_sym_in
+	bnez	t1, cce_sym_nxt
+	addi	t6, t6, 1
+	j	cce_sym_cmp
+cce_sym_in:
+	add	t0, t3, t6
+	lbu	t2, 0(t0)
+	bne	t1, t2, cce_sym_nxt
+	addi	t6, t6, 1
+	j	cce_sym_cmp
+cce_sym_hit:
+	lw	a0, 32(t5)
+	j	cce_apply_unary
+cce_sym_nxt:
+	addi	t5, t5, -40
+	j	cce_sym_scan
+cce_sym_nf:
+	addi	s2, t3, 0		# rewind to ident start for error column
+	addi	a0, zero, 35		# err 35: undefined variable
+	j	report_err
+
+cce_apply_unary:
+	beqz	a1, cce_apply_op
+	addi	t0, zero, 1
+	beq	a1, t0, cce_do_neg
+	xori	a0, a0, -1		# bitwise not
+	j	cce_apply_op
+cce_do_neg:
+	sub	a0, zero, a0
+cce_apply_op:
+	lw	t0, 0(sp)		# acc
+	lw	t1, 4(sp)		# op
+	addi	t2, zero, '+'
+	beq	t1, t2, cce_op_add
+	addi	t2, zero, '-'
+	beq	t1, t2, cce_op_sub
+	addi	t2, zero, '*'
+	beq	t1, t2, cce_op_mul
+	addi	t2, zero, '&'
+	beq	t1, t2, cce_op_and
+	addi	t2, zero, '|'
+	beq	t1, t2, cce_op_or
+	addi	t2, zero, '^'
+	beq	t1, t2, cce_op_xor
+	addi	t2, zero, '<'
+	beq	t1, t2, cce_op_sll
+	addi	t2, zero, '>'
+	beq	t1, t2, cce_op_srl
+	j	cce_err_tok
+cce_op_add:
+	add	a0, t0, a0
+	j	cce_store_acc
+cce_op_sub:
+	sub	a0, t0, a0
+	j	cce_store_acc
+cce_op_mul:
+	addi	t2, zero, 0
+cce_mul_lp:
+	beqz	a0, cce_mul_dn
+	andi	t3, a0, 1
+	beqz	t3, cce_mul_sk
+	add	t2, t2, t0
+cce_mul_sk:
+	slli	t0, t0, 1
+	srli	a0, a0, 1
+	j	cce_mul_lp
+cce_mul_dn:
+	addi	a0, t2, 0
+	j	cce_store_acc
+cce_op_and:
+	and	a0, t0, a0
+	j	cce_store_acc
+cce_op_or:
+	or	a0, t0, a0
+	j	cce_store_acc
+cce_op_xor:
+	xor	a0, t0, a0
+	j	cce_store_acc
+cce_op_sll:
+	sll	a0, t0, a0
+	j	cce_store_acc
+cce_op_srl:
+	srl	a0, t0, a0
+cce_store_acc:
+	sw	a0, 0(sp)
+cce_op_ws:
+	bge	s2, s3, cce_done_eof
+	lbu	t0, 0(s2)
+	addi	t1, zero, ' '
+	beq	t0, t1, cce_ow
+	addi	t1, zero, 9
+	beq	t0, t1, cce_ow
+	addi	t1, zero, 10
+	beq	t0, t1, cce_ow
+	addi	t1, zero, 13
+	beq	t0, t1, cce_ow
+	j	cce_chk_op
+cce_ow:
+	addi	s2, s2, 1
+	j	cce_op_ws
+cce_chk_op:
+	addi	t1, zero, '+'
+	beq	t0, t1, cce_set_op
+	addi	t1, zero, '-'
+	beq	t0, t1, cce_set_op
+	addi	t1, zero, '*'
+	beq	t0, t1, cce_set_op
+	addi	t1, zero, '&'
+	beq	t0, t1, cce_set_op
+	addi	t1, zero, '|'
+	beq	t0, t1, cce_set_op
+	addi	t1, zero, '^'
+	beq	t0, t1, cce_set_op
+	addi	t1, zero, '<'
+	beq	t0, t1, cce_shl_op
+	addi	t1, zero, '>'
+	beq	t0, t1, cce_shr_op
+	addi	t1, zero, ';'
+	beq	t0, t1, cce_done_semi
+	addi	t1, zero, ')'
+	beq	t0, t1, cce_rparen
+	j	cce_err_tok
+cce_set_op:
+	sw	t0, 4(sp)
+	addi	s2, s2, 1
+	j	cce_loop
+cce_shl_op:
+	addi	s2, s2, 1
+	bge	s2, s3, cce_err_eof
+	lbu	t0, 0(s2)
+	addi	t1, zero, '<'
+	bne	t0, t1, cce_err_tok
+	addi	t0, zero, '<'
+	sw	t0, 4(sp)
+	addi	s2, s2, 1
+	j	cce_loop
+cce_shr_op:
+	addi	s2, s2, 1
+	bge	s2, s3, cce_err_eof
+	lbu	t0, 0(s2)
+	addi	t1, zero, '>'
+	bne	t0, t1, cce_err_tok
+	addi	t0, zero, '>'
+	sw	t0, 4(sp)
+	addi	s2, s2, 1
+	j	cce_loop
+cce_rparen:
+	addi	s2, s2, 1
+	lw	a0, 0(sp)		# inner result
+	lw	a1, 8(sp)		# saved unary flag
+	addi	sp, sp, 12		# pop paren frame
+	j	cce_apply_unary
+cce_done_semi:
+	addi	s2, s2, 1		# consume ';'
+	lw	a0, 0(sp)
+	addi	sp, sp, 8		# pop top-level frame
+	j	cce_ret_const
+cce_done_eof:
+	lw	a0, 0(sp)
+	addi	sp, sp, 8
+	j	cce_ret_const
+cce_err_eof:
+	addi	a0, zero, 90		# err 90: bad const expression
+	j	report_err
+cce_err_tok:
+	addi	a0, zero, 90
+	j	report_err
+
 cs_kw_fn:
 	# Nesting check: current_fn must be 0.
 	lla	t0, current_fn
@@ -12866,6 +13312,27 @@ blk_try_struct_decl:
 	addi	gp, zero, 16		# parse_ident site 16 = pi_blk_struct
 	j	parse_ident
 pi_blk_struct:
+	# Check for 'const' keyword before struct lookup.
+	addi	t0, zero, 5
+	bne	s11, t0, blk_not_const
+	lbu	t1, 0(s10)
+	addi	t2, zero, 'c'
+	bne	t1, t2, blk_not_const
+	lbu	t1, 1(s10)
+	addi	t2, zero, 'o'
+	bne	t1, t2, blk_not_const
+	lbu	t1, 2(s10)
+	addi	t2, zero, 'n'
+	bne	t1, t2, blk_not_const
+	lbu	t1, 3(s10)
+	addi	t2, zero, 's'
+	bne	t1, t2, blk_not_const
+	lbu	t1, 4(s10)
+	addi	t2, zero, 't'
+	bne	t1, t2, blk_not_const
+	addi	sp, sp, 4		# pop saved s2 from blk_try_struct_decl
+	j	blk_kw_const
+blk_not_const:
 	addi	gp, zero, 5		# struct_lookup site 5 = stlk_blk_struct
 	j	struct_lookup
 stlk_blk_struct:
@@ -15212,6 +15679,26 @@ pi_cs_not_macro:
 	bne	t1, t2, pi_cs_not_rept
 	j	cs_kw_rept
 pi_cs_not_rept:
+	# 'const' (5 chars) — compile-time constant definition.
+	addi	t0, zero, 5
+	bne	s11, t0, pi_cs_not_const
+	lbu	t1, 0(s10)
+	addi	t2, zero, 'c'
+	bne	t1, t2, pi_cs_not_const
+	lbu	t1, 1(s10)
+	addi	t2, zero, 'o'
+	bne	t1, t2, pi_cs_not_const
+	lbu	t1, 2(s10)
+	addi	t2, zero, 'n'
+	bne	t1, t2, pi_cs_not_const
+	lbu	t1, 3(s10)
+	addi	t2, zero, 's'
+	bne	t1, t2, pi_cs_not_const
+	lbu	t1, 4(s10)
+	addi	t2, zero, 't'
+	bne	t1, t2, pi_cs_not_const
+	j	cs_kw_const
+pi_cs_not_const:
 	# 'fn' (2 chars) — function definition — stays at statement level.
 	addi	t0, zero, 2
 	bne	s11, t0, pi_cs_not_fn
@@ -17942,6 +18429,14 @@ err_tbl:
 	.byte	1, 25
 	.ascii	"value-stack pop underflow"
 	.zero	5
+	# slot 89 — raw: expected '=' in const
+	.byte	1, 21
+	.ascii	"expected '=' in const"
+	.zero	9
+	# slot 90 — raw: bad const expression
+	.byte	1, 20
+	.ascii	"bad const expression"
+	.zero	10
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Register name tables for asm blocks.
