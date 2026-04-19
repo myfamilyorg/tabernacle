@@ -981,6 +981,9 @@ EOT
 test_output  "immut shadow: nested blocks restore correctly" \
 	"x = 65; { x = 66; { x = 67; }; @0x10000000 = x; }; @0x10000000 = x;" "BA"
 
+test_output  "immut shadow: = to mutable outer modifies (no shadow)" \
+	"x := 65; { x = 66; }; @0x10000000 = x;" "B"
+
 # ============================================================================
 echo "=== Char literals ==="
 test_output  "single char 'A'" \

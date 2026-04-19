@@ -3170,6 +3170,8 @@ la_match:
 	lla	t3, block_scope_base
 	lw	t3, 0(t3)
 	bge	t2, t3, la_match_use
+	lbu	t4, 37(t0)
+	bnez	t4, la_match_use
 	j	la_new
 la_match_use:
 	lla	t1, last_ident_entry
