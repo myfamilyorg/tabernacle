@@ -292,9 +292,11 @@ else
 		SERVER_PID=$!
 		sleep 0.5
 
-		# Run tabernacle: no disk, virtio-net only.
-		# Seed list "10.0.2.2:3737" via UART stdin.
-		got=$(printf '10.0.2.2:3737\004' | timeout -k 2 30 \
+		# Run tabernacle: no disk, virtio-net only. Seed list via UART
+		# stdin. Tabernacle echoes "-> <host>\n" before downloading, so
+		# the payload's 'L' marker lands after that prefix — scan the
+		# full output rather than just byte 0.
+		out=$(printf '10.0.2.2:3737\004' | timeout -k 2 30 \
 			qemu-system-riscv32 \
 			-machine virt -cpu "$CPU" \
 			-nographic -bios none \
@@ -302,16 +304,15 @@ else
 			-global virtio-mmio.force-legacy=true \
 			-netdev user,id=n0 \
 			-device virtio-net-device,netdev=n0 \
-			-serial stdio -monitor none 2>/dev/null \
-			| head -c 1)
+			-serial stdio -monitor none 2>/dev/null)
 
 		kill "$SERVER_PID" 2>/dev/null
 		wait "$SERVER_PID" 2>/dev/null
 
-		if [[ "$got" == "L" ]]; then
+		if [[ "$out" == *L* ]]; then
 			record_pass "$name"
 		else
-			record_fail "$name" "got '$(echo -n "$got" | xxd -p)' (expected 'L'=4c)"
+			record_fail "$name" "no 'L' in output: '$(echo -n "$out" | xxd -p | head -c 80)'"
 		fi
 	fi
 fi
