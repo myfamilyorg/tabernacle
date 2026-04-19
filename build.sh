@@ -29,7 +29,7 @@ run() {
 		disk_args="-drive file=$2,format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0"
 		shift 2
 	fi
-	echo "Compiling $*" >&2
+	[ $# -gt 0 ] && echo "Compiling $*" >&2
 	([ $# -gt 0 ] && cat "$@"; printf '\004') | qemu-system-riscv32 \
 		-machine virt -cpu "$CPU" \
 		-nographic -bios none \
