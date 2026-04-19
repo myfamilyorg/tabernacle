@@ -13500,9 +13500,14 @@ sw_ct_blk_sep:
 	addi	t1, zero, '}'
 	beq	t0, t1, ct_blk_end
 	addi	t1, zero, ';'
-	bne	t0, t1, ct_bad_brace_sep
+	bne	t0, t1, blk_sep_chk_brace
 	addi	s2, s2, 1
 	j	ct_blk_loop
+blk_sep_chk_brace:
+	lla	t1, last_was_brace
+	lw	t1, 0(t1)
+	bnez	t1, ct_blk_loop
+	j	ct_bad_brace_sep
 ct_blk_end:
 	addi	s2, s2, 1
 	lw	t0, 0(sp)

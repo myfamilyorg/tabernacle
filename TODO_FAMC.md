@@ -120,31 +120,15 @@ from silently creating a new variable.
 
 ---
 
-## P6 — Optional `;` after `loop` / `for` bodies
+## ~~P6 — Optional `;` after `loop` / `for` bodies~~ ✓ DONE
 
-**Gap.** In some statement positions, a trailing `;` is required after
-`loop { ... }` / `for ... { ... }` even though the braces are already
-unambiguous block delimiters. Ends up looking like:
-
-```
-loop {
-    @(UART + 5) & 0x20 ? break;
-};                               // this ; shouldn't be required
-scratch = (scratch + 4095) & 0xFFFFF000;
-```
-
-Fine when the rule is consistent, but fn bodies don't need the trailing
-`;` after a final `}` (see fn-body tests in `.ci/testfamc`), so the
-inconsistency catches you out when refactoring between the two
-contexts.
-
-**Fix.** Treat the closing `}` of `loop` / `for` as a statement
-terminator in any statement position, same as a fn body. `;` stays
-accepted for the cases where a chain of expressions really does want
-it, but is not required to separate a braced block from the next
-statement.
-
-**Effort:** small. Statement-level parser tweak.
+The top-level statement parser (`compile_stmt`) already checked
+`last_was_brace` and made `;` optional. The bug was in the block-
+expression separator (`sw_ct_blk_sep`), which required `;` or `}`
+with no `last_was_brace` fallback. Added that check so `loop { }`,
+`for { }`, `asm { }`, and plain `{ }` blocks inside fn bodies and
+nested blocks no longer need a trailing `;` before the next statement.
+4 tests added.
 
 ---
 

@@ -1137,6 +1137,14 @@ test_output  "for without trailing semicolon" \
 	"for i in 0..3 { @0x10000000 = 'A' + i } @0x10000000 = '!';" "ABC!"
 test_output  "block without trailing semicolon" \
 	"x = { 65 } @0x10000000 = x;" "A"
+test_output  "loop without semicolon inside fn body" \
+	"fn f() { loop { break } @0x10000000 = 65; } f();" "A"
+test_output  "for without semicolon inside fn body" \
+	"fn f() { for i in 0..3 { @0x10000000 = 'A' + i; } @0x10000000 = '!'; } f();" "ABC!"
+test_output  "asm without semicolon inside fn body" \
+	"fn f() { v := 0; asm { li t0, 65 (v=t0) } @0x10000000 = v; } f();" "A"
+test_output  "nested blocks no semicolons" \
+	"fn f() { loop { break } for i in 0..1 { @0x10000000 = 'A'; } } f();" "A"
 
 # ============================================================================
 echo "=== Arrays ==="
