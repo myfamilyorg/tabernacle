@@ -12,27 +12,7 @@ self-recursion, per-line error reporting, up to 8 fn args.
 
 ---
 
-## P1 — Error channel confuses the build
-
-**Bug.** famc writes compile errors to stdout. The build script captures
-stdout as `bin/full_node`, so an error produces a file whose first bytes
-are `Error: full_node.fam:262:3 undefined variable...`. No exit code
-distinction, no crash — the build "succeeds," tabernacle then fails to
-execute it and hangs silently.
-
-**Symptom.** Caused a multi-hour debugging session. Worked around in
-`tools/refresh_bin_config` by sniffing for `E` as the first byte and
-dumping + exiting non-zero.
-
-**Fix.** Write errors to **stderr**, not stdout. Exit with a non-zero
-status on any compile error. Caller scripts then don't need the sniff
-hack.
-
-**Effort:** small (few sites in `report_err` / `famc.fam3:16664-16858`).
-
----
-
-## P2 — Forward function declarations
+## P1 — Forward function declarations
 
 **Gap.** `ct_fn_call` (`famc.fam3:11605-11633`) does a direct lookup;
 callee must be defined **earlier in the source** than caller.
@@ -57,7 +37,7 @@ front-end.
 
 ---
 
-## P3 — Constants visible in fn bodies
+## P2 — Constants visible in fn bodies
 
 **Gap.** Top-level `X = Y` assignments aren't reachable from inside fn
 bodies. `lookup_or_alloc` computes the scan floor as
@@ -78,7 +58,7 @@ sites. Parse-time only; no storage, no codegen.
 
 ---
 
-## P4 — Array sizes should accept expressions, not just literals
+## P3 — Array sizes should accept expressions, not just literals
 
 **Gap.** `@arr[16384 + 4095]` silently parses as an array **access** of
 an undefined variable rather than a declaration, because famc only
@@ -110,7 +90,7 @@ stretch.
 
 ---
 
-## P5 — Array alignment directive (nice-to-have)
+## P4 — Array alignment directive (nice-to-have)
 
 **Gap.** Page-aligned regions for virtio `QUEUE_PFN` require the
 over-allocate-and-mask pattern:
@@ -120,8 +100,10 @@ over-allocate-and-mask pattern:
 region = (region + 4095) & 0xFFFFF000;
 ```
 
-Wastes up to 4 KiB per site and readers have to pattern-match. A direct
-alignment declaration would be cleaner:
+Both approaches over-allocate identically to guarantee alignment, so
+there's no space saving — but the manual mask is boilerplate that
+readers have to pattern-match. A direct alignment declaration would be
+cleaner:
 
 ```
 @region[49152] align 4096;
@@ -135,7 +117,7 @@ bumps the offset to the next multiple of N before placing the array.
 
 ---
 
-## P6 — Block-level variable scoping (currently fn-level)
+## P5 — Block-level variable scoping (currently fn-level)
 
 **Gap.** Variable bindings are scoped to the **enclosing function**, not
 to the nearest `{}`. Consequence: two sibling branches that each do
@@ -167,7 +149,7 @@ are).
 
 ---
 
-## P7 — Optional `;` after `loop` / `for` bodies
+## P6 — Optional `;` after `loop` / `for` bodies
 
 **Gap.** In some statement positions, a trailing `;` is required after
 `loop { ... }` / `for ... { ... }` even though the braces are already
@@ -195,7 +177,7 @@ statement.
 
 ---
 
-## P8 — Single-expression body for `loop` / `for` (no braces required)
+## P7 — Single-expression body for `loop` / `for` (no braces required)
 
 **Gap.** `loop` and `for` always require a braced block even when the
 body is a single expression. Minor papercut but it forces noise around
@@ -221,7 +203,7 @@ for i in 0..N @arr[i] = 0;
 
 ---
 
-## P9 — Comma operator
+## P8 — Comma operator
 
 **Gap.** fam has no way to sequence side-effecting expressions inside a
 place where a single expression is required (ternary branch, fn arg,
