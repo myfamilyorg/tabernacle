@@ -135,6 +135,19 @@ fn blk_init(blk) {
 	// the request header (offset 8192), and the status byte.
 	scratch := alloc_page(16384);
 
+	// Zero the whole scratch region. blk_write_one always sets
+	// avail.ring[0] (not ring[avail_idx & 15]), so every subsequent
+	// request relies on the other ring slots already being 0 to route
+	// back to desc 0's chain. alloc_page returns uninitialised memory,
+	// so without this zeroing the second write gets an IOERR from the
+	// device chasing a bogus desc index.
+	i := 0;
+	loop {
+		i == 16384 ? break 0;
+		*(scratch + i) = 0;
+		i += 4;
+	};
+
 	*(blk + 0x070) = 0;        // RESET
 	*(blk + 0x070) = 1;        // ACK
 	*(blk + 0x070) = 3;        // ACK | DRIVER
@@ -146,7 +159,8 @@ fn blk_init(blk) {
 	(*(blk + 0x070) & 8) == 0 ? result = 0 : {
 		*(blk + 0x028) = 4096;
 		*(blk + 0x030) = 0;      // select queue 0
-		*(blk + 0x038) = 16;     // queue size
+		*(blk + 0x038) = 16;     // queue size: 3+ required for
+		                          // header/data/status chain.
 		*(blk + 0x03C) = 4096;
 		*(blk + 0x040) = scratch >>u 12;
 		*(blk + 0x070) = 15;     // | DRIVER_OK
@@ -790,24 +804,6 @@ fn serve(image_base, bin_size, start_time) {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-//  debug_dump_hex20 — hex-dump the first 20 bytes at ptr, framed in
-//  brackets and terminated with a newline. Purely diagnostic.
-// ──────────────────────────────────────────────────────────────────────
-fn debug_dump_hex20(ptr) {
-	emit('[');
-	i := 0;
-	loop {
-		i == 20 ? break 0;
-		emit_hex2(@(ptr + i));
-		emit(' ');
-		i += 1;
-	};
-	emit(']');
-	emit(10);
-	0
-}
-
-// ──────────────────────────────────────────────────────────────────────
 //  main — node entry.
 //    seed_list     : pointer to tabernacle's [count:u8][ip:4 port:2]*
 //    boot_source   : 0 = loaded from disk, 1 = loaded from network
@@ -817,24 +813,15 @@ fn debug_dump_hex20(ptr) {
 //                    (captured by init_env before gp was advanced)
 // ──────────────────────────────────────────────────────────────────────
 fn main(seed_list, boot_source, bin_size, image_base, payload_start, start_time) {
-	// start_time is captured by tabernacle's _start just after its
-	// mem_zero loop, so "Server started in N ms" reports total wall
-	// time from boot entry to serve-ready (download + hash + exec +
-	// node init), not just the node-internal slice.
-
-	// Sanity-dump the first 20 bytes of the payload so a run can
-	// visually confirm the appended data is readable at the address
-	// init_env preserved for us.
-	debug_dump_hex20(payload_start);
-
-	// Dispatch: disk boot → 'L', no virtio-blk → 'E', network boot →
-	// write-to-disk.
+	// start_time flows in from tabernacle via a5 (see init.fam), so
+	// "Server started in N ms" measures total wall time from tabernacle
+	// _start through to serve-ready.
 	blk := find_mmio(2);
+	// Dispatch: disk boot → 'L', no virtio-blk → 'E', network boot →
+	// write-to-disk (blk_write_image prints 'W' or 'X' on exit).
 	boot_source == 0 ? emit('L') : blk == 0 ? emit('E') : {
 		blk_write_image(blk, image_base, bin_size)
 	};
-
-	// Become a FAMC chunk server. Never returns.
 	serve(image_base, bin_size, start_time);
 	0
 }

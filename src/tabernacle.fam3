@@ -73,6 +73,13 @@
 .equ	SSTHRESH_INIT,		128
 .equ	BATCH_IDLE_TICKS,	1000000		# 100 ms at 10 MHz
 
+# Fast-fail: if no chunks at all have arrived after this long, the host
+# is almost certainly unreachable (dead, firewalled, bad IP). Don't burn
+# the full DEADLINE_TICKS waiting on it. 20 s is short enough that a
+# human iterating feels it, long enough to tolerate one IP-level
+# retransmit and a slow cold cache on the remote.
+.equ	FAST_FAIL_TICKS,	200000000	# 20 s at 10 MHz
+
 # virtio-net RX queue depth. Must be a power of two; used.ring index and
 # avail.ring reposts wrap at `idx & (RX_QUEUE_NUM - 1)`. 16 is comfortably
 # above any realistic in-one-kick burst of paced 1400-byte packets from
@@ -567,6 +574,14 @@ aimd_round:
 	sub	t0, t6, ra
 	li	t1, DEADLINE_TICKS
 	bgeu	t0, t1, host_failed
+
+	# Fast-fail: zero chunks received after FAST_FAIL_TICKS → unreachable.
+	# Only fires when s3 is still 0 for this host; any progress resets
+	# the check on the next host via the `li s3, 0` at try_next_host.
+	bnez	s3, no_fast_fail
+	li	t1, FAST_FAIL_TICKS
+	bgeu	t0, t1, host_failed
+no_fast_fail:
 
 	# Scan bitmap for first unreceived chunk → a0 = batch_start.
 	li	a0, 0
