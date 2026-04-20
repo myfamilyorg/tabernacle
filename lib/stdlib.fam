@@ -1,7 +1,7 @@
 // FILE: stdlib.fam
 
 fn exit(code) {
-	*(0x00100000) = (code << 16) | 0x3333;
+	*(0x00100000) = (code << 16) | (code ? 0x3333: 0x5555);
 	loop asm { wfi };
 }
 
@@ -14,7 +14,7 @@ fn puts(s) {
 }
 
 fn putc(c) {
-	UART = 0x10000000;
+	const UART = 0x10000000;
 	loop {
 		@(UART + 5) & 0x20 ? break;
 	};
@@ -64,12 +64,31 @@ fn alloc(n) {
 	old_gp
 }
 
-// Setup stack/heap with guard
+struct Args { a0, a1, a2, a3, a4, a5, a6, a7 }
+
+// Setup stack/heap with guard, then save a0-a7 to stack.
+// Store the args block pointer at a fixed scratch address
+// (0x80200000) so _start can retrieve it after sp has moved.
 asm {
-	li t0, 0x1000000 // add 16 MiB to the stack pointer
+	li t0, 0x4000000
 	add sp, sp, t0
-	li t0, 0x400000 // 4 MiB stack / heap top
+	li t0, 0x400000
 	sub s1, sp, t0
+	addi sp, sp, -32
+	sw a0, 0(sp)
+	sw a1, 4(sp)
+	sw a2, 8(sp)
+	sw a3, 12(sp)
+	sw a4, 16(sp)
+	sw a5, 20(sp)
+	sw a6, 24(sp)
+	sw a7, 28(sp)
+	lui t0, 0x80200
+	sw sp, 0(t0)
 }
 
-exit(main());
+fn _start() {
+	args = *(0x80200000);
+	exit(main(args));
+}
+_start();
