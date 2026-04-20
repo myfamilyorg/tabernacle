@@ -212,7 +212,7 @@ fi
 
 # Smoke test: simplest valid program must compile, run, and exit cleanly.
 echo "Smoke test..."
-compile "x = 0;" > "$TMPDIR/smoke.bin" 2>&1 || true
+compile "fn main() { x = 0; } main();" > "$TMPDIR/smoke.bin" 2>&1 || true
 if ! check_bin "$TMPDIR/smoke.bin"; then
 	echo "Smoke test failed: $(head -c40 "$TMPDIR/smoke.bin" | xxd -p)"
 	exit 1
@@ -234,43 +234,43 @@ test_output  "two-digit hex"         "@0x10000000 = 0x42;" "B"
 
 # ============================================================================
 echo "=== Variables ==="
-test_output  "assign and use"        "x = 65; @0x10000000 = x;"                "A"
-test_output  "reassign same slot"    "x := 1; x := 65; @0x10000000 = x;"         "A"
-test_output  "two variables"         "x = 60; y = 5; @0x10000000 = x + y;"     "A"
-test_output  "var copies other"      "x = 65; y = x; @0x10000000 = y;"         "A"
-test_output  "underscore in ident"   "my_var = 65; @0x10000000 = my_var;"      "A"
-test_output  "digits in ident"       "x1 = 60; x2 = 5; @0x10000000 = x1 + x2;" "A"
-test_output  "uppercase in ident"    "Foo = 65; @0x10000000 = Foo;"            "A"
+test_output  "assign and use"        "fn main() { x = 65; @0x10000000 = x; } main();"                "A"
+test_output  "reassign same slot"    "fn main() { x := 1; x := 65; @0x10000000 = x; } main();"         "A"
+test_output  "two variables"         "fn main() { x = 60; y = 5; @0x10000000 = x + y; } main();"     "A"
+test_output  "var copies other"      "fn main() { x = 65; y = x; @0x10000000 = y; } main();"         "A"
+test_output  "underscore in ident"   "fn main() { my_var = 65; @0x10000000 = my_var; } main();"      "A"
+test_output  "digits in ident"       "fn main() { x1 = 60; x2 = 5; @0x10000000 = x1 + x2; } main();" "A"
+test_output  "uppercase in ident"    "fn main() { Foo = 65; @0x10000000 = Foo; } main();"            "A"
 
 # ============================================================================
 echo "=== Addition ==="
 test_output  "literal + literal"     "@0x10000000 = 60 + 5;"                             "A"
-test_output  "var + literal"         "x = 60; @0x10000000 = x + 5;"                      "A"
-test_output  "literal + var"         "x = 5; @0x10000000 = 60 + x;"                      "A"
-test_output  "var + var"             "x = 60; y = 5; @0x10000000 = x + y;"               "A"
-test_output  "3-operand chain"       "a = 10; b = 40; c = 15; @0x10000000 = a + b + c;"  "A"
-test_output  "4-operand chain"       "a = 10; b = 20; c = 15; d = 20; @0x10000000 = a + b + c + d;"  "A"
+test_output  "var + literal"         "fn main() { x = 60; @0x10000000 = x + 5; } main();"                      "A"
+test_output  "literal + var"         "fn main() { x = 5; @0x10000000 = 60 + x; } main();"                      "A"
+test_output  "var + var"             "fn main() { x = 60; y = 5; @0x10000000 = x + y; } main();"               "A"
+test_output  "3-operand chain"       "fn main() { a = 10; b = 40; c = 15; @0x10000000 = a + b + c; } main();"  "A"
+test_output  "4-operand chain"       "fn main() { a = 10; b = 20; c = 15; d = 20; @0x10000000 = a + b + c + d; } main();"  "A"
 test_output  "8-operand chain" \
-	"a = 10; b = 10; c = 10; d = 10; e = 10; f = 5; g = 5; h = 5; @0x10000000 = a + b + c + d + e + f + g + h;" "A"
+	"fn main() { a = 10; b = 10; c = 10; d = 10; e = 10; f = 5; g = 5; h = 5; @0x10000000 = a + b + c + d + e + f + g + h; } main();" "A"
 test_output  "nested temps" \
-	"a = 10; b = 20; c = 15; d = 20; e = a + b; f = c + d; @0x10000000 = e + f;"  "A"
+	"fn main() { a = 10; b = 20; c = 15; d = 20; e = a + b; f = c + d; @0x10000000 = e + f; } main();"  "A"
 
 # ============================================================================
 echo "=== Byte deref (@) ==="
 test_output  "byte store literal"    "@0x10000000 = 65;"                       "A"
-test_output  "byte store via var"    "p = 0x10000000; @p = 65;"                "A"
-test_output  "byte store with expr"  "p = 0x10000000; @p = 60 + 5;"            "A"
-test_output  "byte round-trip RAM"   "p = 0x80200000; @p = 65; @0x10000000 = @p;"  "A"
-test_output  "byte load into var"    "@0x80200000 = 65; x = @0x80200000; @0x10000000 = x;"  "A"
+test_output  "byte store via var"    "fn main() { p = 0x10000000; @p = 65; } main();"                "A"
+test_output  "byte store with expr"  "fn main() { p = 0x10000000; @p = 60 + 5; } main();"            "A"
+test_output  "byte round-trip RAM"   "fn main() { p = 0x80200000; @p = 65; @0x10000000 = @p; } main();"  "A"
+test_output  "byte load into var"    "fn main() { @0x80200000 = 65; x = @0x80200000; @0x10000000 = x; } main();"  "A"
 test_output  "byte arithmetic"       "@0x80200000 = 60; @0x10000000 = @0x80200000 + 5;"    "A"
 
 # ============================================================================
 echo "=== Word deref (*) ==="
 test_compiles "word store literal"   "*0x80200000 = 65;"
-test_compiles "word store via var"   "p = 0x80200000; *p = 65;"
-test_output  "word round-trip"       "p = 0x80200000; *p = 65; @0x10000000 = *p;"         "A"
+test_compiles "word store via var"   "fn main() { p = 0x80200000; *p = 65; } main();"
+test_output  "word round-trip"       "fn main() { p = 0x80200000; *p = 65; @0x10000000 = *p; } main();"         "A"
 test_output  "word then byte read"   "*0x80200000 = 65; @0x10000000 = @0x80200000;"       "A"
-test_output  "word store with expr"  "p = 0x80200000; *p = 60 + 5; @0x10000000 = @p;"     "A"
+test_output  "word store with expr"  "fn main() { p = 0x80200000; *p = 60 + 5; @0x10000000 = @p; } main();"     "A"
 
 # ============================================================================
 echo "=== Multi-statement output ==="
@@ -278,26 +278,26 @@ test_output  "two chars"             "@0x10000000 = 72; @0x10000000 = 105;"     
 test_output  "five chars (Hello)" \
 	"@0x10000000 = 72; @0x10000000 = 101; @0x10000000 = 108; @0x10000000 = 108; @0x10000000 = 111;"      "Hello"
 test_output  "uart via variable" \
-	"u = 0x10000000; @u = 72; @u = 105;" "Hi"
-test_output  "the pass-1 example"    "x = 1; y = x + 48; @0x10000000 = y;" "1"
+	"fn main() { u = 0x10000000; @u = 72; @u = 105; } main();" "Hi"
+test_output  "the pass-1 example"    "fn main() { x = 1; y = x + 48; @0x10000000 = y; } main();" "1"
 
 # ============================================================================
 echo "=== Stack machine stress ==="
 # Many sequential stores, each with their own + chain. Exercises the stack
 # machine push/pop pattern plus variable slot reuse.
 test_output  "sequential ascii 0..9" \
-	"b = 48; @0x10000000 = b + 0; @0x10000000 = b + 1; @0x10000000 = b + 2; @0x10000000 = b + 3; @0x10000000 = b + 4; @0x10000000 = b + 5; @0x10000000 = b + 6; @0x10000000 = b + 7; @0x10000000 = b + 8; @0x10000000 = b + 9;" \
+	"fn main() { b = 48; @0x10000000 = b + 0; @0x10000000 = b + 1; @0x10000000 = b + 2; @0x10000000 = b + 3; @0x10000000 = b + 4; @0x10000000 = b + 5; @0x10000000 = b + 6; @0x10000000 = b + 7; @0x10000000 = b + 8; @0x10000000 = b + 9; } main();" \
 	"0123456789"
 
 # Long + chain that definitely exceeds what a one-temp accumulator could
 # handle (the old code would have clobbered an LHS). 16 operands.
 test_output  "16-operand add chain" \
-	"a = 4; b = 4; c = 4; d = 4; e = 4; f = 4; g = 4; h = 4; i = 4; j = 4; k = 4; l = 4; m = 4; n = 4; o = 4; p = 5; @0x10000000 = a + b + c + d + e + f + g + h + i + j + k + l + m + n + o + p;" \
+	"fn main() { a = 4; b = 4; c = 4; d = 4; e = 4; f = 4; g = 4; h = 4; i = 4; j = 4; k = 4; l = 4; m = 4; n = 4; o = 4; p = 5; @0x10000000 = a + b + c + d + e + f + g + h + i + j + k + l + m + n + o + p; } main();" \
 	"A"
 
 # Many variables — we have 512 slots, this uses 32.
 test_output  "32 variable slots" \
-	"v0 = 33; v1 = 0; v2 = 0; v3 = 0; v4 = 0; v5 = 0; v6 = 0; v7 = 0; v8 = 0; v9 = 0; v10 = 0; v11 = 0; v12 = 0; v13 = 0; v14 = 0; v15 = 0; v16 = 0; v17 = 0; v18 = 0; v19 = 0; v20 = 0; v21 = 0; v22 = 0; v23 = 0; v24 = 0; v25 = 0; v26 = 0; v27 = 0; v28 = 0; v29 = 0; v30 = 0; v31 = 32; @0x10000000 = v0 + v31;" \
+	"fn main() { v0 = 33; v1 = 0; v2 = 0; v3 = 0; v4 = 0; v5 = 0; v6 = 0; v7 = 0; v8 = 0; v9 = 0; v10 = 0; v11 = 0; v12 = 0; v13 = 0; v14 = 0; v15 = 0; v16 = 0; v17 = 0; v18 = 0; v19 = 0; v20 = 0; v21 = 0; v22 = 0; v23 = 0; v24 = 0; v25 = 0; v26 = 0; v27 = 0; v28 = 0; v29 = 0; v30 = 0; v31 = 32; @0x10000000 = v0 + v31; } main();" \
 	"A"
 
 # ============================================================================
@@ -305,7 +305,7 @@ echo "=== Xor (^) ==="
 test_output  "xor literals" \
 	"@0x10000000 = 0x50 ^ 0x11;" "A"
 test_output  "xor variables" \
-	"a = 0x41; b = 0x05; @0x10000000 = a ^ b ^ b;" "A"
+	"fn main() { a = 0x41; b = 0x05; @0x10000000 = a ^ b ^ b; } main();" "A"
 test_output  "xor three-operand chain" \
 	"@0x10000000 = 65 ^ 7 ^ 7;" "A"
 # '+' binds tighter than '^': (60+5) ^ 0 = 65 = 'A'.
@@ -318,54 +318,54 @@ test_output  "xor mixed with subtraction" \
 echo "=== Prefix/postfix ++ -- ==="
 # Prefix ++: value after increment.
 test_output  "prefix ++ yields new value" \
-	"x := 50; @0x10000000 = ++x;" "3"
+	"fn main() { x := 50; @0x10000000 = ++x; } main();" "3"
 # Postfix ++: value is old, variable updated.
 test_output  "postfix ++ yields old value" \
-	"x := 50; @0x10000000 = x++; @0x10000000 = x;" "23"
+	"fn main() { x := 50; @0x10000000 = x++; @0x10000000 = x; } main();" "23"
 # Prefix --.
 test_output  "prefix -- yields new value" \
-	"x := 52; @0x10000000 = --x;" "3"
+	"fn main() { x := 52; @0x10000000 = --x; } main();" "3"
 # Postfix --.
 test_output  "postfix -- yields old value" \
-	"x := 52; @0x10000000 = x--; @0x10000000 = x;" "43"
+	"fn main() { x := 52; @0x10000000 = x--; @0x10000000 = x; } main();" "43"
 # Mixed postfix ++ with '+': (60) + (5) = 65='A', and a,b updated.
 test_output  "postfix ++ in add expression" \
-	"a := 60; b := 5; @0x10000000 = a++ + b++;" "A"
+	"fn main() { a := 60; b := 5; @0x10000000 = a++ + b++; } main();" "A"
 # Two postfix increments in sequence, variable fully updated.
 test_output  "repeated postfix ++ updates variable" \
-	"x := 63; @0x10000000 = x++; @0x10000000 = x++; @0x10000000 = x;" "?@A"
+	"fn main() { x := 63; @0x10000000 = x++; @0x10000000 = x++; @0x10000000 = x; } main();" "?@A"
 # Prefix ++ inside a longer add chain: (1+1)+(50)+12 = 64='@', x=2 after.
 test_output  "prefix ++ inside add chain" \
-	"x := 1; @0x10000000 = ++x + 50 + 12;" "@"
+	"fn main() { x := 1; @0x10000000 = ++x + 50 + 12; } main();" "@"
 
 # ============================================================================
 echo "=== Compound assignments ==="
 test_output  "x += literal" \
-	"x := 60; x += 5; @0x10000000 = x;" "A"
+	"fn main() { x := 60; x += 5; @0x10000000 = x; } main();" "A"
 test_output  "x += expr" \
-	"x := 60; y = 3; x += y + 2; @0x10000000 = x;" "A"
+	"fn main() { x := 60; y = 3; x += y + 2; @0x10000000 = x; } main();" "A"
 test_output  "x -= literal" \
-	"x := 70; x -= 5; @0x10000000 = x;" "A"
+	"fn main() { x := 70; x -= 5; @0x10000000 = x; } main();" "A"
 test_output  "x ^= literal" \
-	"x := 0x43; x ^= 0x02; @0x10000000 = x;" "A"
+	"fn main() { x := 0x43; x ^= 0x02; @0x10000000 = x; } main();" "A"
 test_output  "chained compound assigns" \
-	"x := 10; x += 20; x += 30; x += 5; @0x10000000 = x;" "A"
+	"fn main() { x := 10; x += 20; x += 30; x += 5; @0x10000000 = x; } main();" "A"
 # The case that triggered the original hang report.
 test_output  "the x += 1 repro" \
-	"x := 2; x += 1; y = x + 48; @0x10000000 = y;" "3"
+	"fn main() { x := 2; x += 1; y = x + 48; @0x10000000 = y; } main();" "3"
 
 # ============================================================================
 echo "=== Bare inc/dec statements ==="
 test_output  "bare ++x statement" \
-	"x := 64; ++x; @0x10000000 = x;" "A"
+	"fn main() { x := 64; ++x; @0x10000000 = x; } main();" "A"
 test_output  "bare x++ statement" \
-	"x := 64; x++; @0x10000000 = x;" "A"
+	"fn main() { x := 64; x++; @0x10000000 = x; } main();" "A"
 test_output  "bare --x statement" \
-	"x := 66; --x; @0x10000000 = x;" "A"
+	"fn main() { x := 66; --x; @0x10000000 = x; } main();" "A"
 test_output  "bare x-- statement" \
-	"x := 66; x--; @0x10000000 = x;" "A"
+	"fn main() { x := 66; x--; @0x10000000 = x; } main();" "A"
 test_output  "repeated bare ++x" \
-	"x := 60; ++x; ++x; ++x; ++x; ++x; @0x10000000 = x;" "A"
+	"fn main() { x := 60; ++x; ++x; ++x; ++x; ++x; @0x10000000 = x; } main();" "A"
 
 # ============================================================================
 echo "=== Shifts (<< >>) ==="
@@ -391,13 +391,13 @@ test_output  "shift lower precedence than add (lhs)" \
 test_output  "xor lower precedence than shift" \
 	"@0x10000000 = 0x40 ^ 1 << 0;" "A"
 test_output  "compound <<= " \
-	"x := 8; x <<= 3; @0x10000000 = x;" "@"
+	"fn main() { x := 8; x <<= 3; @0x10000000 = x; } main();" "@"
 test_output  "compound >>= " \
-	"x := 260; x >>= 2; @0x10000000 = x;" "A"
+	"fn main() { x := 260; x >>= 2; @0x10000000 = x; } main();" "A"
 test_output  "compound <<= then >>=" \
-	"x := 1; x <<= 6; x <<= 1; x >>= 1; @0x10000000 = x;" "@"
+	"fn main() { x := 1; x <<= 6; x <<= 1; x >>= 1; @0x10000000 = x; } main();" "@"
 test_output  "shift with variable rhs" \
-	"x = 1; n = 6; @0x10000000 = x << n;" "@"
+	"fn main() { x = 1; n = 6; @0x10000000 = x << n; } main();" "@"
 
 # ============================================================================
 echo "=== Bitwise AND (&) ==="
@@ -406,7 +406,7 @@ test_output  "and literal masks low bits" \
 test_output  "and literal masks upper bits" \
 	"@0x10000000 = 0xFF & 65;" "A"
 test_output  "compound &=" \
-	"x := 0x47; x &= 0x41; @0x10000000 = x;" "A"
+	"fn main() { x := 0x47; x &= 0x41; @0x10000000 = x; } main();" "A"
 # '&' binds tighter than '^': (0x41 & 0x0F) ^ 0x4E = 0x01 ^ 0x4E = 0x4F = 'O'.
 # If '^' were tighter: 0x41 & (0x0F ^ 0x4E) = 0x41 & 0x41 = 0x41 = 'A'.
 # So a result of 'O' confirms Rust precedence (& > ^).
@@ -425,7 +425,7 @@ test_output  "or literal" \
 test_output  "or literal commuted" \
 	"@0x10000000 = 0x01 | 0x40;" "A"
 test_output  "compound |=" \
-	"x := 0x40; x |= 1; @0x10000000 = x;" "A"
+	"fn main() { x := 0x40; x |= 1; @0x10000000 = x; } main();" "A"
 # '^' tighter than '|': 0x40 | (1 ^ 0) = 0x40 | 1 = 0x41 = 'A'.
 test_output  "xor tighter than or" \
 	"@0x10000000 = 0x40 | 1 ^ 0;" "A"
@@ -449,22 +449,22 @@ test_output  "unary ~ chained" \
 	"@0x10000000 = ~~65;" "A"
 # Unary '-' on a variable.
 test_output  "unary - variable" \
-	"x = 1; @0x10000000 = -x + 66;" "A"
+	"fn main() { x = 1; @0x10000000 = -x + 66; } main();" "A"
 # Adding a negative.
 test_output  "unary - in add chain" \
-	"x = 10; @0x10000000 = 75 + -x;" "A"
+	"fn main() { x = 10; @0x10000000 = 75 + -x; } main();" "A"
 # Subtracting a negative.
 test_output  "unary - under subtraction" \
-	"x = 5; @0x10000000 = 60 - -x;" "A"
+	"fn main() { x = 5; @0x10000000 = 60 - -x; } main();" "A"
 # Chaining: -(~64) = -(-65) = 65 = 'A'.
 test_output  "unary - applied to ~" \
 	"@0x10000000 = -~64;" "A"
 # Double unary - with whitespace: - -x = x.
 test_output  "double unary - with space" \
-	"x = 65; @0x10000000 = - -x;" "A"
+	"fn main() { x = 65; @0x10000000 = - -x; } main();" "A"
 # ~x is -x-1. -(-x-1) = x+1. So with x=64, result = 65 = 'A'.
 test_output  "neg of not of variable" \
-	"x = 64; @0x10000000 = -~x;" "A"
+	"fn main() { x = 64; @0x10000000 = -~x; } main();" "A"
 
 # ============================================================================
 echo "=== Parens ==="
@@ -486,12 +486,12 @@ test_output  "nested parens" \
 test_output  "unary applied to paren" \
 	"@0x10000000 = ~(0xBE);" "A"
 test_output  "paren around variable" \
-	"x = 1 + 2; @0x10000000 = (x) + 62;" "A"
+	"fn main() { x = 1 + 2; @0x10000000 = (x) + 62; } main();" "A"
 # Deref of parenthesized address.
 test_output  "byte deref of paren expression" \
-	"p = 0x10000000; @(p + 0) = 65;" "A"
+	"fn main() { p = 0x10000000; @(p + 0) = 65; } main();" "A"
 test_output  "paren under byte deref" \
-	"p = 0x10000000; @(p) = 65;" "A"
+	"fn main() { p = 0x10000000; @(p) = 65; } main();" "A"
 # Paren lets '&' contribute to a subsequent computation differently.
 # (0x44 & 0x0F) | 0x40 = 0x04 | 0x40 = 0x44 = 'D'.
 test_output  "paren changes and-or grouping" \
@@ -529,7 +529,7 @@ test_output  "less-than on negative is signed" \
 	"@0x10000000 = (0 - 1 < 0) + 64;" "A"
 # Variables.
 test_output  "comparison with variables" \
-	"x = 10; y = 5; @0x10000000 = (x > y) + 64;" "A"
+	"fn main() { x = 10; y = 5; @0x10000000 = (x > y) + 64; } main();" "A"
 # Precedence: '+' tighter than '==': (1+2) == 3 → 1.
 test_output  "add tighter than equality" \
 	"@0x10000000 = (1 + 2 == 3) + 64;" "A"
@@ -562,7 +562,7 @@ test_output  "unsigned >=u on -1 is false" \
 	"@0x10000000 = (0 >=u 0 - 1) + 65;" "A"
 # Signed >> (sra): -1 shifted right stays -1 (sign-extends).
 test_output  "signed >> sign-extends" \
-	"x = 0 - 1; @0x10000000 = (x >> 1) + 66;" "A"
+	"fn main() { x = 0 - 1; @0x10000000 = (x >> 1) + 66; } main();" "A"
 # Unsigned >>u (srl): -2 = 0xFFFFFFFE; shifted right by 25 = 0x7F = 127.
 # Then +(256-192) = 127+(-192)? Use different arithmetic:
 # 0xFFFFFFFE >>u 25 = 127. 127 - 62 = 65 = 'A'.
@@ -604,7 +604,7 @@ test_output  "mul by one" \
 test_output  "mul by zero is zero" \
 	"@0x10000000 = 0 * 123 == 0 ? 65 : 66;" "A"
 test_output  "mul variables" \
-	"x = 8; y = 8; @0x10000000 = x * y + 1;" "A"
+	"fn main() { x = 8; y = 8; @0x10000000 = x * y + 1; } main();" "A"
 # '*' binds tighter than '+' (like C).
 test_output  "mul tighter than add (rhs)" \
 	"@0x10000000 = 2 + 3 * 21;" "A"
@@ -618,7 +618,7 @@ test_output  "mul of negative by positive" \
 	"@0x10000000 = (0 - 5) * 13 + 130;" "A"
 # Compound *=
 test_output  "compound *=" \
-	"x := 7; x *= 9; @0x10000000 = x + 2;" "A"
+	"fn main() { x := 7; x *= 9; @0x10000000 = x + 2; } main();" "A"
 test_output  "chained *" \
 	"@0x10000000 = 4 * 4 * 4 + 1;" "A"
 # Larger product computed with upper bits used; byte store selects low 8.
@@ -635,7 +635,7 @@ test_output  "div by one" \
 test_output  "div with remainder truncates toward zero" \
 	"@0x10000000 = 200 / 3;" "B"
 test_output  "div variables" \
-	"x = 260; y = 4; @0x10000000 = x / y;" "A"
+	"fn main() { x = 260; y = 4; @0x10000000 = x / y; } main();" "A"
 test_output  "mod literal" \
 	"@0x10000000 = 65 % 100;" "A"
 test_output  "mod with larger dividend" \
@@ -656,16 +656,16 @@ test_output  "mod of negative follows dividend sign" \
 	"@0x10000000 = (0 - 7) % 3 + 66;" "A"
 # Compound /=
 test_output  "compound /=" \
-	"x := 260; x /= 4; @0x10000000 = x;" "A"
+	"fn main() { x := 260; x /= 4; @0x10000000 = x; } main();" "A"
 # Compound %= producing a printable result: 165 % 100 = 65.
 test_output  "compound %=" \
-	"x := 165; x %= 100; @0x10000000 = x;" "A"
+	"fn main() { x := 165; x %= 100; @0x10000000 = x; } main();" "A"
 # Chained div: ((1000 / 5) / 2) - 35 = 100 - 35 = 65.
 test_output  "chained /" \
 	"@0x10000000 = 1000 / 5 / 2 - 35;" "A"
 # Identity: (a/b)*b + (a%b) == a
 test_output  "divmod identity on positive" \
-	"a = 65; b = 7; q = a / b; r = a % b; @0x10000000 = q * b + r;" "A"
+	"fn main() { a = 65; b = 7; q = a / b; r = a % b; @0x10000000 = q * b + r; } main();" "A"
 
 # ============================================================================
 echo "=== Unsigned division /u and modulo %u ==="
@@ -693,9 +693,9 @@ test_output  "unsigned mod of -1 by 2 is 1" \
 	"@0x10000000 = (0 - 1) %u 2 + 64;" "A"
 # Variables.
 test_output  "unsigned div with variables" \
-	"a = 260; b = 4; @0x10000000 = a /u b;" "A"
+	"fn main() { a = 260; b = 4; @0x10000000 = a /u b; } main();" "A"
 test_output  "unsigned mod with variables" \
-	"a = 165; b = 100; @0x10000000 = a %u b;" "A"
+	"fn main() { a = 165; b = 100; @0x10000000 = a %u b; } main();" "A"
 
 # ============================================================================
 echo "=== Short-circuit && and || ==="
@@ -722,18 +722,18 @@ test_output  "|| normalizes to 0/1" \
 	"@0x10000000 = (7 || 0) + 64;" "A"
 # Mixing with comparisons.
 test_output  "range check with &&" \
-	"x = 5; @0x10000000 = (x > 0 && x < 10) + 64;" "A"
+	"fn main() { x = 5; @0x10000000 = (x > 0 && x < 10) + 64; } main();" "A"
 test_output  "equality alternates with ||" \
-	"x = 5; @0x10000000 = (x == 0 || x == 5) + 64;" "A"
+	"fn main() { x = 5; @0x10000000 = (x == 0 || x == 5) + 64; } main();" "A"
 # Short-circuit verified with ++ side effect.
 test_output  "&& false short-circuits rhs" \
-	"x := 5; y = (0 && ++x); @0x10000000 = x + 60;" "A"
+	"fn main() { x := 5; y = (0 && ++x); @0x10000000 = x + 60; } main();" "A"
 test_output  "&& true evaluates rhs" \
-	"x := 5; y = (1 && ++x); @0x10000000 = x + 59;" "A"
+	"fn main() { x := 5; y = (1 && ++x); @0x10000000 = x + 59; } main();" "A"
 test_output  "|| true short-circuits rhs" \
-	"x := 5; y = (1 || ++x); @0x10000000 = x + 60;" "A"
+	"fn main() { x := 5; y = (1 || ++x); @0x10000000 = x + 60; } main();" "A"
 test_output  "|| false evaluates rhs" \
-	"x := 5; y = (0 || ++x); @0x10000000 = x + 59;" "A"
+	"fn main() { x := 5; y = (0 || ++x); @0x10000000 = x + 59; } main();" "A"
 # Chained operators.
 test_output  "chained &&" \
 	"@0x10000000 = (1 && 1 && 1) + 64;" "A"
@@ -761,12 +761,12 @@ test_output  "ternary true branch" \
 test_output  "ternary false branch" \
 	"@0x10000000 = 0 ? 66 : 65;" "A"
 test_output  "ternary with comparison condition" \
-	"x = 5; @0x10000000 = (x > 0 ? 65 : 66);" "A"
+	"fn main() { x = 5; @0x10000000 = (x > 0 ? 65 : 66); } main();" "A"
 # Optional else form. With missing ':', false-branch yields 0.
 test_output  "ternary optional else — true path" \
 	"@0x10000000 = 1 ? 65;" "A"
 test_output  "ternary optional else — false path (value 0)" \
-	"x = 65; @0x10000000 = x + (0 ? 1);" "A"
+	"fn main() { x = 65; @0x10000000 = x + (0 ? 1); } main();" "A"
 # Right-associative: a ? b : c ? d : e = a ? b : (c ? d : e).
 test_output  "ternary right-associative on else" \
 	"@0x10000000 = 0 ? 66 : 0 ? 67 : 65;" "A"
@@ -780,20 +780,20 @@ test_output  "ternary looser than ||" \
 	"@0x10000000 = (0 || 1) ? 65 : 66;" "A"
 # Ternary with multi-op condition.
 test_output  "ternary with && condition" \
-	"x = 5; @0x10000000 = (x > 0 && x < 10) ? 65 : 66;" "A"
+	"fn main() { x = 5; @0x10000000 = (x > 0 && x < 10) ? 65 : 66; } main();" "A"
 # Short-circuit: only one branch is evaluated. Use ++y with different sign.
 test_output  "ternary short-circuits true branch only" \
-	"x = 5; y := 0; z = (x > 0) ? ++y : --y; @0x10000000 = y + 64;" "A"
+	"fn main() { x = 5; y := 0; z = (x > 0) ? ++y : --y; @0x10000000 = y + 64; } main();" "A"
 test_output  "ternary short-circuits else branch only" \
-	"x = 0; y := 0; z = (x > 0) ? ++y : --y; @0x10000000 = y + 66;" "A"
+	"fn main() { x = 0; y := 0; z = (x > 0) ? ++y : --y; @0x10000000 = y + 66; } main();" "A"
 # Ternary in a larger expression.
 test_output  "ternary result participates in addition" \
 	"@0x10000000 = (1 ? 60 : 0) + 5;" "A"
 # No-else ternary on false cond defaults to 0.
 test_output  "no-else ternary false path defaults to 0" \
-	"x = 0; y = x ? 7; @0x10000000 = y + 65;" "A"
+	"fn main() { x = 0; y = x ? 7; @0x10000000 = y + 65; } main();" "A"
 test_output  "no-else ternary true path returns value" \
-	"x = 1; y = x ? 1; @0x10000000 = y + 64;" "A"
+	"fn main() { x = 1; y = x ? 1; @0x10000000 = y + 64; } main();" "A"
 # Regression coverage for ternary bugs in famc. These were uncovered while
 # rewriting write_self.fam3 in famc.
 #
@@ -803,15 +803,15 @@ test_output  "no-else ternary true path returns value" \
 #     bge(5) instead of bltu(6). `!=` lowers to `xor; sltu a0, zero, a0` and
 #     hit this peephole. Fixed by `funct3 << 1` (slt→blt, sltu→bltu).
 test_output  "ternary with != condition, true case (value)" \
-	"x := 1; @0x10000000 = x != 0 ? 'A' : 'B';" "A"
+	"fn main() { x := 1; @0x10000000 = x != 0 ? 'A' : 'B'; } main();" "A"
 test_output  "ternary with != condition, false case (value)" \
-	"x := 0; @0x10000000 = x != 0 ? 'B' : 'A';" "A"
+	"fn main() { x := 0; @0x10000000 = x != 0 ? 'B' : 'A'; } main();" "A"
 test_output  "ternary with <u condition, true case" \
-	"x := 5; @0x10000000 = x <u 10 ? 'A' : 'B';" "A"
+	"fn main() { x := 5; @0x10000000 = x <u 10 ? 'A' : 'B'; } main();" "A"
 test_output  "ternary with <u condition, false case" \
-	"x := 10; @0x10000000 = x <u 5 ? 'B' : 'A';" "A"
+	"fn main() { x := 10; @0x10000000 = x <u 5 ? 'B' : 'A'; } main();" "A"
 test_output  "ternary with >=u condition, true case" \
-	"x := 10; @0x10000000 = x >=u 5 ? 'A' : 'B';" "A"
+	"fn main() { x := 10; @0x10000000 = x >=u 5 ? 'A' : 'B'; } main();" "A"
 # (2) Two-armed ternary with fn calls in BOTH branches always returned the
 #     false-branch value.  Root cause: ce_cep_tern_mid had a peephole that
 #     skipped emitting jal_end when the middle's last insn was an
@@ -825,9 +825,9 @@ test_output  "ternary with fn calls in both branches, true case" \
 test_output  "ternary with fn calls in both branches, false case" \
 	"fn f() { 65 } fn g() { 66 } @0x10000000 = 0 ? f() : g();" "B"
 test_output  "ternary with fn call only in then, runtime cond" \
-	"fn f() { 65 } x := 1; @0x10000000 = x ? f() : 66;" "A"
+	"fn f() { 65 } fn main() { x := 1; @0x10000000 = x ? f() : 66; } main();" "A"
 test_output  "ternary with fn call only in else, runtime cond" \
-	"fn g() { 66 } x := 0; @0x10000000 = x ? 65 : g();" "B"
+	"fn g() { 66 } fn main() { x := 0; @0x10000000 = x ? 65 : g(); } main();" "B"
 test_output  "nested ternary with fn calls in branches" \
 	"fn a() { 65 } fn b() { 66 } fn c() { 67 } @0x10000000 = 1 ? a() : 0 ? b() : c();" "A"
 # (3) `asm { ... }` was only recognized as a top-level statement; using it
@@ -836,7 +836,7 @@ test_output  "nested ternary with fn calls in branches" \
 #     in the var symtab. Fixed by teaching ct_lbrace's leading-ident scan
 #     to recognize the `asm` keyword and divert to cs_kw_asm.
 test_output  "asm inside block expression" \
-	"x := 0; { asm { (x = gp) }; 0 }; @0x10000000 = x != 0 ? 'A' : 'N';" "A"
+	"fn main() { x := 0; { asm { (x = gp) }; 0 }; @0x10000000 = x != 0 ? 'A' : 'N'; } main();" "A"
 test_output  "asm inside fn body" \
 	"fn get_gp() { x := 0; asm { (x = gp) }; x } @0x10000000 = get_gp() != 0 ? 'A' : 'N';" "A"
 
@@ -844,29 +844,32 @@ test_output  "asm inside fn body" \
 echo "=== Assignment as expression (Pratt) ==="
 # Simple IDENT assignment as an expression
 test_output  "assign in parens contributes its value" \
-	"x := 5; y = (x := 10) + 55; @0x10000000 = y;" "A"
+	"fn main() { x := 5; y = (x := 10) + 55; @0x10000000 = y; } main();" "A"
 # Chained right-associative assignment: a = b = c = 5
 test_output  "chained assignment right-associative" \
-	"a := 0; b := 0; x = a := b := 20; @0x10000000 = a + b + x + 5;" "A"
+	"fn main() { a := 0; b := 0; x = a := b := 20; @0x10000000 = a + b + x + 5; } main();" "A"
 # @ deref assignment as an expression — writes to address, produces value.
 test_output  "@addr = val as an expression" \
-	"p = 0x10000000; @p = 65;" "A"
+	"fn main() { p = 0x10000000; @p = 65; } main();" "A"
 # Assignment inside a ternary branch (the original failing case).
 test_output  "assignment inside ternary branches" \
-	"x = 4; y = 52; x > 3 ? @0x10000000 = y : @0x10000000 = y + 1;" "4"
+	"fn main() { x = 4; y = 52; x > 3 ? @0x10000000 = y : @0x10000000 = y + 1; } main();" "4"
 # Full user repro
 test_output  "user repro — ternary with deref-assign branches" \
 	"$(cat <<'EOT'
+fn main() {
 x := ((2 - 1) + 1);
 x += 1;
 y = x + 48;
 x > 3 ? @0x10000000 = y : @0x10000000 = y + 1;
+}
+main();
 EOT
 )" "4"
 # Expression-statement with a comparison (no side effect; just discarded).
 # We can't observe it directly but it should compile & run cleanly.
 test_output  "expression-statement that just computes" \
-	"x = 5; x > 3; @0x10000000 = 65;" "A"
+	"fn main() { x = 5; x > 3; @0x10000000 = 65; } main();" "A"
 
 # ============================================================================
 echo "=== Block expressions ==="
@@ -877,18 +880,21 @@ test_output  "single-expr block as primary" \
 test_output  "block with trailing bare value" \
 	"@0x10000000 = { x = 10; x + 55 };" "A"
 test_output  "block with only assignments; last assign is value" \
-	"a := 0; @0x10000000 = { a := 66 };" "B"
+	"fn main() { a := 0; @0x10000000 = { a := 66 }; } main();" "B"
 test_output  "block participates in addition" \
 	"@0x10000000 = { 30 } + { 35 };" "A"
 test_output  "block in ternary true branch" \
-	"x = 4; y = x > 3 ? { t = x + 1; t + 60 } : { 0 }; @0x10000000 = y;" "A"
+	"fn main() { x = 4; y = x > 3 ? { t = x + 1; t + 60 } : { 0 }; @0x10000000 = y; } main();" "A"
 test_output  "block in ternary false branch" \
-	"x = 2; y = x > 3 ? { 0 } : { t = x + 1; t + 62 }; @0x10000000 = y;" "A"
+	"fn main() { x = 2; y = x > 3 ? { 0 } : { t = x + 1; t + 62 }; @0x10000000 = y; } main();" "A"
 test_output  "user repro — block in both ternary branches" \
 	"$(cat <<'EOT'
+fn main() {
 x = 4;
 y := x > 3 ? { t = x + 1; t } : { u = x + 2; u };
 @0x10000000 = y + 48;
+}
+main();
 EOT
 )" "5"
 test_output  "nested blocks" \
@@ -898,11 +904,11 @@ test_output  "deeply nested blocks (3 levels)" \
 test_output  "block with many statements" \
 	"@0x10000000 = { a = 1; b = 2; c = 3; d = 4; e = 5; a + b + c + d + e + 50 };" "A"
 test_output  "block side-effect on outer variable" \
-	"x := 0; { x := 65 }; @0x10000000 = x;" "A"
+	"fn main() { x := 0; { x := 65 }; @0x10000000 = x; } main();" "A"
 test_output  "block discards non-final expression value" \
 	"@0x10000000 = { 999; 65 };" "A"
 test_output  "block with @deref store as last expression" \
-	"p = 0x10000000; { @p = 65 };" "A"
+	"fn main() { p = 0x10000000; { @p = 65 }; } main();" "A"
 test_output  "block in binop with precedence (block binds tightly as primary)" \
 	"@0x10000000 = 1 + { 2 * 32 };" "A"
 test_output  "block as operand to comparison → ternary" \
@@ -910,7 +916,7 @@ test_output  "block as operand to comparison → ternary" \
 test_output  "chained assignment inside block" \
 	"@0x10000000 = { a = b = 32; a + b + 1 };" "A"
 test_output  "block with inner ternary as last expr" \
-	"x = 7; @0x10000000 = { x > 3 ? 65 : 66 };" "A"
+	"fn main() { x = 7; @0x10000000 = { x > 3 ? 65 : 66 }; } main();" "A"
 test_output  "block with inner && as last expr (true path)" \
 	"@0x10000000 = { 1 && 1 } + 64;" "A"
 test_output  "block with loop-shaped sum" \
@@ -918,9 +924,9 @@ test_output  "block with loop-shaped sum" \
 test_output  "empty-effect block followed by addition" \
 	"@0x10000000 = { x = 1 } + 64;" "A"
 test_output  "block expression-statement (value discarded)" \
-	"x := 5; { x := x + 60 }; @0x10000000 = x + 0;" "A"
+	"fn main() { x := 5; { x := x + 60 }; @0x10000000 = x + 0; } main();" "A"
 test_output  "double-nested block via deref store target" \
-	"p = 0x10000000; @p = { { 65 } };" "A"
+	"fn main() { p = 0x10000000; @p = { { 65 } }; } main();" "A"
 
 # Block-level variable scoping (P5): bindings introduced inside { } go out
 # of scope at }, so sibling blocks may reuse names independently.
@@ -935,10 +941,10 @@ EOT
 )" "A"
 
 test_output  "block-scoped var: outer var survives inner block" \
-	"x = 65; { y = 1; }; @0x10000000 = x;" "A"
+	"fn main() { x = 65; { y = 1; }; @0x10000000 = x; } main();" "A"
 
 test_output  "block-scoped var: inner block modifies outer via :=" \
-	"x := 60; { x := x + 5; }; @0x10000000 = x;" "A"
+	"fn main() { x := 60; { x := x + 5; }; @0x10000000 = x; } main();" "A"
 
 test_error   "block-scoped var: inner var not visible after block" \
 	"fn f() { { y = 65; }; @0x10000000 = y; } f();" \
@@ -950,14 +956,14 @@ test_output  "block-scoped var: loop body scopes var" \
 # Immutable shadow: `=` in an inner block shadows the outer binding;
 # the outer value is restored when the block ends. `:=` still modifies.
 test_output  "immut shadow: = in inner block shadows outer" \
-	"x = 65; { x = 66; @0x10000000 = x; }; @0x10000000 = x;" "BA"
+	"fn main() { x = 65; { x = 66; @0x10000000 = x; }; @0x10000000 = x; } main();" "BA"
 
 test_output  "immut shadow: := in inner block modifies outer" \
-	"x := 65; { x := 66; }; @0x10000000 = x;" "B"
+	"fn main() { x := 65; { x := 66; }; @0x10000000 = x; } main();" "B"
 
 test_error   "immut shadow: = in same scope errors" \
-	"x = 1; x = 2;" \
-	"Error:1:8 cannot reassign immutable"
+	"fn main() { x = 1; x = 2; } main();" \
+	"Error:1:20 cannot reassign immutable"
 
 test_output  "immut shadow: fn body shadows top-level" \
 	"$(cat <<'EOT'
@@ -968,6 +974,7 @@ fn print_str(s) {
         @s ? @UART = @s++ : break;
     }
 }
+fn main() {
 s = "hello\n";
 print_str(s);
 {
@@ -975,14 +982,16 @@ print_str(s);
     print_str(s);
 }
 print_str(s);
+}
+main();
 EOT
 )" "$(printf 'hello\nabc\nhello\n')"
 
 test_output  "immut shadow: nested blocks restore correctly" \
-	"x = 65; { x = 66; { x = 67; }; @0x10000000 = x; }; @0x10000000 = x;" "BA"
+	"fn main() { x = 65; { x = 66; { x = 67; }; @0x10000000 = x; }; @0x10000000 = x; } main();" "BA"
 
 test_output  "immut shadow: = to mutable outer modifies (no shadow)" \
-	"x := 65; { x = 66; }; @0x10000000 = x;" "B"
+	"fn main() { x := 65; { x = 66; }; @0x10000000 = x; } main();" "B"
 
 # ── Comprehensive scope interaction tests ──
 # Immutable (=) in fn body
@@ -1032,8 +1041,8 @@ test_output  "scope: const and immut var coexist" \
 
 # Nested function scope isolation
 test_error   "scope: fn body cannot read outer var" \
-	"x = 65; fn f() { @0x10000000 = x; } f();" \
-	"Error:1:32 undefined variable"
+	"fn f() { @0x10000000 = x; } fn main() { x = 65; f(); } main();" \
+	"Error:1:24 undefined variable"
 
 # Deep nesting: block inside loop inside fn
 test_output  "scope: deep nesting — shadow + restore" \
@@ -1057,10 +1066,10 @@ EOT
 
 # For-loop iterator scoping
 test_output  "scope: for iterator shadows immut outer" \
-	"i = 99; for i in 0..3 { @0x10000000 = '0' + i; }; @0x10000000 = i + 48 == 147 ? 'Y' : 'N';" "012Y"
+	"fn main() { i = 99; for i in 0..3 { @0x10000000 = '0' + i; }; @0x10000000 = i + 48 == 147 ? 'Y' : 'N'; } main();" "012Y"
 
 test_output  "scope: for iterator not visible after loop" \
-	"s := 0; for i in 1..=5 s += i; @0x10000000 = s == 15 ? 'Y' : 'N';" "Y"
+	"fn main() { s := 0; for i in 1..=5 s += i; @0x10000000 = s == 15 ? 'Y' : 'N'; } main();" "Y"
 
 # Sibling ternary branches with = (the P5 motivating case)
 test_output  "scope: sibling ternary branches reuse name with =" \
@@ -1089,7 +1098,7 @@ test_output  "backslash escape" \
 test_output  "single-quote escape" \
 	"@0x10000000 = '\\'';" "'"
 test_output  "char compared" \
-	"x = 'Z'; @0x10000000 = x == 'Z' ? 65 : 66;" "A"
+	"fn main() { x = 'Z'; @0x10000000 = x == 'Z' ? 65 : 66; } main();" "A"
 test_output  "backspace escape \\b" \
 	"@0x10000000 = 'A'; @0x10000000 = '\b'; @0x10000000 = 'B';" "$(printf 'A\bB')"
 test_output  "form feed escape \\f" \
@@ -1106,49 +1115,49 @@ test_output  "double-quote escape in char literal" \
 # ============================================================================
 echo "=== Compound assigns in expression context ==="
 test_output  "(x += 3) as expression" \
-	"x := 5; @0x10000000 = (x += 3) + 57;" "A"
+	"fn main() { x := 5; @0x10000000 = (x += 3) + 57; } main();" "A"
 test_output  "x -= n inside block" \
-	"x := 100; y = { x -= 35; x }; @0x10000000 = y;" "A"
+	"fn main() { x := 100; y = { x -= 35; x }; @0x10000000 = y; } main();" "A"
 test_output  "x *= n" \
-	"x := 13; { x *= 5 }; @0x10000000 = x;" "A"
+	"fn main() { x := 13; { x *= 5 }; @0x10000000 = x; } main();" "A"
 test_output  "x /= n" \
-	"x := 325; { x /= 5 }; @0x10000000 = x;" "A"
+	"fn main() { x := 325; { x /= 5 }; @0x10000000 = x; } main();" "A"
 test_output  "x %= n" \
-	"x := 132; { x %= 67 }; @0x10000000 = x;" "A"
+	"fn main() { x := 132; { x %= 67 }; @0x10000000 = x; } main();" "A"
 test_output  "x &= mask" \
-	"x := 0x7FF; { x &= 0x41 }; @0x10000000 = x;" "A"
+	"fn main() { x := 0x7FF; { x &= 0x41 }; @0x10000000 = x; } main();" "A"
 test_output  "x |= bits" \
-	"x := 0x40; { x |= 1 }; @0x10000000 = x;" "A"
+	"fn main() { x := 0x40; { x |= 1 }; @0x10000000 = x; } main();" "A"
 test_output  "x ^= bits" \
-	"x := 0x60; { x ^= 0x21 }; @0x10000000 = x;" "A"
+	"fn main() { x := 0x60; { x ^= 0x21 }; @0x10000000 = x; } main();" "A"
 test_output  "x <<= shift in expression" \
-	"x := 4; { x <<= 2 }; @0x10000000 = x + 49;" "A"
+	"fn main() { x := 4; { x <<= 2 }; @0x10000000 = x + 49; } main();" "A"
 test_output  "x >>= shift in expression" \
-	"x := 260; { x >>= 2 }; @0x10000000 = x;" "A"
+	"fn main() { x := 260; { x >>= 2 }; @0x10000000 = x; } main();" "A"
 test_output  "x >>u= unsigned shift in expression" \
-	"x := 260; { x >>u= 2 }; @0x10000000 = x;" "A"
+	"fn main() { x := 260; { x >>u= 2 }; @0x10000000 = x; } main();" "A"
 # Compound assigns on deref targets — byte and word.
 test_output  "@deref += on heap byte" \
-	"p = 0x80005000; @p = 60; @p += 5; r = @p; @0x10000000 = r;" "A"
+	"fn main() { p = 0x80005000; @p = 60; @p += 5; r = @p; @0x10000000 = r; } main();" "A"
 test_output  "@deref *= on heap byte" \
-	"p = 0x80005004; @p = 13; @p *= 5; r = @p; @0x10000000 = r;" "A"
+	"fn main() { p = 0x80005004; @p = 13; @p *= 5; r = @p; @0x10000000 = r; } main();" "A"
 test_output  "*deref += on heap word" \
-	"p = 0x80005008; *p = 60; *p += 5; r = *p; @0x10000000 = r;" "A"
+	"fn main() { p = 0x80005008; *p = 60; *p += 5; r = *p; @0x10000000 = r; } main();" "A"
 test_output  "*deref *= on heap word" \
-	"p = 0x8000500C; *p = 13; *p *= 5; r = *p; @0x10000000 = r;" "A"
+	"fn main() { p = 0x8000500C; *p = 13; *p *= 5; r = *p; @0x10000000 = r; } main();" "A"
 test_output  "*deref &= on heap word" \
-	"p = 0x80005010; *p = 0x7F; *p &= 0x41; r = *p; @0x10000000 = r;" "A"
+	"fn main() { p = 0x80005010; *p = 0x7F; *p &= 0x41; r = *p; @0x10000000 = r; } main();" "A"
 # Unary logical NOT.
 test_output  "!0 is 1" \
-	"x = 0; @0x10000000 = !x + 64;" "A"
+	"fn main() { x = 0; @0x10000000 = !x + 64; } main();" "A"
 test_output  "!5 is 0" \
-	"x = 5; @0x10000000 = !x + 65;" "A"
+	"fn main() { x = 5; @0x10000000 = !x + 65; } main();" "A"
 test_output  "!!x double-negate" \
-	"x = 5; @0x10000000 = !!x + 64;" "A"
+	"fn main() { x = 5; @0x10000000 = !!x + 64; } main();" "A"
 test_output  "! in ternary condition" \
-	"x = 0; @0x10000000 = !x ? 65 : 66;" "A"
+	"fn main() { x = 0; @0x10000000 = !x ? 65 : 66; } main();" "A"
 test_output  "! on comparison result" \
-	"x = 5; y = 3; @0x10000000 = !(x > y) + 66;" "B"
+	"fn main() { x = 5; y = 3; @0x10000000 = !(x > y) + 66; } main();" "B"
 
 # ============================================================================
 echo "=== Loop / break ==="
@@ -1157,10 +1166,11 @@ test_output  "loop break const" \
 	"@0x10000000 = loop { break 65; };" "A"
 # Loop that counts up to a bound.
 test_output  "loop sum 1..10" \
-	"y := 0; x = loop { y += 1; y > 10 ? break y + 54; }; @0x10000000 = x;" "A"
+	"fn main() { y := 0; x = loop { y += 1; y > 10 ? break y + 54; }; @0x10000000 = x; } main();" "A"
 # The full user repro: sum 1..100 == 5050.
 test_output  "user repro — sum 1..100 via loop+break" \
 	"$(cat <<'EOT'
+fn main() {
 y := 0;
 x := 0;
 x := loop {
@@ -1168,17 +1178,20 @@ x := loop {
     x += y;
 };
 x == 5050 ? @0x10000000 = 'Y' : @0x10000000 = 'N';
+}
+main();
 EOT
 )" "Y"
 # Break with no explicit value (defaults to 0).
 test_output  "break without value" \
-	"x = loop { break; }; @0x10000000 = x + 65;" "A"
+	"fn main() { x = loop { break; }; @0x10000000 = x + 65; } main();" "A"
 # Loop inside an expression.
 test_output  "loop result used in addition" \
 	"@0x10000000 = 60 + loop { break 5; };" "A"
 # continue skips the rest of the loop body.
 test_output  "continue skips rest of body" \
 	"$(cat <<'EOT'
+fn main() {
 i := 0; sum := 0;
 sum := loop {
     ++i > 10 ? break sum;
@@ -1186,20 +1199,26 @@ sum := loop {
     sum += i;
 };
 @0x10000000 = sum == 50 ? 'A' : 'N';
+}
+main();
 EOT
 )" "A"
 test_output  "continue in a fall-through (no else) ternary" \
 	"$(cat <<'EOT'
+fn main() {
 i := 0;
 loop {
     ++i > 7 ? break 0;
     i % 2 == 0 ? continue;
     @0x10000000 = 48 + i;
 };
+}
+main();
 EOT
 )" "1357"
 test_output  "continue target is innermost loop only" \
 	"$(cat <<'EOT'
+fn main() {
 outer := 0; hits := 0;
 loop {
     outer += 1;
@@ -1211,12 +1230,15 @@ loop {
     outer > 2 ? break 0;
 };
 @0x10000000 = hits == 9 ? 'A' : 'N';
+}
+main();
 EOT
 )" "A"
 
 # Nested loops: the inner break only exits the inner loop.
 test_output  "nested loops — inner break doesn't escape outer" \
 	"$(cat <<'EOT'
+fn main() {
 o := 0;
 total := 0;
 total := loop {
@@ -1226,6 +1248,8 @@ total := loop {
     o > 4 ? break total + 30;
 };
 @0x10000000 = total;
+}
+main();
 EOT
 )" "A"
 
@@ -1236,34 +1260,34 @@ test_output  "exclusive range body" \
 test_output  "inclusive range body" \
 	"for i in 0..=3 { @0x10000000 = 'A' + i; };" "ABCD"
 test_output  "for as expression — inclusive last value" \
-	"v = for x in 0..=10 { x }; @0x10000000 = v + 55;" "A"
+	"fn main() { v = for x in 0..=10 { x }; @0x10000000 = v + 55; } main();" "A"
 test_output  "for as expression — exclusive last value" \
-	"v = for x in 0..5 { x }; @0x10000000 = v + 61;" "A"
+	"fn main() { v = for x in 0..5 { x }; @0x10000000 = v + 61; } main();" "A"
 test_output  "empty range evaluates to 0" \
-	"v = for x in 0..0 { x + 1 }; @0x10000000 = v + 65;" "A"
+	"fn main() { v = for x in 0..0 { x + 1 }; @0x10000000 = v + 65; } main();" "A"
 test_output  "sum 1..=100 via for" \
-	"s := 0; for i in 1..=100 { s += i; }; @0x10000000 = s == 5050 ? 'Y' : 'N';" "Y"
+	"fn main() { s := 0; for i in 1..=100 { s += i; }; @0x10000000 = s == 5050 ? 'Y' : 'N'; } main();" "Y"
 test_output  "break with value inside for" \
-	"v = for x in 0..100 { x > 5 ? break x + 58; }; @0x10000000 = v;" "@"
+	"fn main() { v = for x in 0..100 { x > 5 ? break x + 58; }; @0x10000000 = v; } main();" "@"
 test_output  "continue in for skips body tail" \
-	"s := 0; for i in 0..=10 { i % 2 == 0 ? continue; s += i; }; @0x10000000 = s == 25 ? 'Y' : 'N';" "Y"
+	"fn main() { s := 0; for i in 0..=10 { i % 2 == 0 ? continue; s += i; }; @0x10000000 = s == 25 ? 'Y' : 'N'; } main();" "Y"
 test_output  "shadowing — outer x unchanged after for" \
-	"x = 5; for x in 0..3 { }; @0x10000000 = x + 60;" "A"
+	"fn main() { x = 5; for x in 0..3 { }; @0x10000000 = x + 60; } main();" "A"
 test_output  "shadowing — inner x visible in body" \
-	"x = 9; for x in 0..3 { @0x10000000 = '0' + x; }; @0x10000000 = 'A';" "012A"
+	"fn main() { x = 9; for x in 0..3 { @0x10000000 = '0' + x; }; @0x10000000 = 'A'; } main();" "012A"
 test_output  "nested for loops" \
 	"for i in 0..3 { for j in 0..2 { @0x10000000 = 'A' + i + j; }; };" "ABBCCD"
 test_output  "non-literal range bounds" \
-	"lo = 2; hi = 5; v = for x in lo..hi { x }; @0x10000000 = v + 61;" "A"
+	"fn main() { lo = 2; hi = 5; v = for x in lo..hi { x }; @0x10000000 = v + 61; } main();" "A"
 test_output  "inclusive with expression bounds" \
-	"lo = 1; hi = 4; for i in lo..=hi { @0x10000000 = '0' + i; };" "1234"
+	"fn main() { lo = 1; hi = 4; for i in lo..=hi { @0x10000000 = '0' + i; }; } main();" "1234"
 # Semicolon optional after brace-terminated expressions.
 test_output  "loop without trailing semicolon" \
-	"x := 64; loop { x++; x > 65 ? break 0 } @0x10000000 = x;" "B"
+	"fn main() { x := 64; loop { x++; x > 65 ? break 0 } @0x10000000 = x; } main();" "B"
 test_output  "for without trailing semicolon" \
 	"for i in 0..3 { @0x10000000 = 'A' + i } @0x10000000 = '!';" "ABC!"
 test_output  "block without trailing semicolon" \
-	"x = { 65 } @0x10000000 = x;" "A"
+	"fn main() { x = { 65 } @0x10000000 = x; } main();" "A"
 test_output  "loop without semicolon inside fn body" \
 	"fn f() { loop { break } @0x10000000 = 65; } f();" "A"
 test_output  "for without semicolon inside fn body" \
@@ -1274,13 +1298,13 @@ test_output  "nested blocks no semicolons" \
 	"fn f() { loop { break } for i in 0..1 { @0x10000000 = 'A'; } } f();" "A"
 # Single-expression bodies (P7): loop/for accept an expression without braces.
 test_output  "loop single-expr body with break" \
-	"x := 64; loop x > 65 ? break : x++; @0x10000000 = x;" "B"
+	"fn main() { x := 64; loop x > 65 ? break : x++; @0x10000000 = x; } main();" "B"
 test_output  "loop single-expr body — break with value" \
-	"v = loop 1 > 0 ? break 65; @0x10000000 = v;" "A"
+	"fn main() { v = loop 1 > 0 ? break 65; @0x10000000 = v; } main();" "A"
 test_output  "for single-expr body" \
 	"for i in 0..3 @0x10000000 = 'A' + i;" "ABC"
 test_output  "for single-expr body — accumulate" \
-	"s := 0; for i in 1..=10 s += i; @0x10000000 = s == 55 ? 'Y' : 'N';" "Y"
+	"fn main() { s := 0; for i in 1..=10 s += i; @0x10000000 = s == 55 ? 'Y' : 'N'; } main();" "Y"
 test_output  "loop braceless inside fn body" \
 	"fn f() { x := 0; loop x >= 3 ? break : x++; @0x10000000 = x + 62; } f();" "A"
 test_output  "for braceless inside fn body" \
@@ -1299,62 +1323,63 @@ test_output  "halfword array decl + access" \
 test_output  "byte array iteration" \
 	"@arr[5]; for i in 0..5 { @arr[i] = 'A' + i; }; for i in 0..5 { @0x10000000 = @arr[i]; };" "ABCDE"
 test_output  "word array sum" \
-	"*arr[5]; for i in 0..5 { *arr[i] = i + 1; }; s := 0; for i in 0..5 { s += *arr[i]; }; @0x10000000 = s + 50;" "A"
+	"fn main() { *arr[5]; for i in 0..5 { *arr[i] = i + 1; }; s := 0; for i in 0..5 { s += *arr[i]; }; @0x10000000 = s + 50; } main();" "A"
 test_output  "halfword array values" \
 	"#arr[5]; for i in 0..5 { #arr[i] = 100 * (i + 1); }; @0x10000000 = #arr[0] == 100 && #arr[4] == 500 ? 'A' : 'N';" "A"
 test_output  "array access on pointer to heap RAM" \
-	"p = 0x80005000; @p[0] = 'A'; @p[1] = 'B'; @p[2] = 'C'; @0x10000000 = @p[0]; @0x10000000 = @p[1]; @0x10000000 = @p[2];" "ABC"
+	"fn main() { p = 0x80005000; @p[0] = 'A'; @p[1] = 'B'; @p[2] = 'C'; @0x10000000 = @p[0]; @0x10000000 = @p[1]; @0x10000000 = @p[2]; } main();" "ABC"
 test_output  "word and byte alias on same block" \
 	"*arr[4]; *arr[0] = 0x41424344; @0x10000000 = @arr[0]; @0x10000000 = @arr[1]; @0x10000000 = @arr[2]; @0x10000000 = @arr[3];" "DCBA"
 test_output  "halfword plain deref on a pointer" \
-	"p = 0x80005000; #p = 65; @0x10000000 = #p;" "A"
+	"fn main() { p = 0x80005000; #p = 65; @0x10000000 = #p; } main();" "A"
 test_output  "halfword indexed access on a pointer" \
-	"p = 0x80005000; #p[2] = 65; @0x10000000 = #p[2];" "A"
+	"fn main() { p = 0x80005000; #p[2] = 65; @0x10000000 = #p[2]; } main();" "A"
 # Block-level declarations (inside { ... } / function bodies).
 test_output  "array declared inside a block expression" \
-	"v = { @arr[5]; @arr[0] = 65; @arr[0] }; @0x10000000 = v;" "A"
+	"fn main() { v = { @arr[5]; @arr[0] = 65; @arr[0] }; @0x10000000 = v; } main();" "A"
 test_output  "array declared inside a function body" \
 	"fn f() { @arr[5]; @arr[0] = 65; @arr[0] } @0x10000000 = f();" "A"
 test_output  "function-local word array fill + sum" \
 	"fn sum5() { *arr[5]; for i in 0..5 { *arr[i] = i + 1; }; s := 0; for i in 0..5 { s += *arr[i]; }; s + 50 } @0x10000000 = sum5();" "A"
 test_output  "function-local byte array iteration" \
-	"fn greet() { @buf[5]; for i in 0..5 { @buf[i] = 'A' + i; }; for i in 0..5 { @0x10000000 = @buf[i]; }; 0 } v = greet();" "ABCDE"
+	"fn greet() { @buf[5]; for i in 0..5 { @buf[i] = 'A' + i; }; for i in 0..5 { @0x10000000 = @buf[i]; }; 0 } fn main() { v = greet(); } main();" "ABCDE"
 # Error case
 test_error "array decl redefines existing variable" \
-	"x = 5; @x[10];" \
-	"Error:1:10 already defined"
+	"fn main() { x = 5; @x[10]; } main();" \
+	"Error:1:22 already defined"
 test_error "array decl with non-literal size" \
-	"x = 5; @arr[x];" \
-	"Error:1:9 array size must be a literal"
+	"fn main() { x = 5; @arr[x]; } main();" \
+	"Error:1:21 array size must be a literal"
 
 # ============================================================================
 echo "=== Structs ==="
 # Basic declaration + positional literal + read
 test_output  "struct literal + read (positional)" \
-	"struct P { x, y, z } p = P { 10, 20, 35 }; @0x10000000 = P@p.x + P@p.y + P@p.z;" "A"
+	"struct P { x, y, z } fn main() { p = P { 10, 20, 35 }; @0x10000000 = P@p.x + P@p.y + P@p.z; } main();" "A"
 # Named init
 test_output  "struct literal + named init" \
-	"struct P { x, y, z } p = P { x: 10, y: 20, z: 35 }; @0x10000000 = P@p.x + P@p.y + P@p.z;" "A"
+	"struct P { x, y, z } fn main() { p = P { x: 10, y: 20, z: 35 }; @0x10000000 = P@p.x + P@p.y + P@p.z; } main();" "A"
 # Missing fields default to 0
 test_output  "partial named init, rest zero" \
-	"struct P { a, b, c, d } p = P { b: 65 }; @0x10000000 = P@p.a + P@p.b + P@p.c + P@p.d;" "A"
+	"struct P { a, b, c, d } fn main() { p = P { b: 65 }; @0x10000000 = P@p.a + P@p.b + P@p.c + P@p.d; } main();" "A"
 # Write: plain
 test_output  "field write" \
-	"struct P { x, y } p := P { 0, 0 }; P@p.x = 65; @0x10000000 = P@p.x;" "A"
+	"struct P { x, y } fn main() { p := P { 0, 0 }; P@p.x = 65; @0x10000000 = P@p.x; } main();" "A"
 # Write to non-zero offset
 test_output  "field write y offset=4" \
-	"struct P { x, y } p := P { 0, 0 }; P@p.y = 65; @0x10000000 = P@p.y;" "A"
+	"struct P { x, y } fn main() { p := P { 0, 0 }; P@p.y = 65; @0x10000000 = P@p.y; } main();" "A"
 # Compound assign on field
 test_output  "field compound +=" \
-	"struct P { x, y } p := P { 30, 0 }; P@p.x += 35; @0x10000000 = P@p.x;" "A"
+	"struct P { x, y } fn main() { p := P { 30, 0 }; P@p.x += 35; @0x10000000 = P@p.x; } main();" "A"
 # [0] syntax equivalent to no index
 test_output  "P@p[0].x equivalent to P@p.x" \
-	"struct P { x, y } p = P { 65, 0 }; @0x10000000 = P@p[0].x;" "A"
+	"struct P { x, y } fn main() { p = P { 65, 0 }; @0x10000000 = P@p[0].x; } main();" "A"
 # Nested struct literal in init
 test_output  "user repro — nested struct literal" \
 	"$(cat <<'EOT'
 struct MyStruct { a, b, c }
 struct MyOtherStruct { v, w }
+fn main() {
 x = MyStruct { a: 1, b: MyOtherStruct { 1, 2 } };
 v1 = MyStruct@x.a;
 inner = MyStruct@x.b;
@@ -1362,13 +1387,15 @@ v2 = MyOtherStruct@inner.v;
 v3 = MyOtherStruct@inner.w;
 v4 = MyStruct@x.c;
 @0x10000000 = v1 + v2 + v3 + v4 + 61;
+}
+main();
 EOT
 )" "A"
 # Struct pointer passed to function
 test_output  "struct passed by pointer, read in fn" \
-	"struct P { x, y } fn getx(p) { P@p.x } pt = P { 65, 0 }; @0x10000000 = getx(pt);" "A"
+	"struct P { x, y } fn getx(p) { P@p.x } fn main() { pt = P { 65, 0 }; @0x10000000 = getx(pt); } main();" "A"
 test_output  "struct passed by pointer, written in fn" \
-	"struct P { x, y } fn setx(p, v) { P@p.x = v; 0 } pt := P { 0, 0 }; setx(pt, 65); @0x10000000 = P@pt.x;" "A"
+	"struct P { x, y } fn setx(p, v) { P@p.x = v; 0 } fn main() { pt := P { 0, 0 }; setx(pt, 65); @0x10000000 = P@pt.x; } main();" "A"
 # Error cases
 test_error "struct redefined" \
 	"struct P { x } struct P { y }" \
@@ -1377,32 +1404,32 @@ test_error "field access on unknown struct" \
 	"@0x10000000 = BadStruct@x.f;" \
 	"Error:1:15 unknown struct type"
 test_error "unknown field name" \
-	"struct P { x } p = P { 5 }; @0x10000000 = P@p.z;" \
-	"Error:1:48 unknown field name"
+	"struct P { x } fn main() { p = P { 5 }; @0x10000000 = P@p.z; } main();" \
+	"Error:1:60 unknown field name"
 test_error "too many positional values" \
-	"struct P { x, y } p = P { 1, 2, 3 };" \
-	"Error:1:33 too many struct values"
+	"struct P { x, y } fn main() { p = P { 1, 2, 3 }; } main();" \
+	"Error:1:45 too many struct values"
 test_error "immutable struct field write" \
-	"struct P { x, y } p = P { 1, 2 }; P@p.x = 99;" \
-	"Error:1:42 left of '=' is not an lvalue"
+	"struct P { x, y } fn main() { p = P { 1, 2 }; P@p.x = 99; } main();" \
+	"Error:1:54 left of '=' is not an lvalue"
 test_error "immutable struct field compound" \
-	"struct P { x, y } p = P { 1, 2 }; P@p.x += 1;" \
-	"Error:1:43 left of '=' is not an lvalue"
+	"struct P { x, y } fn main() { p = P { 1, 2 }; P@p.x += 1; } main();" \
+	"Error:1:55 left of '=' is not an lvalue"
 test_output  "postfix ++ on struct field" \
-	"struct P { x, y } p := P { 64, 0 }; P@p.x++; @0x10000000 = P@p.x;" "A"
+	"struct P { x, y } fn main() { p := P { 64, 0 }; P@p.x++; @0x10000000 = P@p.x; } main();" "A"
 test_output  "postfix -- on struct field" \
-	"struct P { x, y } p := P { 66, 0 }; P@p.x--; @0x10000000 = P@p.x;" "A"
+	"struct P { x, y } fn main() { p := P { 66, 0 }; P@p.x--; @0x10000000 = P@p.x; } main();" "A"
 test_output  "postfix ++ returns old value" \
-	"struct P { x, y } p := P { 64, 0 }; v = P@p.x++; @0x10000000 = v + 1;" "A"
+	"struct P { x, y }  fn main() { p := P { 64, 0 }; v = P@p.x++; @0x10000000 = v + 1; } main();" "A"
 test_output  "@ptr++ reads byte, advances pointer (C-style *p++)" \
-	"s := \"AB\"; @0x10000000 = @s++; @0x10000000 = @s;" "AB"
+	"fn main() { s := \"AB\"; @0x10000000 = @s++; @0x10000000 = @s; } main();" "AB"
 test_output  "*ptr++ reads word, advances pointer" \
-	"*buf[2]; *buf = 65; *(buf+4) = 66; p := buf; @0x10000000 = *p++; @0x10000000 = *p;" "AB"
+	"fn main() { *buf[2]; *buf = 65; *(buf+4) = 66; p := buf; @0x10000000 = *p++; @0x10000000 = *p; } main();" "AB"
 test_error "postfix ++ on immutable struct" \
-	"struct P { x } p = P { 1 }; P@p.x++;" \
-	"Error:1:36 left of '=' is not an lvalue"
+	"struct P { x } fn main() { p = P { 1 }; P@p.x++; } main();" \
+	"Error:1:48 left of '=' is not an lvalue"
 test_output  "runtime index in struct access" \
-	"struct P { x } p = P { 65 }; i = 0; @0x10000000 = P@p[i].x;" "A"
+	"struct P { x }  fn main() { p = P { 65 }; i = 0; @0x10000000 = P@p[i].x; } main();" "A"
 
 # ============================================================================
 echo "=== Struct arrays + sizeof ==="
@@ -1414,18 +1441,18 @@ test_output  "non-pow2 struct size with multiply (3 fields)" \
 	"struct P { x, y, z } P@pts[3]; for i in 0..3 { P@pts[i].x = i + 1; }; @0x10000000 = P@pts[0].x + P@pts[1].x + P@pts[2].x + 59;" "A"
 # Chained field access: Struct@x.a.b reads a pointer chain using the same type.
 test_output  "chained access through pointer" \
-	"struct N { val, next } a := N { 0, 0 }; b = N { 65, 0 }; N@a.next = b; @0x10000000 = N@a.next.val;" "A"
+	"struct N { val, next }  fn main() { a := N { 0, 0 }; b = N { 65, 0 }; N@a.next = b; @0x10000000 = N@a.next.val; } main();" "A"
 test_output  "3-level chain" \
-	"struct N { v, n } a := N { 0, 0 }; b := N { 0, 0 }; c = N { 65, 0 }; N@a.n = b; N@b.n = c; @0x10000000 = N@a.n.n.v;" "A"
+	"struct N { v, n }  fn main() { a := N { 0, 0 }; b := N { 0, 0 }; c = N { 65, 0 }; N@a.n = b; N@b.n = c; @0x10000000 = N@a.n.n.v; } main();" "A"
 test_output  "chain write" \
-	"struct N { v, n } a := N { 0, 0 }; b = N { 0, 0 }; N@a.n = b; N@a.n.v = 65; @0x10000000 = N@b.v;" "A"
+	"struct N { v, n }  fn main() { a := N { 0, 0 }; b = N { 0, 0 }; N@a.n = b; N@a.n.v = 65; @0x10000000 = N@b.v; } main();" "A"
 # Struct-array declarations inside function bodies and block expressions.
 test_output  "struct array in function body" \
 	"struct P { x, y } fn f() { P@arr[3]; P@arr[0].x = 65; P@arr[0].x } @0x10000000 = f();" "A"
 test_output  "struct array in function with loop" \
 	"struct P { x, y } fn f() { P@arr[3]; for i in 0..3 { P@arr[i].x = 'A' + i; }; @0x10000000 = P@arr[0].x; @0x10000000 = P@arr[1].x; @0x10000000 = P@arr[2].x; 0 } f();" "ABC"
 test_output  "struct array in block expression" \
-	"struct P { x } v = { P@pts[2]; P@pts[0].x = 65; P@pts[0].x }; @0x10000000 = v;" "A"
+	"struct P { x } fn main() { v = { P@pts[2]; P@pts[0].x = 65; P@pts[0].x }; @0x10000000 = v; } main();" "A"
 test_output  "sizeof(StructName)" \
 	"struct P { x, y, z } @0x10000000 = sizeof(P) + 53;" "A"
 test_output  "sizeof in function" \
@@ -1474,19 +1501,19 @@ test_output  "caller vars survive callee with many vars" \
 	"fn cle() { a := 99; b := 99; c := 99; d := 99; a+b+c+d } fn cer() { w := 10; x := 20; y := 15; z := 20; cle(); w+x+y+z } @0x10000000 = cer();" "A"
 # Test 2: var carried across loop back-edge stays live.
 test_output  "var live across loop back-edge" \
-	"x := 5; y := 0; loop { x == 0 ? break 0; y += x; x -= 1; }; @0x10000000 = y + 50;" "A"
+	"fn main() { x := 5; y := 0; loop { x == 0 ? break 0; y += x; x -= 1; }; @0x10000000 = y + 50; } main();" "A"
 # Test 3: var conditionally updated via one-armed ternary, then read.
 # Ensures the var's value at the join is consistent regardless of branch.
 test_output  "var read after one-armed ternary update" \
-	"x := 60; y := 1; y > 0 ? x += 5; @0x10000000 = x;" "A"
+	"fn main() { x := 60; y := 1; y > 0 ? x += 5; @0x10000000 = x; } main();" "A"
 # Test 4: many vars (stresses the var-register pool) used in deep expression.
 # Mixes register-homed vars with expression-stack pressure.
 test_output  "5 vars in deeply nested add" \
-	"a := 1; b := 2; c := 3; d := 4; e := 5; @0x10000000 = a+(b+(c+(d+(e+50))));" "A"
+	"fn main() { a := 1; b := 2; c := 3; d := 4; e := 5; @0x10000000 = a+(b+(c+(d+(e+50)))); } main();" "A"
 # Test 5: 11 vars — exceeds any plausible reg pool, forcing spill-to-frame
 # alongside reg-homed vars in the same expression.
 test_output  "11 vars summed (mixed reg + frame homes)" \
-	"a := 1; b := 2; c := 3; d := 4; e := 5; f := 6; g := 7; h := 8; i := 9; j := 10; k := 10; @0x10000000 = a+b+c+d+e+f+g+h+i+j+k;" "A"
+	"fn main() { a := 1; b := 2; c := 3; d := 4; e := 5; f := 6; g := 7; h := 8; i := 9; j := 10; k := 10; @0x10000000 = a+b+c+d+e+f+g+h+i+j+k; } main();" "A"
 # Test 6: function with 8 args + 4 locals, exercising arg-to-reg moves and
 # local register allocation simultaneously.
 test_output  "fn with 8 args + 4 locals" \
@@ -1533,88 +1560,88 @@ test_error "return outside function" \
 # ============================================================================
 echo "=== String literals ==="
 test_output  "string literal first byte" \
-	"s = \"A\"; @0x10000000 = @s;" "A"
+	"fn main() { s = \"A\"; @0x10000000 = @s; } main();" "A"
 test_output  "string literal multi-char" \
-	"s = \"Hello\"; @0x10000000 = @s; @0x10000000 = @(s+4);" "Ho"
+	"fn main() { s = \"Hello\"; @0x10000000 = @s; @0x10000000 = @(s+4); } main();" "Ho"
 test_output  "string literal escape \\n" \
-	"s = \"A\\nB\"; @0x10000000 = @s; @0x10000000 = @(s+2);" "AB"
+	"fn main() { s = \"A\\nB\"; @0x10000000 = @s; @0x10000000 = @(s+2); } main();" "AB"
 test_output  "string literal escape \\\\  and \\\"" \
-	"s = \"A\\\\B\\\"\"; @0x10000000 = @s; @0x10000000 = @(s+1); @0x10000000 = @(s+2); @0x10000000 = @(s+3);" 'A\B"'
+	"fn main() { s = \"A\\\\B\\\"\"; @0x10000000 = @s; @0x10000000 = @(s+1); @0x10000000 = @(s+2); @0x10000000 = @(s+3); } main();" 'A\B"'
 test_output  "string literal null terminated" \
-	"s = \"AB\"; @0x10000000 = @(s+2) + 65;" "A"
+	"fn main() { s = \"AB\"; @0x10000000 = @(s+2) + 65; } main();" "A"
 test_output  "string passed to function" \
 	"fn first(s) { @s } @0x10000000 = first(\"A\");" "A"
 test_output  "string in expression" \
 	"@0x10000000 = @\"A\";" "A"
 test_error "unterminated string" \
-	"s = \"hello;" \
-	"Error:1:6 unterminated string"
+	"fn main() { s = \"hello; } main();" \
+	"Error:1:18 unterminated string"
 test_error "invalid string escape" \
-	"s = \"\\q\";" \
-	"Error:1:8 invalid string escape"
+	"fn main() { s = \"\\q\"; } main();" \
+	"Error:1:20 invalid string escape"
 
 # ============================================================================
 echo "=== Inline asm ==="
 test_output  "asm: addi with bindings" \
-	"input := 1; output := 0; asm { (t0=input) addi t0, t0, 1 (output=t0) } @0x10000000 = output + 64;" "B"
+	"fn main() { input := 1; output := 0; asm { (t0=input) addi t0, t0, 1 (output=t0) } @0x10000000 = output + 64; } main();" "B"
 test_output  "asm: add three regs" \
-	"a := 60; b := 5; c := 0; asm { (t0=a) (t1=b) add t2, t0, t1 (c=t2) } @0x10000000 = c;" "A"
+	"fn main() { a := 60; b := 5; c := 0; asm { (t0=a) (t1=b) add t2, t0, t1 (c=t2) } @0x10000000 = c; } main();" "A"
 test_output  "asm: sub" \
-	"a := 70; b := 5; c := 0; asm { (t0=a) (t1=b) sub t2, t0, t1 (c=t2) } @0x10000000 = c;" "A"
+	"fn main() { a := 70; b := 5; c := 0; asm { (t0=a) (t1=b) sub t2, t0, t1 (c=t2) } @0x10000000 = c; } main();" "A"
 test_output  "asm: mv" \
-	"a := 65; b := 0; asm { (t0=a) mv t1, t0 (b=t1) } @0x10000000 = b;" "A"
+	"fn main() { a := 65; b := 0; asm { (t0=a) mv t1, t0 (b=t1) } @0x10000000 = b; } main();" "A"
 test_output  "asm: li small imm" \
-	"v := 0; asm { li t0, 65 (v=t0) } @0x10000000 = v;" "A"
+	"fn main() { v := 0; asm { li t0, 65 (v=t0) } @0x10000000 = v; } main();" "A"
 test_output  "asm: nop is legal" \
-	"a := 65; b := 0; asm { (t0=a) nop (b=t0) } @0x10000000 = b;" "A"
+	"fn main() { a := 65; b := 0; asm { (t0=a) nop (b=t0) } @0x10000000 = b; } main();" "A"
 test_output  "asm: wfi in unreachable branch (verifies encoding parses)" \
-	"a := 65; b := 0; asm { (t0=a) j skip wfi skip: (b=t0) } @0x10000000 = b;" "A"
+	"fn main() { a := 65; b := 0; asm { (t0=a) j skip wfi skip: (b=t0) } @0x10000000 = b; } main();" "A"
 test_output  "asm: abi names" \
-	"input := 1; output := 0; asm { (a0=input) addi a0, a0, 64 (output=a0) } @0x10000000 = output;" "A"
+	"fn main() { input := 1; output := 0; asm { (a0=input) addi a0, a0, 64 (output=a0) } @0x10000000 = output; } main();" "A"
 test_output  "asm: xori" \
-	"v := 0x43; r := 0; asm { (t0=v) xori t0, t0, 2 (r=t0) } @0x10000000 = r;" "A"
+	"fn main() { v := 0x43; r := 0; asm { (t0=v) xori t0, t0, 2 (r=t0) } @0x10000000 = r; } main();" "A"
 test_output  "asm: ori" \
-	"v := 0x40; r := 0; asm { (t0=v) ori t0, t0, 1 (r=t0) } @0x10000000 = r;" "A"
+	"fn main() { v := 0x40; r := 0; asm { (t0=v) ori t0, t0, 1 (r=t0) } @0x10000000 = r; } main();" "A"
 test_output  "asm: andi" \
-	"v := 0x4F; r := 0; asm { (t0=v) andi t0, t0, 0x41 (r=t0) } @0x10000000 = r;" "A"
+	"fn main() { v := 0x4F; r := 0; asm { (t0=v) andi t0, t0, 0x41 (r=t0) } @0x10000000 = r; } main();" "A"
 test_output  "asm: slli" \
-	"v := 0x20; r := 0; asm { (t0=v) slli t0, t0, 1 (r=t0) } @0x10000000 = r + 1;" "A"
+	"fn main() { v := 0x20; r := 0; asm { (t0=v) slli t0, t0, 1 (r=t0) } @0x10000000 = r + 1; } main();" "A"
 test_output  "asm: srli" \
-	"v := 0x82; r := 0; asm { (t0=v) srli t0, t0, 1 (r=t0) } @0x10000000 = r;" "A"
+	"fn main() { v := 0x82; r := 0; asm { (t0=v) srli t0, t0, 1 (r=t0) } @0x10000000 = r; } main();" "A"
 test_output  "asm: srai on positive" \
-	"v := 0x82; r := 0; asm { (t0=v) srai t0, t0, 1 (r=t0) } @0x10000000 = r;" "A"
+	"fn main() { v := 0x82; r := 0; asm { (t0=v) srai t0, t0, 1 (r=t0) } @0x10000000 = r; } main();" "A"
 test_output  "asm: slti true" \
-	"v := 5; r := 0; asm { (t0=v) slti t0, t0, 10 (r=t0) } @0x10000000 = r + 64;" "A"
+	"fn main() { v := 5; r := 0; asm { (t0=v) slti t0, t0, 10 (r=t0) } @0x10000000 = r + 64; } main();" "A"
 test_output  "asm: sltiu true" \
-	"v := 5; r := 0; asm { (t0=v) sltiu t0, t0, 10 (r=t0) } @0x10000000 = r + 64;" "A"
+	"fn main() { v := 5; r := 0; asm { (t0=v) sltiu t0, t0, 10 (r=t0) } @0x10000000 = r + 64; } main();" "A"
 test_output  "asm: xor" \
-	"a := 0x43; b := 0x02; r := 0; asm { (t0=a) (t1=b) xor t2, t0, t1 (r=t2) } @0x10000000 = r;" "A"
+	"fn main() { a := 0x43; b := 0x02; r := 0; asm { (t0=a) (t1=b) xor t2, t0, t1 (r=t2) } @0x10000000 = r; } main();" "A"
 test_output  "asm: or" \
-	"a := 0x40; b := 0x01; r := 0; asm { (t0=a) (t1=b) or t2, t0, t1 (r=t2) } @0x10000000 = r;" "A"
+	"fn main() { a := 0x40; b := 0x01; r := 0; asm { (t0=a) (t1=b) or t2, t0, t1 (r=t2) } @0x10000000 = r; } main();" "A"
 test_output  "asm: and" \
-	"a := 0x4F; b := 0x41; r := 0; asm { (t0=a) (t1=b) and t2, t0, t1 (r=t2) } @0x10000000 = r;" "A"
+	"fn main() { a := 0x4F; b := 0x41; r := 0; asm { (t0=a) (t1=b) and t2, t0, t1 (r=t2) } @0x10000000 = r; } main();" "A"
 test_output  "asm: sll" \
-	"a := 0x20; b := 1; r := 0; asm { (t0=a) (t1=b) sll t2, t0, t1 (r=t2) } @0x10000000 = r + 1;" "A"
+	"fn main() { a := 0x20; b := 1; r := 0; asm { (t0=a) (t1=b) sll t2, t0, t1 (r=t2) } @0x10000000 = r + 1; } main();" "A"
 test_output  "asm: srl" \
-	"a := 0x82; b := 1; r := 0; asm { (t0=a) (t1=b) srl t2, t0, t1 (r=t2) } @0x10000000 = r;" "A"
+	"fn main() { a := 0x82; b := 1; r := 0; asm { (t0=a) (t1=b) srl t2, t0, t1 (r=t2) } @0x10000000 = r; } main();" "A"
 test_output  "asm: sra positive" \
-	"a := 0x82; b := 1; r := 0; asm { (t0=a) (t1=b) sra t2, t0, t1 (r=t2) } @0x10000000 = r;" "A"
+	"fn main() { a := 0x82; b := 1; r := 0; asm { (t0=a) (t1=b) sra t2, t0, t1 (r=t2) } @0x10000000 = r; } main();" "A"
 test_output  "asm: slt true" \
-	"a := 5; b := 10; r := 0; asm { (t0=a) (t1=b) slt t2, t0, t1 (r=t2) } @0x10000000 = r + 64;" "A"
+	"fn main() { a := 5; b := 10; r := 0; asm { (t0=a) (t1=b) slt t2, t0, t1 (r=t2) } @0x10000000 = r + 64; } main();" "A"
 test_output  "asm: sltu true" \
-	"a := 5; b := 10; r := 0; asm { (t0=a) (t1=b) sltu t2, t0, t1 (r=t2) } @0x10000000 = r + 64;" "A"
+	"fn main() { a := 5; b := 10; r := 0; asm { (t0=a) (t1=b) sltu t2, t0, t1 (r=t2) } @0x10000000 = r + 64; } main();" "A"
 test_output  "asm: lw" \
-	"*buf[1]; *buf = 0x41; r := 0; asm { (t0=buf) lw t1, 0(t0) (r=t1) } @0x10000000 = r;" "A"
+	"fn main() { *buf[1]; *buf = 0x41; r := 0; asm { (t0=buf) lw t1, 0(t0) (r=t1) } @0x10000000 = r; } main();" "A"
 test_output  "asm: lw with offset" \
-	"*buf[2]; *(buf+4) = 0x41; r := 0; asm { (t0=buf) lw t1, 4(t0) (r=t1) } @0x10000000 = r;" "A"
+	"fn main() { *buf[2]; *(buf+4) = 0x41; r := 0; asm { (t0=buf) lw t1, 4(t0) (r=t1) } @0x10000000 = r; } main();" "A"
 test_output  "asm: lh" \
-	"#buf[1]; #buf = 0x41; r := 0; asm { (t0=buf) lh t1, 0(t0) (r=t1) } @0x10000000 = r;" "A"
+	"fn main() { #buf[1]; #buf = 0x41; r := 0; asm { (t0=buf) lh t1, 0(t0) (r=t1) } @0x10000000 = r; } main();" "A"
 test_output  "asm: lhu" \
-	"#buf[1]; #buf = 0x41; r := 0; asm { (t0=buf) lhu t1, 0(t0) (r=t1) } @0x10000000 = r;" "A"
+	"fn main() { #buf[1]; #buf = 0x41; r := 0; asm { (t0=buf) lhu t1, 0(t0) (r=t1) } @0x10000000 = r; } main();" "A"
 test_output  "asm: lb" \
-	"@buf[1]; @buf = 0x41; r := 0; asm { (t0=buf) lb t1, 0(t0) (r=t1) } @0x10000000 = r;" "A"
+	"fn main() { @buf[1]; @buf = 0x41; r := 0; asm { (t0=buf) lb t1, 0(t0) (r=t1) } @0x10000000 = r; } main();" "A"
 test_output  "asm: lbu" \
-	"@buf[1]; @buf = 0x41; r := 0; asm { (t0=buf) lbu t1, 0(t0) (r=t1) } @0x10000000 = r;" "A"
+	"fn main() { @buf[1]; @buf = 0x41; r := 0; asm { (t0=buf) lbu t1, 0(t0) (r=t1) } @0x10000000 = r; } main();" "A"
 test_output  "asm: sw" \
 	"*buf[1]; *buf = 0; asm { (t0=buf) li t1, 0x41 sw t1, 0(t0) } @0x10000000 = *buf;" "A"
 test_output  "asm: sh" \
@@ -1624,21 +1651,21 @@ test_output  "asm: sb" \
 test_output  "asm: sb direct to UART" \
 	"asm { lui t0, 0x10000 li t1, 0x41 sb t1, 0(t0) }" "A"
 test_output  "asm: beq taken forward" \
-	"r := 0; asm { li t0, 1 li t1, 1 beq t0, t1, skip li t2, 66 (r=t2) j done skip: li t2, 65 (r=t2) done: } @0x10000000 = r;" "A"
+	"fn main() { r := 0; asm { li t0, 1 li t1, 1 beq t0, t1, skip li t2, 66 (r=t2) j done skip: li t2, 65 (r=t2) done: } @0x10000000 = r; } main();" "A"
 test_output  "asm: beq not taken" \
-	"r := 0; asm { li t0, 1 li t1, 2 beq t0, t1, skip li t2, 65 (r=t2) j done skip: li t2, 66 (r=t2) done: } @0x10000000 = r;" "A"
+	"fn main() { r := 0; asm { li t0, 1 li t1, 2 beq t0, t1, skip li t2, 65 (r=t2) j done skip: li t2, 66 (r=t2) done: } @0x10000000 = r; } main();" "A"
 test_output  "asm: bne backward loop" \
 	"asm { lui t1, 0x10000 li t0, 0 start: addi t0, t0, 1 addi t2, t0, 64 sb t2, 0(t1) li t3, 3 bne t0, t3, start }" "ABC"
 test_output  "asm: bne taken" \
-	"r := 0; asm { li t0, 1 li t1, 2 bne t0, t1, yes li t2, 78 (r=t2) j done yes: li t2, 65 (r=t2) done: } @0x10000000 = r;" "A"
+	"fn main() { r := 0; asm { li t0, 1 li t1, 2 bne t0, t1, yes li t2, 78 (r=t2) j done yes: li t2, 65 (r=t2) done: } @0x10000000 = r; } main();" "A"
 test_output  "asm: blt" \
-	"r := 0; asm { li t0, 1 li t1, 2 blt t0, t1, yes li t2, 78 (r=t2) j done yes: li t2, 65 (r=t2) done: } @0x10000000 = r;" "A"
+	"fn main() { r := 0; asm { li t0, 1 li t1, 2 blt t0, t1, yes li t2, 78 (r=t2) j done yes: li t2, 65 (r=t2) done: } @0x10000000 = r; } main();" "A"
 test_output  "asm: bge" \
-	"r := 0; asm { li t0, 5 li t1, 3 bge t0, t1, yes li t2, 78 (r=t2) j done yes: li t2, 65 (r=t2) done: } @0x10000000 = r;" "A"
+	"fn main() { r := 0; asm { li t0, 5 li t1, 3 bge t0, t1, yes li t2, 78 (r=t2) j done yes: li t2, 65 (r=t2) done: } @0x10000000 = r; } main();" "A"
 test_output  "asm: bltu" \
-	"r := 0; asm { li t0, 1 li t1, 2 bltu t0, t1, yes li t2, 78 (r=t2) j done yes: li t2, 65 (r=t2) done: } @0x10000000 = r;" "A"
+	"fn main() { r := 0; asm { li t0, 1 li t1, 2 bltu t0, t1, yes li t2, 78 (r=t2) j done yes: li t2, 65 (r=t2) done: } @0x10000000 = r; } main();" "A"
 test_output  "asm: bgeu" \
-	"r := 0; asm { li t0, 5 li t1, 3 bgeu t0, t1, yes li t2, 78 (r=t2) j done yes: li t2, 65 (r=t2) done: } @0x10000000 = r;" "A"
+	"fn main() { r := 0; asm { li t0, 5 li t1, 3 bgeu t0, t1, yes li t2, 78 (r=t2) j done yes: li t2, 65 (r=t2) done: } @0x10000000 = r; } main();" "A"
 test_output  "asm: j forward then back" \
 	"asm { j end never: li t0, 66 lui t1, 0x10000 sb t0, 0(t1) j exit end: li t0, 65 lui t1, 0x10000 sb t0, 0(t1) exit: }" "A"
 test_output  "asm: jal zero forward" \
@@ -1646,7 +1673,7 @@ test_output  "asm: jal zero forward" \
 test_output  "asm: numeric label backward loop" \
 	"asm { lui t1, 0x10000 li t0, 0 1: addi t0, t0, 1 addi t2, t0, 64 sb t2, 0(t1) li t3, 3 bne t0, t3, 1b }" "ABC"
 test_output  "asm: numeric label forward ref" \
-	"r := 0; asm { li t0, 1 li t1, 1 beq t0, t1, 1f li t2, 78 (r=t2) j 2f 1: li t2, 65 (r=t2) 2: } @0x10000000 = r;" "A"
+	"fn main() { r := 0; asm { li t0, 1 li t1, 1 beq t0, t1, 1f li t2, 78 (r=t2) j 2f 1: li t2, 65 (r=t2) 2: } @0x10000000 = r; } main();" "A"
 test_output  "asm: multiple 1: labels (forward picks nearest)" \
 	"asm { lui t1, 0x10000 li t0, 65 sb t0, 0(t1) j 1f 1: li t0, 66 sb t0, 0(t1) j 2f 1: li t0, 67 sb t0, 0(t1) 2: }" "AB"
 test_output  "asm: two asm blocks with same 1: (macro hygiene)" \
@@ -1656,15 +1683,15 @@ test_output  "asm fn: no args" \
 test_output  "asm fn: one arg" \
 	"asm emit_byte { lui t0, 0x10000 sb a0, 0(t0) } emit_byte(65); emit_byte(66); emit_byte(67);" "ABC"
 test_output  "asm fn: two args" \
-	"asm add2 { add a0, a0, a1 } r := add2(30, 35); @0x10000000 = r;" "A"
+	"asm add2 { add a0, a0, a1 } fn main() { r := add2(30, 35); @0x10000000 = r; } main();" "A"
 test_output  "asm fn: return value" \
-	"asm inc { addi a0, a0, 1 } r := inc(64); @0x10000000 = r;" "A"
+	"asm inc { addi a0, a0, 1 } fn main() { r := inc(64); @0x10000000 = r; } main();" "A"
 test_output  "asm fn: called from regular fn" \
 	"asm inc { addi a0, a0, 1 } fn wrapper(x) { inc(x) } @0x10000000 = wrapper(64);" "A"
 test_output  "asm fn: regular fn wrapping asm fn" \
 	"fn double(x) { x + x } asm inc { addi a0, a0, 1 } @0x10000000 = double(inc(32));" "B"
 test_output  "asm fn: with branches" \
-	"asm absv { li t0, 0 blt a0, t0, neg j done neg: sub a0, zero, a0 done: } r := absv(0xFFFFFFBF); @0x10000000 = r;" "A"
+	"asm absv { li t0, 0 blt a0, t0, neg j done neg: sub a0, zero, a0 done: } fn main() { r := absv(0xFFFFFFBF); @0x10000000 = r; } main();" "A"
 test_output  "asm: .word emits instructions" \
 	"asm { .word 0x04100293 .word 0x10000337 .word 0x00530023 }" "A"
 test_output  "asm: .byte emits instructions" \
@@ -1691,7 +1718,7 @@ test_output  "line comment at EOF no newline" \
 test_output  "block comment on one line" \
 	"/* pick */ @0x10000000 = 68;" "D"
 test_output  "block comment inside expression" \
-	"x = 26 /* plus */ + 39; @0x10000000 = x;" "A"
+	"fn main() { x = 26 /* plus */ + 39; @0x10000000 = x; } main();" "A"
 test_output  "multiline block comment" \
 	"/* line1
 line2
@@ -1705,8 +1732,8 @@ test_output  "comment between tokens in a for loop" \
 test_output  "division operator isn't mistaken for comment" \
 	"@0x10000000 = 130 / 2;" "A"
 test_output  "// inside a block expression" \
-	"v = { // commented
-	65 }; @0x10000000 = v;" "A"
+	"fn main() { v = { // commented
+	65 }; @0x10000000 = v; } main();" "A"
 test_error "unterminated block comment" \
 	"/* oops" \
 	"Error:2:1 unterminated block comment"
@@ -1720,8 +1747,8 @@ echo "=== Fn scoping (not closures) ==="
 # bodies. Reading one errors "undefined variable"; assigning creates a
 # new local (which is indistinguishable from any other first-def of x).
 test_error   "top-level var inside fn body — not a closure" \
-	"x = 5; fn f() { x } f();" \
-	"Error:1:17 undefined variable"
+	"fn main() { x = 5; fn f() { x } f(); } main();" \
+	"Error:1:20 undefined variable"
 
 # ============================================================================
 echo "=== Fn call with deref prefix (*fn() / @fn() / #fn()) ==="
@@ -1729,7 +1756,7 @@ echo "=== Fn call with deref prefix (*fn() / @fn() / #fn()) ==="
 # correctly as both rvalue and lvalue at statement top level and within
 # expression context.
 test_output  "@fn() rvalue" \
-	"p := 0x80100000; @p = 65; fn addr() { 0x80100000 } @0x10000000 = @addr();" "A"
+	"fn addr() { 0x80100000 } fn main() { p := 0x80100000; @p = 65; @0x10000000 = @addr(); } main();" "A"
 test_output  "@fn() = value (assignment target)" \
 	"fn addr() { 0x10000000 } @addr() = 65;" "A"
 test_output  "#fn() = value (halfword deref assignment)" \
@@ -1771,27 +1798,27 @@ echo "=== Known C-semantics quirks (documented, not bugs) ==="
 # convention). Not a bug — matches the underlying hardware — but worth
 # locking in so a refactor can't silently change it.
 test_output  "1 << 32 == 1 (RISC-V mask)" \
-	"v := 1 << 32; @0x10000000 = v == 1 ? 'A' : 'N';" "A"
+	"fn main() { v := 1 << 32; @0x10000000 = v == 1 ? 'A' : 'N'; } main();" "A"
 test_output  "1 << 33 == 2 (RISC-V mask)" \
-	"v := 1 << 33; @0x10000000 = v == 2 ? 'A' : 'N';" "A"
+	"fn main() { v := 1 << 33; @0x10000000 = v == 2 ? 'A' : 'N'; } main();" "A"
 test_output  "1 << 64 == 1 (mask again)" \
-	"v := 1 << 64; @0x10000000 = v == 1 ? 'A' : 'N';" "A"
+	"fn main() { v := 1 << 64; @0x10000000 = v == 1 ? 'A' : 'N'; } main();" "A"
 # Division/modulo by zero returns M-extension sentinel values.
 test_output  "5 / 0 == -1 (M-ext convention)" \
-	"v := 5 / 0; @0x10000000 = v == -1 ? 'A' : 'N';" "A"
+	"fn main() { v := 5 / 0; @0x10000000 = v == -1 ? 'A' : 'N'; } main();" "A"
 test_output  "5 % 0 == 5 (remainder is dividend)" \
-	"v := 5 % 0; @0x10000000 = v == 5 ? 'A' : 'N';" "A"
+	"fn main() { v := 5 % 0; @0x10000000 = v == 5 ? 'A' : 'N'; } main();" "A"
 test_output  "5 /u 0 == -1" \
-	"v := 5 /u 0; @0x10000000 = v == -1 ? 'A' : 'N';" "A"
+	"fn main() { v := 5 /u 0; @0x10000000 = v == -1 ? 'A' : 'N'; } main();" "A"
 # Chained comparisons lower left-associatively (C semantics, not math).
 # `3 < 2 < 1` is `(3<2)<1` = `0<1` = 1 (true), NOT "is 2 between 3 and 1".
 test_output  "chained comparison — C-style left-assoc" \
 	"@0x10000000 = (3 < 2 < 1) == 1 ? 'A' : 'N';" "A"
 # Short-circuit skips RHS side effects.
 test_output  "&& short-circuits division by zero on LHS=0" \
-	"x := 0; r := (x != 0) && (10 / x > 0); @0x10000000 = r == 0 ? 'A' : 'N';" "A"
+	"fn main() { x := 0; r := (x != 0) && (10 / x > 0); @0x10000000 = r == 0 ? 'A' : 'N'; } main();" "A"
 test_output  "|| short-circuits division by zero when LHS true" \
-	"x := 0; r := (x == 0) || (10 / x > 0); @0x10000000 = r == 1 ? 'A' : 'N';" "A"
+	"fn main() { x := 0; r := (x == 0) || (10 / x > 0); @0x10000000 = r == 1 ? 'A' : 'N'; } main();" "A"
 
 # ============================================================================
 echo "=== gp points to end of binary (node base calc depends on this) ==="
@@ -1801,12 +1828,15 @@ echo "=== gp points to end of binary (node base calc depends on this) ==="
 # compile a small program, read its gp, and compare against the measured
 # binary size on disk.
 test_gp_matches_size "gp == base + aligned_size (minimal)" "$(cat <<'EOT'
+fn main() {
 g := 0;
 asm { (g = gp) }
 for i in 0..8 {
     n := (g >>u ((7 - i) << 2)) & 0xF;
     @0x10000000 = n < 10 ? '0' + n : 'A' + n - 10;
 };
+}
+main();
 EOT
 )"
 # Same invariant, larger binary (more instructions emitted).
@@ -1818,26 +1848,29 @@ fn emit_hex(v) {
     };
     0
 }
+fn main() {
 g := 0;
 asm { (g = gp) }
 emit_hex(g);
+}
+main();
 EOT
 )"
 
 # ============================================================================
 echo "=== Immutability ==="
 test_error "compound += on immutable var" \
-	"x = 5; x += 1;" \
-	"Error:1:8 cannot reassign immutable"
+	"fn main() { x = 5; x += 1; } main();" \
+	"Error:1:20 cannot reassign immutable"
 test_error "compound -= on immutable var" \
-	"x = 5; x -= 1;" \
-	"Error:1:8 cannot reassign immutable"
+	"fn main() { x = 5; x -= 1; } main();" \
+	"Error:1:20 cannot reassign immutable"
 test_error "postfix ++ on immutable var" \
-	"x = 5; x++;" \
-	"Error:1:8 cannot reassign immutable"
+	"fn main() { x = 5; x++; } main();" \
+	"Error:1:20 cannot reassign immutable"
 test_error "prefix ++ on immutable var" \
-	"x = 5; ++x;" \
-	"Error:1:10 cannot reassign immutable"
+	"fn main() { x = 5; ++x; } main();" \
+	"Error:1:22 cannot reassign immutable"
 
 # ============================================================================
 echo "=== Limits and error detection ==="
@@ -1848,7 +1881,7 @@ echo "=== Limits and error detection ==="
 
 # ── Identifier length (max 32 chars) ────────────────────────────────────────
 test_output  "identifier 32 chars (max)" \
-	"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa := 65; @0x10000000 = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;" "A"
+	"fn main() { aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa := 65; @0x10000000 = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; } main();" "A"
 test_error "identifier 33 chars (over)" \
 	"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa := 5;" \
 	"Error:1:33 identifier too long"
@@ -1872,7 +1905,7 @@ test_error "fn with 9 params (over)" \
 
 # ── Struct field count (max 16) ─────────────────────────────────────────────
 test_output  "struct with 16 fields (max)" \
-	"struct P { a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p } x = P{65,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}; @0x10000000 = P@x.a;" "A"
+	"struct P { a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p } fn main() { x = P{65,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}; @0x10000000 = P@x.a; } main();" "A"
 test_error "struct with 17 fields (over)" \
 	"struct P { a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q } x = 0;" \
 	"Error:1:45 struct has too many fields"
@@ -1881,10 +1914,10 @@ test_error "struct with 17 fields (over)" \
 # 32 unconditional breaks inside unreachable `if (0)` branches, plus one
 # real break to exit. Counts at compile time, doesn't affect runtime.
 test_output  "loop with 32 breaks (max)" \
-	"r := loop { $(for i in $(seq 1 31); do printf '0 ? break 0;'; done) break 65; }; @0x10000000 = r;" "A"
+	"fn main() { r := loop { $(for i in $(seq 1 31); do printf '0 ? break 0;'; done) break 65; }; @0x10000000 = r; } main();" "A"
 test_error "loop with 33 breaks (over)" \
-	"y := 1; loop { $(for i in $(seq 1 33); do printf '0 ? break 0;'; done) };" \
-	"Error:1:411 loop has too many 'break's"
+	"fn main() { y := 1; loop { $(for i in $(seq 1 33); do printf '0 ? break 0;'; done) }; } main();" \
+	"Error:1:423 loop has too many 'break's"
 
 # ── Value-stack depth (9 s-regs, memory spill beyond) ──────────────────────
 # Right-associative nesting forces each sub-expression to push before the
@@ -1937,15 +1970,15 @@ test_error "undefined asm label reports error" \
 
 # ── Integer literal overflow (max 2^32 - 1) ─────────────────────────────────
 test_output  "decimal literal at 2^32-1" \
-	"x := 4294967295; @0x10000000 = x == 0xFFFFFFFF ? 'A' : 'N';" "A"
+	"fn main() { x := 4294967295; @0x10000000 = x == 0xFFFFFFFF ? 'A' : 'N'; } main();" "A"
 test_error "decimal literal at 2^32" \
-	"x := 4294967296;" \
-	"Error:1:15 integer literal overflow"
+	"fn main() { x := 4294967296; } main();" \
+	"Error:1:27 integer literal overflow"
 test_output  "hex literal at 2^32-1" \
-	"x := 0xFFFFFFFF; @0x10000000 = x == 4294967295 ? 'A' : 'N';" "A"
+	"fn main() { x := 0xFFFFFFFF; @0x10000000 = x == 4294967295 ? 'A' : 'N'; } main();" "A"
 test_error "hex literal at 2^32" \
-	"x := 0x100000000;" \
-	"Error:1:16 integer literal overflow"
+	"fn main() { x := 0x100000000; } main();" \
+	"Error:1:28 integer literal overflow"
 
 # ── Array count overflow (N * stride must fit in 2^20 frame) ────────────────
 # Struct arrays have stride = fields*4 (up to 64). Byte arrays cap at ~2^20.
@@ -2205,9 +2238,9 @@ test_output "macro arg with parenthesized fn call (paren tracking)" \
 test_output "macro arg with comma inside nested parens" \
 	"fn add(a, b) { a + b } macro show v { @0x10000000 = \\v; } show((add(60, 5)));" "A"
 test_output "negative rept iteration with positive offset" \
-	"rept i in -2..3 { x := \\i + 67; @0x10000000 = x; }" "ABCDE"
+	"rept i in -2..3 { @0x10000000 = \\i + 67; }" "ABCDE"
 test_output "rept counter as negative literal substitution" \
-	"rept i in -1..2 { y := 0 - \\i + 65; @0x10000000 = y; }" "BA@"
+	"rept i in -1..2 { @0x10000000 = 0 - \\i + 65; }" "BA@"
 test_compiles "asm addi max positive imm (2047)" \
 	"asm { addi t0, zero, 2047 }"
 test_error "asm addi imm over 12 bits" \
@@ -2252,17 +2285,17 @@ echo "=== Error messages ==="
 # Note: compile() pipes via `echo "$src"` which appends a trailing newline,
 # so EOF errors report one line past the last source line, col 1.
 test_error "missing ';' at EOF" \
-	"x := 5" \
+	"@0x10000000 = 5" \
 	"Error:2:1 Expected ';' at end of input"
 test_error "missing ';' before next stmt" \
-	"x := 5 y := 6;" \
-	"Error:1:8 Expected ';' found 'y'"
+	"@0x10000000 = 5 @0x10000000 = 6;" \
+	"Error:1:17 Expected ';' found '@'"
 test_error "missing ';' after multi-line input" \
-	"$(printf 'a = 1;\nb := 2')" \
+	"$(printf '@0x10000000 = 1;\n@0x10000000 = 2')" \
 	"Error:3:1 Expected ';' at end of input"
 test_error "column tracking on same line" \
-	"a = 5; b := 5 c := 0;" \
-	"Error:1:15 Expected ';' found 'c'"
+	"@0x10000000 = 1; @0x10000000 = 5 @0x10000000 = 0;" \
+	"Error:1:34 Expected ';' found '@'"
 
 # ── FILE: directive for multi-file error reporting ──────────────────────────
 # A /* FILE: NAME */ (or // FILE: NAME) comment inside the input restarts
@@ -2270,17 +2303,17 @@ test_error "column tracking on same line" \
 # subsequent error message. Used to cat multiple source files through UART
 # while keeping error messages readable.
 test_error "FILE: block comment reports filename" \
-	"$(printf '/* FILE: stdlib.fam */\nx = ;')" \
-	"Error: stdlib.fam:2:5 Expected expression found ';'"
+	"$(printf '/* FILE: stdlib.fam */\n@0x10000000 = ;')" \
+	"Error: stdlib.fam:2:15 Expected expression found ';'"
 test_error "FILE: line comment reports filename" \
-	"$(printf '// FILE: prelude.fam\ny = ;')" \
-	"Error: prelude.fam:2:5 Expected expression found ';'"
+	"$(printf '// FILE: prelude.fam\n@0x10000000 = ;')" \
+	"Error: prelude.fam:2:15 Expected expression found ';'"
 test_error "FILE: restarts line numbering at comment's opening line" \
-	"$(printf 'x = 1;\ny = 2;\n/* FILE: next.fam */\nz = ;')" \
-	"Error: next.fam:2:5 Expected expression found ';'"
+	"$(printf '@0x10000000 = 1;\n@0x10000000 = 2;\n/* FILE: next.fam */\n@0x10000000 = ;')" \
+	"Error: next.fam:2:15 Expected expression found ';'"
 test_error "FILE: later directive wins" \
-	"$(printf '/* FILE: a.fam */\nx = 1;\n/* FILE: b.fam */\nz = ;')" \
-	"Error: b.fam:2:5 Expected expression found ';'"
+	"$(printf '/* FILE: a.fam */\n@0x10000000 = 1;\n/* FILE: b.fam */\n@0x10000000 = ;')" \
+	"Error: b.fam:2:15 Expected expression found ';'"
 # Missing ')'.
 test_error "missing ')' at EOF" \
 	"@0x10000000 = (1 + 2" \
@@ -2290,30 +2323,30 @@ test_error "missing ')' found ';'" \
 	"Error:1:21 Expected ')' found ';'"
 # Missing '}' / ';' in a block.
 test_error "missing '}' at EOF" \
-	"x = { 1; 2" \
+	"@0x10000000 = { 1; 2" \
 	"Error:2:1 Expected '}' or ';' at end of input"
 test_error "block-separator error shape" \
-	"x = { 1 2 };" \
-	"Error:1:9 Expected '}' or ';' found '2'"
+	"@0x10000000 = { 1 2 };" \
+	"Error:1:19 Expected '}' or ';' found '2'"
 # Missing primary expression.
 test_error "bare '@' at EOF" \
 	"@" \
 	"Error:2:1 Expected expression at end of input"
 test_error "RHS of '=' missing" \
-	"x = ;" \
-	"Error:1:5 Expected expression found ';'"
+	"fn main() { x = ; } main();" \
+	"Error:1:17 Expected expression found ';'"
 test_error "primary in paren missing" \
-	"x = (1 + );" \
-	"Error:1:10 Expected expression found ')'"
+	"fn main() { x = (1 + ); } main();" \
+	"Error:1:22 Expected expression found ')'"
 # Lvalue errors.
 test_error "'=' on non-lvalue expression" \
-	"x = 0; y = 0; (x & y) = 1;" \
-	"Error:1:24 left of '=' is not an lvalue"
+	"fn main() { x = 0; y = 0; (x & y) = 1; } main();" \
+	"Error:1:36 left of '=' is not an lvalue"
 test_error "'++' on numeric literal" \
-	"x = ++5;" \
-	"Error:1:7 '++'/'--' requires an lvalue"
+	"fn main() { x = ++5; } main();" \
+	"Error:1:19 '++'/'--' requires an lvalue"
 test_error "line tracking — error on line 3" \
-	"$(printf 'a = 1;\nb = 2;\nc := 3')" \
+	"$(printf '@0x10000000 = 1;\n@0x10000000 = 2;\n@0x10000000 = 3')" \
 	"Error:4:1 Expected ';' at end of input"
 # for-loop parse errors
 test_error "for without ident" \
@@ -2337,17 +2370,17 @@ test_error "unknown char-literal escape" \
 # Undefined-variable detection: reads of names that haven't been assigned yet
 # are rejected. First use on the LHS of a bare '=' is still a declaration.
 test_error "undefined var on RHS of assignment" \
-	"y = z;" \
-	"Error:1:5 undefined variable"
+	"fn main() { y = z; } main();" \
+	"Error:1:17 undefined variable"
 test_error "undefined var in expression" \
-	"x = 5; @0x10000000 = y + 1;" \
-	"Error:1:22 undefined variable"
+	"fn main() { x = 5; @0x10000000 = y + 1; } main();" \
+	"Error:1:34 undefined variable"
 test_error "undefined var inside for body" \
 	"for i in 0..3 { qq + 1; };" \
 	"Error:1:17 undefined variable"
 test_error "undefined var inside block" \
-	"v = { r };" \
-	"Error:1:7 undefined variable"
+	"fn main() { v = { r }; } main();" \
+	"Error:1:19 undefined variable"
 test_error "compound '+=' on undef var" \
 	"y += 3;" \
 	"Error:1:1 undefined variable"

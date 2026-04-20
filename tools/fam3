@@ -1,0 +1,60 @@
+#!/bin/sh
+# Assemble a source file using a bootstrap assembler binary.
+# Usage: compile <assembler> <source> [output]
+# If output is omitted, replaces extension with .bin
+
+if [ $# -lt 1 ]; then
+	echo "Usage: $0 <source> [output]"
+	echo "Example: $0 tmp/test.fam3 tmp/test.bin"
+	exit 1
+fi
+
+SELF="$0"
+[ -L "$SELF" ] && SELF="$(readlink -f "$SELF")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+ASM="$ROOT_DIR/bin/fam3"
+SRC="$1"
+
+if [ ! -e "$ASM" ]; then
+	echo "Error: $ASM not found"
+	exit 1
+fi
+if [ ! -e "$SRC" ]; then
+	echo "Error: $SRC not found"
+	exit 1
+fi
+
+if [ -n "$2" ]; then
+	OUT="$2"
+else
+	OUT="${SRC%.*}.bin"
+fi
+
+CPU="rv32,m=false,a=false,f=false,d=false,c=false,\
+zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\
+zcd=false,zcf=false,zcmp=false,zcmt=false,zicsr=false,zifencei=false"
+
+(cat "$SRC"; printf '\004') | qemu-system-riscv32 \
+	-machine virt \
+	-cpu "$CPU" \
+	-nographic \
+	-bios none \
+	-device loader,file="$ASM",addr=0x80000000 \
+	-serial mon:stdio 2>/dev/null > "$OUT"
+
+if [ ! -s "$OUT" ]; then
+	echo "Error: assembler produced no output"
+	rm -f "$OUT"
+	exit 1
+fi
+
+MAGIC=$(head -c 4 "$OUT" | xxd -p)
+if [ "$MAGIC" != "13000000" ]; then
+	# Not a valid binary — print the error output and clean up
+	cat "$OUT"
+	rm -f "$OUT"
+	exit 1
+fi
+
+echo "$OUT ($(wc -c < "$OUT") bytes)"

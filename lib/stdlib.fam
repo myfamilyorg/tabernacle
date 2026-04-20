@@ -1,0 +1,75 @@
+// FILE: stdlib.fam
+
+fn exit(code) {
+	*(0x00100000) = (code << 16) | 0x3333;
+	loop asm { wfi };
+}
+
+fn puts(s) {
+	const UART = 0x10000000;
+	loop {
+		loop @(UART + 5) & 0x20 ? break;
+		@s ? @UART = @s++ : break;
+	}
+}
+
+fn putc(c) {
+	UART = 0x10000000;
+	loop {
+		@(UART + 5) & 0x20 ? break;
+	};
+	@UART = c;
+}
+
+fn print_hex(n) {
+	const UART = 0x10000000;
+	i := 28;
+	loop {
+		d := (n >> i) & 0xF;
+		d < 10 ? { @UART = d + 48; } : { @UART = d + 55; }
+		i ? i = i - 4 : break;
+	}
+}
+
+fn print_dec(n) {
+	@buf[16];
+	count := 0;
+	loop {
+		@buf[count++] = '0' + n %u 10;
+		n = n /u 10;
+		!n ? break;
+	}
+	loop {
+		!count-- ? break;
+		putc(@buf[count]);
+	}
+}
+
+fn panic(msg) {
+	puts("PANIC: ");
+	puts(msg);
+	putc('\n');
+	exit(255);
+}
+
+fn alloc(n) {
+	n_aligned = (n + 3) & 0xFFFFFFFC;
+	old_gp := 0;
+	asm { (old_gp = gp) };
+	new_gp = old_gp + n_aligned;
+	guard := 0;
+	asm { (guard = s1) };
+	new_gp >= guard ? panic("heap overflow");
+	asm { (gp = new_gp) };
+	old_gp
+}
+
+// Setup stack/heap with guard
+asm {
+	li t0, 0x1000000 // add 16 MiB to the stack pointer
+	add sp, sp, t0
+	li t0, 0x400000 // 4 MiB stack / heap top
+	sub s1, sp, t0
+}
+
+exit(main());

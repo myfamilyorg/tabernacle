@@ -15870,6 +15870,14 @@ la_cs:
 	lla	t0, lookup_was_new
 	lw	t4, 0(t0)
 	beqz	t4, cs_fb
+	# NEW entry — reject if we are at top level (current_fn == 0).
+	# Top-level code must not declare variables; use 'const' instead.
+	lla	t0, current_fn
+	lw	t0, 0(t0)
+	bnez	t0, la_cs_in_fn
+	addi	a0, zero, 91
+	j	report_err
+la_cs_in_fn:
 	# NEW entry — set mutability from the assign_is_mut flag.
 	lla	t0, assign_is_mut
 	lw	t3, 0(t0)
@@ -18467,6 +18475,10 @@ err_tbl:
 	.byte	1, 20
 	.ascii	"bad const expression"
 	.zero	10
+	# slot 91 — raw: variable declaration at top level
+	.byte	1, 26
+	.ascii	"variable decl at top level"
+	.zero	4
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Register name tables for asm blocks.
