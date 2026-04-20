@@ -1267,7 +1267,7 @@ def main():
 
         preamble = (
             "#!/usr/bin/env bash\nset -u\n"
-            "PASS=0; FAIL=0; TOTAL=0; VERBOSE=0\n"
+            "PASS=0; FAIL=0; TOTAL=0; VERBOSE=0; COVERAGE=1\n"
             "echo() { :; }\n"
             "test_output()          { printf '%s\\0' \"$2\"; }\n"
             "test_compiles()        { printf '%s\\0' \"$2\"; }\n"
@@ -1281,8 +1281,8 @@ def main():
             if '=== Literals ===' in line:
                 in_tests = True
             if in_tests:
-                if '=== Results ===' in line:
-                    break
+                if line.strip() == 'exit 0':
+                    continue
                 test_section.append(line)
 
         script = preamble + ''.join(test_section)
