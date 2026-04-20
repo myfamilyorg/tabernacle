@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Binary-level formal verification of famc (61014 bytes: 14375 code instructions
+Binary-level formal verification of famc (61249 bytes: 14431 code instructions
 + embedded data tables including error strings and register names).
 
 famc is the fifth and final stage of the bootstrap chain (fam0→fam1→fam2→fam3→famc).
@@ -8,7 +8,7 @@ It is a self-contained compiler that translates C-like source code into bare-met
 RV32I binaries. Verification layers:
 
   Layer 1 — Bit-level instruction semantics
-    Round-trip encode/decode of all 14368 code instructions.
+    Round-trip encode/decode of all 14431 code instructions.
     ISA restriction checks: pure RV32I, no extensions.
 
   Layer 2 — Exhaustive store/load enumeration

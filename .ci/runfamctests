@@ -948,7 +948,7 @@ test_output  "block-scoped var: inner block modifies outer via :=" \
 
 test_error   "block-scoped var: inner var not visible after block" \
 	"fn f() { { y = 65; }; @0x10000000 = y; } f();" \
-	"Error:1:37 undefined variable"
+	"Error:1:37 undefined variable 'y'"
 
 test_output  "block-scoped var: loop body scopes var" \
 	"fn f() { x := 0; loop { y = 1; x := x + y; x > 2 ? break; }; @0x10000000 = x + 62; } f();" "A"
@@ -1030,7 +1030,7 @@ test_output  "scope: const shadows outer const in inner block" \
 
 test_error   "scope: const not visible after loop body" \
 	"fn f() { loop { const X = 1; break; } @0x10000000 = X; } f();" \
-	"Error:1:53 undefined variable"
+	"Error:1:53 undefined variable 'X'"
 
 # Mixed const + var interactions
 test_output  "scope: var shadows const in inner block" \
@@ -1042,7 +1042,7 @@ test_output  "scope: const and immut var coexist" \
 # Nested function scope isolation
 test_error   "scope: fn body cannot read outer var" \
 	"fn f() { @0x10000000 = x; } fn main() { x = 65; f(); } main();" \
-	"Error:1:24 undefined variable"
+	"Error:1:24 undefined variable 'x'"
 
 # Deep nesting: block inside loop inside fn
 test_output  "scope: deep nesting — shadow + restore" \
@@ -1537,7 +1537,7 @@ print('@0x10000000 = g0(32) + g1(31);')
 # Error cases
 test_error "undefined function" \
 	"f();" \
-	"Error:1:1 undefined function"
+	"Error:1:1 undefined function 'f'"
 test_error "wrong arg count — too few" \
 	"fn f(x, y) { x + y } f(1);" \
 	"Error:1:26 wrong number of arguments"
@@ -1748,7 +1748,7 @@ echo "=== Fn scoping (not closures) ==="
 # new local (which is indistinguishable from any other first-def of x).
 test_error   "top-level var inside fn body — not a closure" \
 	"fn main() { x = 5; fn f() { x } f(); } main();" \
-	"Error:1:20 undefined variable"
+	"Error:1:20 undefined variable 'fn'"
 
 # ============================================================================
 echo "=== Fn call with deref prefix (*fn() / @fn() / #fn()) ==="
@@ -2127,19 +2127,19 @@ test_error  "const bad expression token" \
 
 test_error  "const undefined reference" \
 	"const X = NOPE + 1;" \
-	"Error:1:11 undefined variable"
+	"Error:1:11 undefined variable 'NOPE'"
 
 test_error  "const out of scope after block" \
 	"fn f() { { const X = 65; }; @0x10000000 = X; } f();" \
-	"Error:1:43 undefined variable"
+	"Error:1:43 undefined variable 'X'"
 
 test_error  "const out of scope after loop" \
 	"fn f() { loop { const X = 65; break; }; @0x10000000 = X; } f();" \
-	"Error:1:55 undefined variable"
+	"Error:1:55 undefined variable 'X'"
 
 test_error  "const in fn not visible at top level" \
 	"fn f() { const X = 65; } @0x10000000 = X;" \
-	"Error:1:40 undefined variable"
+	"Error:1:40 undefined variable 'X'"
 
 test_output "const visible within same block" \
 	"fn f() { { const X = 86; @0x10000000 = X; }; } f();" "V"
@@ -2371,28 +2371,28 @@ test_error "unknown char-literal escape" \
 # are rejected. First use on the LHS of a bare '=' is still a declaration.
 test_error "undefined var on RHS of assignment" \
 	"fn main() { y = z; } main();" \
-	"Error:1:17 undefined variable"
+	"Error:1:17 undefined variable 'z'"
 test_error "undefined var in expression" \
 	"fn main() { x = 5; @0x10000000 = y + 1; } main();" \
-	"Error:1:34 undefined variable"
+	"Error:1:34 undefined variable 'y'"
 test_error "undefined var inside for body" \
 	"for i in 0..3 { qq + 1; };" \
-	"Error:1:17 undefined variable"
+	"Error:1:17 undefined variable 'qq'"
 test_error "undefined var inside block" \
 	"fn main() { v = { r }; } main();" \
-	"Error:1:19 undefined variable"
+	"Error:1:19 undefined variable 'r'"
 test_error "compound '+=' on undef var" \
 	"y += 3;" \
-	"Error:1:1 undefined variable"
+	"Error:1:1 undefined variable 'y'"
 test_error "compound '*=' on undef var" \
 	"q *= 2;" \
-	"Error:1:1 undefined variable"
+	"Error:1:1 undefined variable 'q'"
 test_error "'y++;' on undef var" \
 	"y++;" \
-	"Error:1:1 undefined variable"
+	"Error:1:1 undefined variable 'y'"
 test_error "'++y;' on undef var" \
 	"++z;" \
-	"Error:1:3 undefined variable"
+	"Error:1:3 undefined variable 'z'"
 # Break-list overflow (>32 breaks in one loop). Generate 35 breaks via shell
 # so the program is large but the error message is deterministic.
 test_error "break overflow in single loop" \
