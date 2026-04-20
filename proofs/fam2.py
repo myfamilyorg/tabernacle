@@ -269,10 +269,36 @@ def main():
     check(f"all {n_code} code instructions round-trip encode correctly", rt_ok)
 
     # No jalr (opcode 0x67) anywhere in the code — fam2 uses static jumps only
+    # ISA restriction checks — matches CPU config (pure RV32I, no extensions)
+    rv32i_opcodes = {0x37, 0x17, 0x6F, 0x63, 0x03, 0x23, 0x13, 0x33}
+    for i in range(n_code):
+        w = words[i]
+        op = rv_opcode(w)
+        if op not in rv32i_opcodes and op != 0x67:
+            check(f"0x{i*4:04x}: unexpected opcode 0x{op:02x}", False)
+
     jalr_pcs = [i * 4 for i in range(n_code) if rv_opcode(words[i]) == 0x67]
-    check("no jalr instructions in code (static jumps only)", len(jalr_pcs) == 0)
-    for pc in jalr_pcs[:5]:
-        print(f"         jalr at 0x{pc:04x}")
+    check("no jalr (static jumps only)", len(jalr_pcs) == 0)
+
+    system_pcs = [i * 4 for i in range(n_code) if rv_opcode(words[i]) == 0x73]
+    check("no SYSTEM (no ecall/ebreak/CSR — zicsr=false)", len(system_pcs) == 0)
+
+    fence_pcs = [i * 4 for i in range(n_code) if rv_opcode(words[i]) == 0x0F]
+    check("no FENCE (zifencei=false)", len(fence_pcs) == 0)
+
+    mext_pcs = [i * 4 for i in range(n_code)
+                if rv_opcode(words[i]) == 0x33 and rv_funct7(words[i]) == 0x01]
+    check("no M-extension (m=false, no mul/div)", len(mext_pcs) == 0)
+
+    amo_pcs = [i * 4 for i in range(n_code) if rv_opcode(words[i]) == 0x2F]
+    check("no A-extension (a=false, no atomics)", len(amo_pcs) == 0)
+
+    fp_opcodes = {0x07, 0x27, 0x43, 0x47, 0x4B, 0x4F, 0x53}
+    fp_pcs = [i * 4 for i in range(n_code) if rv_opcode(words[i]) in fp_opcodes]
+    check("no F/D-extension (f=false, d=false, no float)", len(fp_pcs) == 0)
+
+    compressed = [i * 4 for i in range(n_code) if words[i] & 0x3 != 0x3]
+    check("no compressed instructions (c=false, all 32-bit)", len(compressed) == 0)
 
     # ═══════════════════════════════════════════════════════════
     # [1] Exhaustive store enumeration
@@ -309,6 +335,30 @@ def main():
           len(unknown_stores) == 0)
     for pc, w, r1, r2, imm in unknown_stores:
         print(f"         unknown: @0x{pc:04x} {w} x{r2}, {imm}(x{r1})")
+
+    # Exhaustive load enumeration
+    print(f"\n    Load instruction enumeration")
+
+    loads = []
+    for i in range(n_code):
+        w = words[i]
+        if rv_opcode(w) == 0x03:  # LOAD
+            pc = i * 4
+            rs1 = rv_rs1(w)
+            loads.append((pc, rs1))
+
+    print(f"  INFO  {len(loads)} load instructions in code section")
+
+    # fam2 loads from: sp(2), s5(21) UART, s10(26) token buf, s4(20) symtab,
+    # s8(24) fixup, s1(9) output, t2(5)/t0(5) computed, t3(28)/t6(31) iterators,
+    # s9(25) mnem table, s11(27) reg table, a5(15) mnem entry, etc.
+    load_bases = {rs1 for _, rs1 in loads}
+    known_load_bases = {2, 5, 6, 7, 9, 15, 18, 19, 20, 21, 24, 25, 26, 27, 28, 29, 31}
+    unknown_load_bases = load_bases - known_load_bases
+    check("all loads use known base registers",
+          len(unknown_load_bases) == 0)
+    for b in unknown_load_bases:
+        print(f"         unknown load base: x{b}")
 
     # ═══════════════════════════════════════════════════════════
     # [2] Branch target verification
@@ -382,11 +432,24 @@ def main():
             mnem_ok = False
     check("all mnemonic templates match RV32I spec", mnem_ok)
 
-    # jalr/ret/jr not in mnemonic table (fam2 uses static jumps only)
+    # Verify mnemonic table cannot emit disabled extensions
     mnem_names = {name for name, _, _, _, _ in mnem_entries}
-    check("jalr not in mnemonic table", 'jalr' not in mnem_names)
-    check("ret not in mnemonic table", 'ret' not in mnem_names)
-    check("jr not in mnemonic table", 'jr' not in mnem_names)
+    excluded_mnemonics = [
+        'jalr', 'ret', 'jr',                              # no indirect jumps
+        'ecall', 'ebreak', 'csrr', 'csrw', 'csrs', 'csrc',  # no SYSTEM (zicsr=false)
+        'csrrs', 'csrrc', 'csrrw', 'csrrwi', 'csrrsi', 'csrrci',
+        'fence', 'fence.i',                                # zifencei=false
+        'mul', 'mulh', 'mulhsu', 'mulhu', 'div', 'divu', 'rem', 'remu',  # m=false
+        'lr.w', 'sc.w', 'amoswap.w', 'amoadd.w', 'amoand.w',  # a=false
+        'amoor.w', 'amoxor.w', 'amomax.w', 'amomin.w',
+        'flw', 'fsw', 'fadd.s', 'fsub.s', 'fmul.s', 'fdiv.s',  # f=false
+        'fld', 'fsd', 'fadd.d', 'fsub.d', 'fmul.d', 'fdiv.d',  # d=false
+    ]
+    found_excluded = [m for m in excluded_mnemonics if m in mnem_names]
+    check("mnemonic table excludes all disabled extensions",
+          len(found_excluded) == 0)
+    for m in found_excluded:
+        print(f"         found excluded mnemonic: {m}")
 
     # Verify opcode templates decompose correctly
     template_ok = True
@@ -1163,9 +1226,10 @@ def main():
         print(f"\nProof chain:")
         print(f"  bin/fam2 (5744 bytes: {n_code} code instructions + data tables)")
         print(f"    → bit-field extraction (round-trip validated)")
-        print(f"    → exhaustive store enumeration")
+        print(f"    → ISA: pure RV32I (no jalr/SYSTEM/FENCE/M/A/F/D/C)")
+        print(f"    → exhaustive store + load enumeration (known bases only)")
         print(f"    → branch targets mechanically checked")
-        print(f"    → mnemonic table: 42 entries verified against RV32I spec")
+        print(f"    → mnemonic table: 42 entries verified, extensions excluded")
         print(f"    → register table: 33 entries verified")
         print(f"    → Z3 encoder proofs: R/I/S/B/U/J all correct")
         print(f"    → B/J-type round-trip encoding proven")

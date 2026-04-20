@@ -172,8 +172,36 @@ def main():
             rt_ok = False
     check(f"all {N} instructions round-trip encode correctly", rt_ok)
 
+    # ISA restriction checks — matches CPU config (pure RV32I, no extensions)
+    rv32i_opcodes = {0x37, 0x17, 0x6F, 0x63, 0x03, 0x23, 0x13, 0x33}
+    for i in range(N):
+        w = words[i]
+        op = rv_opcode(w)
+        if op not in rv32i_opcodes and op != 0x67:
+            check(f"0x{i*4:03x}: unexpected opcode 0x{op:02x}", False)
+
     jalr_pcs = [i * 4 for i in range(N) if rv_opcode(words[i]) == 0x67]
-    check("no jalr instructions in binary (static jumps only)", len(jalr_pcs) == 0)
+    check("no jalr (static jumps only)", len(jalr_pcs) == 0)
+
+    system_pcs = [i * 4 for i in range(N) if rv_opcode(words[i]) == 0x73]
+    check("no SYSTEM (no ecall/ebreak/CSR — zicsr=false)", len(system_pcs) == 0)
+
+    fence_pcs = [i * 4 for i in range(N) if rv_opcode(words[i]) == 0x0F]
+    check("no FENCE (zifencei=false)", len(fence_pcs) == 0)
+
+    mext_pcs = [i * 4 for i in range(N)
+                if rv_opcode(words[i]) == 0x33 and rv_funct7(words[i]) == 0x01]
+    check("no M-extension (m=false, no mul/div)", len(mext_pcs) == 0)
+
+    amo_pcs = [i * 4 for i in range(N) if rv_opcode(words[i]) == 0x2F]
+    check("no A-extension (a=false, no atomics)", len(amo_pcs) == 0)
+
+    fp_opcodes = {0x07, 0x27, 0x43, 0x47, 0x4B, 0x4F, 0x53}
+    fp_pcs = [i * 4 for i in range(N) if rv_opcode(words[i]) in fp_opcodes]
+    check("no F/D-extension (f=false, d=false, no float)", len(fp_pcs) == 0)
+
+    compressed = [i * 4 for i in range(N) if words[i] & 0x3 != 0x3]
+    check("no compressed instructions (c=false, all 32-bit)", len(compressed) == 0)
 
     # ═══════════════════════════════════════════════════════════
     # [1] Exhaustive store enumeration
@@ -239,6 +267,28 @@ def main():
             check(f"store @0x{pc:03x}: {desc}", ok)
         else:
             print(f"  INFO  extra store @0x{pc:03x}: {width} x{rs2}({RNAMES[rs2]}), {imm}(x{rs1}({RNAMES[rs1]}))")
+
+    # Exhaustive load enumeration
+    print("\n    Load instruction enumeration")
+
+    loads = []
+    for i, w in enumerate(words):
+        if rv_opcode(w) == 0x03:  # LOAD
+            pc = i * 4
+            rs1 = rv_rs1(w)
+            loads.append((pc, rs1))
+
+    # fam1 loads from: s5/x21 (UART), s1/x9 (output buffer), s7/x23 (label tbl via scan),
+    # s8/x24 (label tbl write ptr), s10/x26 (fixup tbl write ptr),
+    # t0/x5 (computed addr for table entries), t2/x7 (instruction addr during patching),
+    # t6/x31 (fixup iterator), t0/x5 (label scan)
+    load_bases = {rs1 for _, rs1 in loads}
+    known_load_bases = {5, 7, 9, 21, 23, 31}  # t0, t2, s1, s5, s7, t6
+    unknown_load_bases = load_bases - known_load_bases
+    check("all loads use known base registers (UART/buffer/tables/computed)",
+          len(unknown_load_bases) == 0)
+    for b in unknown_load_bases:
+        print(f"         unknown load base: x{b} ({RNAMES[b]})")
 
     # ═══════════════════════════════════════════════════════════
     # [2] Branch target verification
@@ -984,7 +1034,9 @@ def main():
         print(f"\nProof chain:")
         print(f"  bin/fam1 (576 bytes, 144 instructions)")
         print(f"    → bit-field extraction (round-trip validated)")
+        print(f"    → no jalr / no SYSTEM / no M-extension")
         print(f"    → exhaustive store enumeration (9 stores, each verified)")
+        print(f"    → exhaustive load enumeration (known bases only)")
         print(f"    → branch targets mechanically checked")
         print(f"    → initialization: all 11 setup instructions verified")
         print(f"    → Z3 invariant induction (hex loop, nibble packing)")

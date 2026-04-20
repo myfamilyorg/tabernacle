@@ -72,6 +72,7 @@ def rv_rd(w):     return (w >> 7) & 0x1F
 def rv_funct3(w): return (w >> 12) & 0x7
 def rv_rs1(w):    return (w >> 15) & 0x1F
 def rv_rs2(w):    return (w >> 20) & 0x1F
+def rv_funct7(w): return (w >> 25) & 0x7F
 
 def rv_imm_i(w):
     return sign_ext((w >> 20) & 0xFFF, 12)
@@ -160,8 +161,36 @@ def main():
             rt_ok = False
     check(f"all {N} instructions round-trip encode correctly", rt_ok)
 
+    # ISA restriction checks — matches CPU config (pure RV32I, no extensions)
+    rv32i_opcodes = {0x37, 0x17, 0x6F, 0x63, 0x03, 0x23, 0x13, 0x33}
+    for i in range(N):
+        w = words[i]
+        op = rv_opcode(w)
+        if op not in rv32i_opcodes and op != 0x67:
+            check(f"0x{i*4:02x}: unexpected opcode 0x{op:02x}", False)
+
     jalr_pcs = [i * 4 for i in range(N) if rv_opcode(words[i]) == 0x67]
-    check("no jalr instructions in binary (static jumps only)", len(jalr_pcs) == 0)
+    check("no jalr (static jumps only)", len(jalr_pcs) == 0)
+
+    system_pcs = [i * 4 for i in range(N) if rv_opcode(words[i]) == 0x73]
+    check("no SYSTEM (no ecall/ebreak/CSR — zicsr=false)", len(system_pcs) == 0)
+
+    fence_pcs = [i * 4 for i in range(N) if rv_opcode(words[i]) == 0x0F]
+    check("no FENCE (zifencei=false)", len(fence_pcs) == 0)
+
+    mext_pcs = [i * 4 for i in range(N)
+                if rv_opcode(words[i]) == 0x33 and rv_funct7(words[i]) == 0x01]
+    check("no M-extension (m=false, no mul/div)", len(mext_pcs) == 0)
+
+    amo_pcs = [i * 4 for i in range(N) if rv_opcode(words[i]) == 0x2F]
+    check("no A-extension (a=false, no atomics)", len(amo_pcs) == 0)
+
+    fp_opcodes = {0x07, 0x27, 0x43, 0x47, 0x4B, 0x4F, 0x53}
+    fp_pcs = [i * 4 for i in range(N) if rv_opcode(words[i]) in fp_opcodes]
+    check("no F/D-extension (f=false, d=false, no float)", len(fp_pcs) == 0)
+
+    compressed = [i * 4 for i in range(N) if words[i] & 0x3 != 0x3]
+    check("no compressed instructions (c=false, all 32-bit)", len(compressed) == 0)
 
     # ═══════════════════════════════════════════════════════════
     # [1] Exhaustive store enumeration
@@ -192,6 +221,21 @@ def main():
     # Store 3: 0xa4 sw t1, 0(s5) — shutdown
     check("store @0xa4: sw x6(t1), 0(x21(s5)) → shutdown",
           stores[2] == (0xa4, 'sw', 21, 6, 0))
+
+    # Exhaustive load enumeration
+    print("\n    Load instruction enumeration")
+
+    loads = []
+    for i, w in enumerate(words):
+        if rv_opcode(w) == 0x03:  # LOAD
+            pc = i * 4
+            rs1 = rv_rs1(w)
+            loads.append((pc, rs1))
+
+    # fam0 loads: all from s5 (UART=x21) or s1 (output buffer=x9)
+    load_bases = {rs1 for _, rs1 in loads}
+    check("all loads use s5 (UART) or s1 (output buffer) as base",
+          load_bases <= {21, 9})
 
     # ═══════════════════════════════════════════════════════════
     # [2] Branch target verification
@@ -589,6 +633,54 @@ def main():
         # fam0 correctly assembles fam1.
 
     # ═══════════════════════════════════════════════════════════
+    # [9] Fixed point: fam0(fam0.fam0) == fam0 (bootstrap root)
+    # ═══════════════════════════════════════════════════════════
+    print("\n[9] Fixed point: fam0(fam0.fam0) == bin/fam0")
+
+    fam0_src_path = os.path.join(BASE, 'src', 'fam0.fam0')
+
+    if not os.path.exists(fam0_src_path):
+        print("  SKIP  fam0.fam0 source not found")
+    else:
+        with open(fam0_src_path, 'r') as f:
+            fam0_src = f.read()
+
+        sim_s3 = 0
+        sim_s4 = 0
+        sim_t4 = 0
+        fp_output = bytearray()
+
+        for ch in fam0_src:
+            c = ord(ch)
+            if c == 10:
+                sim_s4 = 0
+            if c == ord('#'):
+                sim_s4 = 1
+            if c == 4:
+                break
+            if sim_s4 != 0:
+                continue
+            t1 = (c - 48) & 0xFFFFFFFF
+            if t1 < 10:
+                nib = t1
+            else:
+                t1 = (t1 - 7) & 0xFFFFFFFF
+                if t1 < 16:
+                    nib = t1
+                else:
+                    continue
+            sim_s3 ^= 1
+            if sim_s3 != 0:
+                sim_t4 = (nib << 4) & 0xFF
+            else:
+                fp_output.append((sim_t4 | nib) & 0xFF)
+
+        check(f"fam0(fam0.fam0) length matches bin/fam0 ({len(fp_output)} == {len(binary)})",
+              len(fp_output) == len(binary))
+        check("fam0(fam0.fam0) == bin/fam0 (fixed point)",
+              bytes(fp_output) == binary)
+
+    # ═══════════════════════════════════════════════════════════
     # Summary
     # ═══════════════════════════════════════════════════════════
     print("\n" + "=" * 60)
@@ -600,11 +692,14 @@ def main():
         print(f"\nProof chain:")
         print(f"  bin/fam0 (168 bytes)")
         print(f"    → bit-field extraction (round-trip validated)")
+        print(f"    → no jalr / no SYSTEM / no M-extension")
         print(f"    → exhaustive store enumeration (3 stores, each verified)")
+        print(f"    → exhaustive load enumeration (UART + output buffer only)")
         print(f"    → branch targets mechanically checked")
         print(f"    → Z3 model built from extracted constants")
         print(f"    → invariant induction over all 256 input bytes")
         print(f"    → concrete test: fam0(fam1.fam0) == bin/fam1")
+        print(f"    → fixed point: fam0(fam0.fam0) == bin/fam0")
     return 1 if failed > 0 else 0
 
 
