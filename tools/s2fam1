@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Convert a RISC-V .S file to fam1 hex+label format.
+
+Assembles the .S with GNU as, then formats the binary as hex bytes with
+fam1-style labels (:XXXX) and fixups (@XXXX) for branches and jumps.
+
+fam1 uses 4-character label names. GNU as labels are mapped to 4-char
+codes: L000, L001, ... (up to L999, then LA00-LZZZ).
+
+Output format:
+    :L000                       # label definition
+    XX XX XX XX  # comment      # instruction with pre-set fields
+    @L001                       # fixup: patch previous B/J instruction
+
+Usage: s2fam1 input.S [output.fam1]
+       If output is omitted, writes to stdout.
+"""
+
+import subprocess, sys, os, tempfile, re
+
+AS = "riscv64-linux-gnu-as"
+LD = "riscv64-linux-gnu-ld"
+OBJCOPY = "riscv64-linux-gnu-objcopy"
+OBJDUMP = "riscv64-linux-gnu-objdump"
+
+MARCH = "rv32i"
+MABI = "ilp32"
+LDEMU = "elf32lriscv"
+TEXT_ADDR = "0x80000000"
+
+LISTING_RE = re.compile(
+    r"^\s*(\d+)\s+"
+    r"(?:([0-9a-fA-F]{4})\s+"
+    r"([0-9a-fA-F]{2,8}))?"
+    r"\s*(.*)"
+)
+
+
+def run(cmd):
+    r = subprocess.run(cmd, capture_output=True, encoding="utf-8",
+                        errors="replace")
+    if r.returncode != 0:
+        err = "\n".join(
+            l for l in r.stderr.splitlines()
+            if "cannot find entry symbol _start" not in l
+        ).strip()
+        if err:
+            print(f"Error running {cmd[0]}:\n{err}", file=sys.stderr)
+            sys.exit(1)
+    return r
+
+
+def build(src):
+    """Assemble .S → objdump text, raw binary, listing text."""
+    with tempfile.TemporaryDirectory() as tmp:
+        obj = os.path.join(tmp, "out.o")
+        elf = os.path.join(tmp, "out.elf")
+        raw = os.path.join(tmp, "out.bin")
+
+        listing_r = run([AS, f"-march={MARCH}", f"-mabi={MABI}",
+                         "-al", src, "-o", obj])
+        run([LD, "-m", LDEMU, f"-Ttext={TEXT_ADDR}", obj, "-o", elf])
+        run([OBJCOPY, "-O", "binary", elf, raw])
+
+        with open(raw, "rb") as f:
+            binary = f.read()
+
+        disasm_r = run([OBJDUMP, "-d", "-M", "no-aliases", elf])
+
+        return listing_r.stdout, disasm_r.stdout, binary
+
+
+def parse_objdump(text):
+    """Parse objdump → {offset: disasm_text}, {offset: label_name}."""
+    base = int(TEXT_ADDR, 16)
+    insns = {}
+    labels = {}
+
+    for line in text.splitlines():
+        # Label: "80000030 <loop>:"
+        m = re.match(r"\s*([0-9a-f]+)\s+<(\w+)>:", line)
+        if m:
+            labels[int(m.group(1), 16) - base] = m.group(2)
+            continue
+
+        # Instruction
+        m = re.match(r"\s*([0-9a-f]+):\s+([0-9a-f ]+?)\s{2,}(.+)", line)
+        if m:
+            offset = int(m.group(1), 16) - base
+            dis = m.group(3).strip()
+            # Clean annotations but keep branch target info
+            dis_clean = re.sub(r"\s*#\s*[0-9a-f]+\s+<[^>]+>", "", dis)
+            dis_clean = re.sub(
+                r"[0-9a-f]+\s+<(\w+)(?:\+0x[0-9a-f]+)?>", r"\1", dis_clean)
+            insns[offset] = dis_clean
+
+            # Extract branch/jump target label
+            tm = re.search(r"<(\w+)>", dis)
+            if tm:
+                insns[f"{offset}_target"] = tm.group(1)
+
+    return insns, labels
+
+
+def parse_listing_comments(text, source_lines):
+    """Extract source comments from listing → {offset: comment},
+    {offset: [pre_lines]}, header_lines.
+
+    The GAS listing truncates each source line at ~118 columns, which
+    mangles UTF-8 (box-drawing `─`/`═` runs lose their trailing bytes and
+    end up as `�`). We work around that by looking up the original source
+    line by line number instead of reading the listing's truncated copy.
+    """
+    comments = {}
+    pre_comments = {}  # offset -> list of raw non-code lines preceding
+    header_lines = []
+    seen_code = False
+    non_code_linenos = []
+
+    def full_line(n):
+        if 1 <= n <= len(source_lines):
+            return source_lines[n - 1]
+        return ""
+
+    for line in text.splitlines():
+        if line.startswith("GAS LISTING") or line.strip() == "" or '\f' in line:
+            continue
+
+        m = LISTING_RE.match(line)
+        if not m:
+            continue
+
+        lineno = int(m.group(1))
+        offset_hex = m.group(2)
+        data_hex = m.group(3)
+
+        if data_hex and offset_hex:
+            offset = int(offset_hex, 16)
+            seen_code = True
+            # Inline comment from full source line.
+            src = full_line(lineno)
+            cm = re.search(r"[\t ]#\s*(.*)", src)
+            if cm and cm.group(1).strip():
+                comments[offset] = cm.group(1).strip()
+            # Accumulate ALL preceding non-code lines (in source order)
+            # rather than overwriting with only the last one.
+            pre_list = []
+            for nc_line in non_code_linenos:
+                nc_src = full_line(nc_line)
+                nc_fmt = nc_src.replace("\t", " ")
+                nc_fmt = re.sub(r"  +", " ", nc_fmt).strip()
+                if nc_fmt:
+                    pre_list.append(nc_fmt)
+            if pre_list:
+                pre_comments[offset] = pre_list
+            non_code_linenos = []
+        elif not data_hex:
+            src = full_line(lineno)
+            raw = src.rstrip()
+            if not seen_code:
+                if raw and not raw.lstrip().startswith("#"):
+                    raw = f"# {raw.lstrip()}"
+                header_lines.append(raw)
+            elif src.strip():
+                non_code_linenos.append(lineno)
+
+    return comments, pre_comments, header_lines
+
+
+def make_label_map(labels):
+    """Map GNU as label names → 4-char fam1 labels."""
+    mapping = {}
+    idx = 0
+    for offset in sorted(labels.keys()):
+        name = labels[offset]
+        if name in mapping:
+            continue
+        if idx < 1000:
+            code = f"L{idx:03d}"
+        else:
+            # L000-L999 exhausted, use LA00-LZZZ
+            i = idx - 1000
+            c1 = chr(ord('A') + i // (36 * 36))
+            i %= 36 * 36
+            c2 = chr(ord('0') + i // 36) if i // 36 < 10 else chr(
+                ord('A') + i // 36 - 10)
+            c3 = chr(ord('0') + i % 36) if i % 36 < 10 else chr(
+                ord('A') + i % 36 - 10)
+            code = f"{c1}{c2}{c3}"  # only 3 chars, but we need 4
+            code = f"L{code}"  # won't work past ~46K labels
+        mapping[name] = code
+        idx += 1
+    return mapping
+
+
+def is_branch_or_jump(binary, offset):
+    """Check if instruction at offset is B-type or J-type.
+    Returns 'B', 'J', or None."""
+    if offset + 4 > len(binary):
+        return None
+    opcode = binary[offset] & 0x7F
+    if opcode == 0x63:
+        return 'B'
+    if opcode == 0x6F:
+        return 'J'
+    return None
+
+
+def zero_immediate(binary, offset, typ):
+    """Return instruction word with immediate bits zeroed."""
+    word = int.from_bytes(binary[offset:offset+4], 'little')
+    if typ == 'B':
+        # B-type: clear bits [31], [30:25], [11:8], [7]
+        mask = 0x01FFF07F  # keep rs2, rs1, funct3, opcode
+        return word & mask
+    elif typ == 'J':
+        # J-type: clear bits [31], [30:21], [20], [19:12]
+        mask = 0x00000FFF  # keep rd, opcode
+        return word & mask
+    return word
+
+
+def convert(listing_text, disasm_text, binary, source_lines):
+    """Generate fam1 format output."""
+    insns, labels = parse_objdump(disasm_text)
+    comments, pre_comments, header_lines = parse_listing_comments(
+        listing_text, source_lines)
+    label_map = make_label_map(labels)
+
+    # Build reverse map: offset → label code
+    offset_to_code = {}
+    for offset, name in labels.items():
+        offset_to_code[offset] = label_map[name]
+
+    out = list(header_lines)
+    emitted_pre = set()
+
+    def flush_pre(offset):
+        """Emit all non-code lines preceding this offset, once."""
+        if offset in emitted_pre or offset not in pre_comments:
+            return
+        emitted_pre.add(offset)
+        if out and out[-1] != "":
+            out.append("")
+        for pre in pre_comments[offset]:
+            if pre.startswith("#"):
+                out.append(pre)
+            elif pre.endswith(":"):
+                # Raw source-level label — skip; we emit :XXXX below.
+                continue
+            else:
+                out.append(f"# {pre}")
+
+    for offset in range(0, len(binary), 4):
+        chunk = binary[offset:offset + 4]
+
+        # Label definition
+        if offset in offset_to_code:
+            flush_pre(offset)
+            out.append(f":{offset_to_code[offset]}")
+        else:
+            flush_pre(offset)
+
+        # Check if this is a branch/jump that targets a label
+        typ = is_branch_or_jump(binary, offset)
+        target_name = insns.get(f"{offset}_target")
+
+        if typ and target_name and target_name in label_map:
+            # Emit instruction with zeroed immediate + fixup
+            zeroed = zero_immediate(binary, offset, typ)
+            hx = " ".join(f"{b:02X}" for b in zeroed.to_bytes(4, 'little'))
+            dis = insns.get(offset, "")
+            src = comments.get(offset, "")
+            comment_parts = [p for p in [dis, src] if p]
+            comment = " ; ".join(comment_parts)
+            if comment:
+                out.append(f"{hx}\t# {comment}")
+            else:
+                out.append(hx)
+            out.append(f"@{label_map[target_name]}")
+        else:
+            # Regular instruction or data — emit raw hex
+            hx = " ".join(f"{b:02X}" for b in chunk)
+            dis = insns.get(offset, "")
+            src = comments.get(offset, "")
+            comment_parts = [p for p in [dis, src] if p]
+            comment = " ; ".join(comment_parts)
+            if comment:
+                out.append(f"{hx}\t# {comment}")
+            else:
+                out.append(hx)
+
+    while out and out[-1] == "":
+        out.pop()
+
+    return "\n".join(out) + "\n"
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} input.S [output.fam1]", file=sys.stderr)
+        sys.exit(1)
+
+    src = sys.argv[1]
+    with open(src, "r") as f:
+        source_lines = f.read().splitlines()
+    listing, disasm, binary = build(src)
+    output = convert(listing, disasm, binary, source_lines)
+
+    if len(sys.argv) >= 3:
+        with open(sys.argv[2], "w") as f:
+            f.write(output)
+    else:
+        sys.stdout.write(output)
+
+
+if __name__ == "__main__":
+    main()
