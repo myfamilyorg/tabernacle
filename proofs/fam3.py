@@ -1730,6 +1730,378 @@ def main():
                 break
 
     # ═══════════════════════════════════════════════════════════
+    # [8] Branch coverage test suite
+    # ═══════════════════════════════════════════════════════════
+    print("\n[8] Branch coverage test suite")
+
+    CODE_BASE = 0x80000000
+    CODE_SIZE = len(binary)
+
+    def simulate_fam3_bin(binary, input_bytes, rx_delays=None):
+        """Execute fam3 binary instruction-by-instruction.
+        Returns (output, branch_log).
+        """
+        code_words = [struct.unpack_from('<I', binary, i)[0]
+                      for i in range(0, len(binary), 4)]
+        regs = [0] * 32
+        pc = CODE_BASE
+        mem = {}
+        for i, b in enumerate(binary):
+            mem[CODE_BASE + i] = b
+        output = bytearray()
+        branch_log = {}
+        input_pos = 0
+        output_pos = 0
+        uart_base = 0x10000000
+        max_steps = 200_000_000
+        rx_delays = rx_delays or set()
+        poll_count = {}
+
+        def mem_rb(addr):
+            return mem.get(addr, 0)
+
+        def mem_rw(addr):
+            return mem_rb(addr) | (mem_rb(addr+1)<<8) | (mem_rb(addr+2)<<16) | (mem_rb(addr+3)<<24)
+
+        def mem_wb(addr, val):
+            mem[addr] = val & 0xFF
+
+        def mem_ww(addr, val):
+            val = val & 0xFFFFFFFF
+            for b in range(4):
+                mem[addr+b] = (val >> (b*8)) & 0xFF
+
+        for step in range(max_steps):
+            if pc < CODE_BASE or pc >= CODE_BASE + len(binary) or pc % 4 != 0:
+                break
+            idx = (pc - CODE_BASE) // 4
+            w = code_words[idx]
+            op = rv_opcode(w)
+            rd = rv_rd(w)
+            rs1_idx = rv_rs1(w)
+            rs2_idx = rv_rs2(w)
+            rs1_v = regs[rs1_idx]
+            rs2_v = regs[rs2_idx]
+            next_pc = pc + 4
+
+            def wr(val):
+                if rd != 0:
+                    regs[rd] = val & 0xFFFFFFFF
+
+            if op == 0x37:
+                wr(rv_imm_u(w) & 0xFFFFFFFF)
+            elif op == 0x17:
+                wr((pc + rv_imm_u(w)) & 0xFFFFFFFF)
+            elif op == 0x13:
+                f3 = rv_funct3(w)
+                imm = rv_imm_i(w)
+                if f3 == 0:    wr(rs1_v + imm)
+                elif f3 == 4:  wr(rs1_v ^ (imm & 0xFFFFFFFF))
+                elif f3 == 7:  wr(rs1_v & (imm & 0xFFFFFFFF))
+                elif f3 == 6:  wr(rs1_v | (imm & 0xFFFFFFFF))
+                elif f3 == 1:  wr(rs1_v << rv_rs2(w))
+                elif f3 == 5:
+                    shamt = rv_rs2(w)
+                    if rv_funct7(w) & 0x20:
+                        v = rs1_v
+                        if v & 0x80000000: v = v | ~0xFFFFFFFF
+                        wr(v >> shamt)
+                    else:
+                        wr(rs1_v >> shamt)
+                elif f3 == 2:
+                    s1 = rs1_v if rs1_v < 0x80000000 else rs1_v - 0x100000000
+                    wr(1 if s1 < imm else 0)
+                elif f3 == 3:
+                    wr(1 if rs1_v < (imm & 0xFFFFFFFF) else 0)
+            elif op == 0x33:
+                f3 = rv_funct3(w)
+                f7 = rv_funct7(w)
+                if f3 == 0 and f7 == 0:    wr(rs1_v + rs2_v)
+                elif f3 == 0 and f7 == 32: wr(rs1_v - rs2_v)
+                elif f3 == 6 and f7 == 0:  wr(rs1_v | rs2_v)
+                elif f3 == 7 and f7 == 0:  wr(rs1_v & rs2_v)
+                elif f3 == 4 and f7 == 0:  wr(rs1_v ^ rs2_v)
+                elif f3 == 1 and f7 == 0:  wr(rs1_v << (rs2_v & 0x1F))
+                elif f3 == 5 and f7 == 0:  wr(rs1_v >> (rs2_v & 0x1F))
+                elif f3 == 5 and f7 == 32:
+                    v = rs1_v
+                    if v & 0x80000000: v = v | ~0xFFFFFFFF
+                    wr(v >> (rs2_v & 0x1F))
+                elif f3 == 2 and f7 == 0:
+                    s1 = rs1_v if rs1_v < 0x80000000 else rs1_v - 0x100000000
+                    s2 = rs2_v if rs2_v < 0x80000000 else rs2_v - 0x100000000
+                    wr(1 if s1 < s2 else 0)
+                elif f3 == 3 and f7 == 0:
+                    wr(1 if rs1_v < rs2_v else 0)
+            elif op == 0x03:
+                f3 = rv_funct3(w)
+                addr = (rs1_v + rv_imm_i(w)) & 0xFFFFFFFF
+                if addr == uart_base:
+                    if input_pos < len(input_bytes):
+                        wr(input_bytes[input_pos])
+                        input_pos += 1
+                    else:
+                        wr(4)
+                elif addr == uart_base + 5:
+                    key = (pc, input_pos, output_pos)
+                    cnt = poll_count.get(key, 0)
+                    poll_count[key] = cnt + 1
+                    if input_pos in rx_delays and cnt == 0:
+                        wr(0x00)
+                    else:
+                        wr(0x21)
+                else:
+                    if f3 == 0:
+                        v = mem_rb(addr)
+                        wr(v if v < 128 else (v | 0xFFFFFF00))
+                    elif f3 == 1:
+                        v = mem_rb(addr) | (mem_rb(addr+1) << 8)
+                        wr(v if v < 32768 else (v | 0xFFFF0000))
+                    elif f3 == 2:  wr(mem_rw(addr))
+                    elif f3 == 4:  wr(mem_rb(addr))
+                    elif f3 == 5:  wr(mem_rb(addr) | (mem_rb(addr+1) << 8))
+            elif op == 0x23:
+                f3 = rv_funct3(w)
+                addr = (regs[rs1_idx] + rv_imm_s(w)) & 0xFFFFFFFF
+                val = rs2_v
+                if addr == uart_base:
+                    output.append(val & 0xFF)
+                    output_pos += 1
+                elif addr == 0x100000:
+                    break
+                else:
+                    if f3 == 0:    mem_wb(addr, val)
+                    elif f3 == 1:  mem_wb(addr, val); mem_wb(addr+1, val >> 8)
+                    elif f3 == 2:  mem_ww(addr, val)
+            elif op == 0x63:
+                f3 = rv_funct3(w)
+                imm = rv_imm_b(w)
+                taken = False
+                s_rs1 = rs1_v if rs1_v < 0x80000000 else rs1_v - 0x100000000
+                s_rs2 = rs2_v if rs2_v < 0x80000000 else rs2_v - 0x100000000
+                if f3 == 0:   taken = (rs1_v == rs2_v)
+                elif f3 == 1: taken = (rs1_v != rs2_v)
+                elif f3 == 4: taken = (s_rs1 < s_rs2)
+                elif f3 == 5: taken = (s_rs1 >= s_rs2)
+                elif f3 == 6: taken = (rs1_v < rs2_v)
+                elif f3 == 7: taken = (rs1_v >= rs2_v)
+                rel_pc = pc - CODE_BASE
+                if rel_pc not in branch_log:
+                    branch_log[rel_pc] = set()
+                branch_log[rel_pc].add('T' if taken else 'N')
+                if taken:
+                    next_pc = (pc + imm) & 0xFFFFFFFF
+            elif op == 0x6F:
+                wr(pc + 4)
+                next_pc = (pc + rv_imm_j(w)) & 0xFFFFFFFF
+            elif op == 0x73:  # SYSTEM (wfi)
+                pass  # treat as nop
+
+            pc = next_pc
+
+        return bytes(output), branch_log
+
+    def make_input(s):
+        if isinstance(s, str):
+            return s.encode('ascii') + b'\x04'
+        return s + b'\x04'
+
+    # Identify all B-type branches
+    branch_pcs = []
+    branch_labels_cov = {}
+    rn = ['zero','ra','sp','gp','tp','t0','t1','t2',
+          's0','s1','a0','a1','a2','a3','a4','a5','a6','a7',
+          's2','s3','s4','s5','s6','s7','s8','s9','s10','s11',
+          't3','t4','t5','t6']
+    for i in range(n_code):
+        w = words[i]
+        if rv_opcode(w) == 0x63:
+            pc_addr = i * 4
+            f3 = rv_funct3(w)
+            rs1, rs2 = rv_rs1(w), rv_rs2(w)
+            tgt = pc_addr + rv_imm_b(w)
+            bnames = {0:'beq',1:'bne',4:'blt',5:'bge',6:'bltu',7:'bgeu'}
+            label = f"0x{pc_addr:04x}: {bnames.get(f3,'?')} {rn[rs1]}, {rn[rs2]} → 0x{tgt:04x}"
+            branch_pcs.append(pc_addr)
+            branch_labels_cov[pc_addr] = label
+
+    print(f"  {len(branch_pcs)} B-type branch instructions in binary\n")
+
+    # Systematic test suite
+    tests = []
+
+    # Basic
+    tests.append(("empty input", make_input("")))
+    tests.append(("nop", make_input("nop\n")))
+    tests.append(("comment", make_input("# comment\naddi a0, zero, 1\n")))
+    tests.append(("blank lines", make_input("\n\naddi a0, zero, 1\n")))
+
+    # R-type: all 10
+    for m in ['add','sub','and','or','xor','sll','srl','sra','slt','sltu']:
+        tests.append((f"R: {m}", make_input(f"{m} a0, a1, a2\n")))
+
+    # I-type: all 9
+    for m in ['addi','andi','ori','xori','slti','sltiu','slli','srli','srai']:
+        tests.append((f"I: {m}", make_input(f"{m} a0, a1, 1\n")))
+
+    # Loads
+    for m in ['lb','lh','lw','lbu','lhu']:
+        tests.append((f"load: {m}", make_input(f"{m} a0, 4(sp)\n")))
+        tests.append((f"load neg: {m}", make_input(f"{m} a0, -4(sp)\n")))
+
+    # Stores
+    for m in ['sb','sh','sw']:
+        tests.append((f"store: {m}", make_input(f"{m} a0, 4(sp)\n")))
+        tests.append((f"store neg: {m}", make_input(f"{m} a0, -4(sp)\n")))
+
+    # Branches: all 6 with numeric and label
+    for m in ['beq','bne','blt','bge','bltu','bgeu']:
+        tests.append((f"branch num: {m}", make_input(f"{m} a0, a1, 8\n")))
+        tests.append((f"branch label: {m}", make_input(f"top:\n{m} a0, a1, top\n")))
+        tests.append((f"branch fwd: {m}", make_input(f"{m} a0, a1, skip\nnop\nskip:\n")))
+
+    # U-type
+    tests.append(("lui", make_input("lui a0, 0x12345\n")))
+    tests.append(("auipc", make_input("auipc a0, 0\n")))
+
+    # J-type
+    tests.append(("jal ra", make_input("jal ra, skip\nskip:\n")))
+    tests.append(("jal x0", make_input("jal zero, skip\nnop\nskip:\n")))
+
+    # Pseudos: basic
+    tests.append(("nop pseudo", make_input("nop\n")))
+    tests.append(("li small", make_input("li a0, 42\n")))
+    tests.append(("li large", make_input("li a0, 0x12345678\n")))
+    tests.append(("li neg", make_input("li a0, -1\n")))
+    tests.append(("mv", make_input("mv a0, a1\n")))
+    tests.append(("j forward", make_input("j skip\nnop\nskip:\n")))
+    tests.append(("j backward", make_input("top:\nj top\n")))
+    tests.append(("neg", make_input("neg t0, a0\n")))
+    tests.append(("not", make_input("not t0, a0\n")))
+    tests.append(("seqz", make_input("seqz t0, a0\n")))
+    tests.append(("snez", make_input("snez t0, a0\n")))
+    tests.append(("sltz", make_input("sltz t0, a0\n")))
+    tests.append(("sgtz", make_input("sgtz t0, a0\n")))
+
+    # Branch pseudos with numeric and label
+    for m in ['beqz','bnez','bltz','bgez','blez']:
+        tests.append((f"pseudo: {m} num", make_input(f"{m} a0, 8\n")))
+        tests.append((f"pseudo: {m} label", make_input(f"top:\n{m} a0, top\n")))
+        tests.append((f"pseudo: {m} fwd", make_input(f"{m} a0, skip\nnop\nskip:\n")))
+
+    # Two-operand branch pseudos
+    for m in ['bgt','ble','bgtu','bleu']:
+        tests.append((f"pseudo: {m} num", make_input(f"{m} a0, a1, 8\n")))
+        tests.append((f"pseudo: {m} label", make_input(f"top:\n{m} a0, a1, top\n")))
+        tests.append((f"pseudo: {m} fwd", make_input(f"{m} a0, a1, skip\nnop\nskip:\n")))
+
+    # Directives
+    tests.append((".equ", make_input(".equ MAGIC, 42\naddi a0, zero, MAGIC\n")))
+    tests.append((".byte", make_input(".byte 0x41, 0x42\n")))
+    tests.append((".word", make_input(".word 0x12345678\n")))
+    tests.append((".ascii", make_input('.ascii "hello\\n"\n')))
+    tests.append((".zero", make_input(".zero 8\n")))
+
+    # lla
+    tests.append(("lla", make_input("data:\n.word 42\nlla a0, data\n")))
+
+    # wfi
+    tests.append(("wfi", make_input("wfi\n")))
+
+    # prologue/epilogue
+    tests.append(("prologue/epilogue", make_input("prologue s0, s1, zero\nepilogue\n")))
+
+    # Register coverage
+    for r in ['zero','ra','sp','gp','tp','t0','t1','t2','t3','t4','t5','t6',
+              's0','s1','s2','s3','s4','s5','s6','s7','s8','s9','s10','s11',
+              'a0','a1','a2','a3','a4','a5','a6','a7','fp']:
+        tests.append((f"reg: {r}", make_input(f"addi {r}, {r}, 0\n")))
+
+    for n in [0, 1, 10, 15, 20, 31]:
+        tests.append((f"reg: x{n}", make_input(f"addi x{n}, x{n}, 0\n")))
+
+    # Number parsing
+    tests.append(("num: 0", make_input("addi a0, zero, 0\n")))
+    tests.append(("num: 2047", make_input("addi a0, zero, 2047\n")))
+    tests.append(("num: -2048", make_input("addi a0, zero, -2048\n")))
+    tests.append(("num: 0xFF", make_input("addi a0, zero, 0xFF\n")))
+    tests.append(("num: 0xabc", make_input("addi a0, zero, 0xabc\n")))
+    tests.append(("num: -0xA", make_input("addi a0, zero, -0xA\n")))
+    tests.append(("num: 1234", make_input("li a0, 1234\n")))
+
+    # Hex passthrough
+    tests.append(("hex pass", make_input("13 05 A0 00\n")))
+    tests.append(("hex then asm", make_input("13 00 00 00\nadd a0, a1, a2\n")))
+
+    # Label edge cases
+    tests.append(("long label",
+                  make_input("abcdefghijklmnopqrstuvwxyz12345:\nbeq a0, zero, abcdefghijklmnopqrstuvwxyz12345\n")))
+    tests.append(("many labels",
+                  make_input("aa:\nbb:\ncc:\ndd:\nee:\nff:\nbeq a0, zero, ff\n")))
+    tests.append(("labels differ late",
+                  make_input("aaaa1111bbbbXXXX:\naaaa1111bbbbYYYY:\nbeq a0, zero, aaaa1111bbbbYYYY\n")))
+
+    # Mixed instruction sequences
+    tests.append(("all formats",
+                  make_input(
+                      "lui a0, 0x100\nauipc a1, 0\naddi a2, a0, 5\n"
+                      "add a3, a0, a1\nsw a3, 0(sp)\nlw a4, 0(sp)\n"
+                      "top:\nbeq a0, zero, top\njal ra, skip\nnop\nskip:\n"
+                      "li a5, 0xDEAD\nmv a6, a5\nbnez a0, top\n"
+                  )))
+
+    # Forward refs in various types
+    tests.append(("fwd beq fixup", make_input("beq a0, zero, target\nnop\nnop\ntarget:\n")))
+    tests.append(("fwd j fixup", make_input("j target\nnop\ntarget:\n")))
+    tests.append(("two fwd refs", make_input("beq a0, zero, end\nbeq a1, zero, end\nnop\nend:\n")))
+
+    # Negative store/load offsets
+    tests.append(("sw -100(sp)", make_input("sw a0, -100(sp)\n")))
+    tests.append(("lw -100(sp)", make_input("lw a0, -100(sp)\n")))
+
+    # RX delay
+    tests.append(("RX delay", make_input("nop\n"), {0}))
+
+    global_branches = {pc_addr: set() for pc_addr in branch_pcs}
+    test_pass = 0
+    test_total = 0
+
+    for item in tests:
+        name = item[0]
+        inp = item[1]
+        rx_d = item[2] if len(item) > 2 else None
+        test_total += 1
+        try:
+            out, blog = simulate_fam3_bin(binary, inp, rx_d)
+            test_pass += 1
+            for pc_addr in blog:
+                if pc_addr in global_branches:
+                    global_branches[pc_addr] |= blog[pc_addr]
+        except Exception as e:
+            print(f"  FAIL  {name}: {e}")
+
+    check(f"all {test_total} test inputs completed", test_pass == test_total)
+
+    # Branch coverage report
+    total_pairs = len(branch_pcs) * 2
+    covered_pairs = sum(len(dirs) for dirs in global_branches.values())
+    pct = covered_pairs / total_pairs * 100
+
+    print(f"\n  Branch coverage: {covered_pairs}/{total_pairs} directions ({pct:.1f}%)")
+
+    missing = [(pc_addr, d) for pc_addr in branch_pcs
+               for d in ('T', 'N') if d not in global_branches[pc_addr]]
+    if missing:
+        print(f"\n  Missing directions ({len(missing)}):")
+        for pc_addr, d in missing[:20]:
+            direction = "taken" if d == 'T' else "not-taken"
+            print(f"    {branch_labels_cov[pc_addr]} — {direction}")
+        if len(missing) > 20:
+            print(f"    ... and {len(missing) - 20} more")
+
+    check(f"branch coverage ≥ 65% ({pct:.1f}%)", pct >= 65.0)
+
+    # ═══════════════════════════════════════════════════════════
     # Summary
     # ═══════════════════════════════════════════════════════════
     print("\n" + "=" * 60)
@@ -1750,6 +2122,7 @@ def main():
         print(f"    → B/J-type round-trip encoding proven")
         print(f"    → concrete tests: 16 test programs assembled correctly")
         print(f"    → cross-check: fam2(fam3.fam2) == bin/fam3")
+        print(f"    → branch coverage: {covered_pairs}/{total_pairs} ({pct:.1f}%)")
     return 1 if failed > 0 else 0
 
 

@@ -2400,6 +2400,207 @@ test_error "break overflow in single loop" \
 	"Error:34:17 loop has too many 'break's"
 
 # ============================================================================
+echo "=== Error coverage — previously untested error paths ==="
+
+# break / continue outside loop
+test_error "break outside a loop" \
+	"break;" \
+	"Error:1:6 'break' outside a loop"
+test_error "continue outside a loop" \
+	"continue;" \
+	"Error:1:9 'continue' outside a loop"
+
+# variable decl at top level (mutable := not allowed outside fn)
+test_error "mutable var decl at top level" \
+	"x := 5;" \
+	"Error:1:3 variable decl at top level"
+
+# bare struct name not valid
+test_error "bare struct name in expression" \
+	"struct P { x } @0x10000000 = P;" \
+	"Error:1:31 bare struct name not valid"
+
+# unterminated asm
+test_error "unterminated asm block" \
+	"asm { nop" \
+	"Error:2:1 unterminated asm"
+
+# bad asm mnemonic
+test_error "bad asm mnemonic" \
+	"asm { badop t0, t1 }" \
+	"Error:1:12 bad asm mnemonic/reg"
+
+# asm expected ','
+test_error "asm missing comma in R-type" \
+	"asm { add t0 t1, t2 }" \
+	"Error:1:14 asm expected ','"
+
+# malformed asm binding
+test_error "malformed asm binding — missing =" \
+	"fn main() { x := 0; asm { (x) } } main();" \
+	"Error:1:29 malformed asm binding"
+
+# asm expected imm(reg)
+test_error "asm load missing paren" \
+	"asm { lw t0, 0 t1 }" \
+	"Error:1:16 asm expected imm(reg)"
+
+# duplicate asm label
+test_error "duplicate asm symbolic label" \
+	"asm { foo: nop foo: nop }" \
+	"Error:1:16 duplicate asm label"
+
+# bad macro name (digit-starting name)
+test_error "macro with digit-starting name" \
+	"macro 3x() { }" \
+	"Error:1:7 bad macro name"
+
+# expansion nested too deeply
+test_error "macro expansion nested too deeply" \
+	"macro A() { B(); } macro B() { A(); } A();" \
+	"Error:1:1 expansion nested too deeply"
+
+# macro \name with unknown arg passes through verbatim (shell then fails).
+# rept \name with unknown counter similarly passes through.
+
+# Struct parsing: missing ',' or '}'
+test_error "struct definition missing comma" \
+	"struct P { x y }" \
+	"Error:1:14 Expected ',' or '}' found 'y'"
+
+# asm branch offset out of range (B-type backward > 4 KiB)
+test_error "asm B-type branch offset out of range" \
+	"asm { start: $(for i in $(seq 1 1100); do printf 'nop '; done) beq zero, zero, start }" \
+	"Error:2:1 branch offset out of range"
+
+# ============================================================================
+echo "=== Additional feature coverage ==="
+
+# Subtraction — stand-alone primary operation
+test_output  "subtraction literals" \
+	"@0x10000000 = 70 - 5;" "A"
+test_output  "subtraction variables" \
+	"fn main() { x = 70; y = 5; @0x10000000 = x - y; } main();" "A"
+test_output  "chained subtraction" \
+	"@0x10000000 = 100 - 20 - 15;" "A"
+test_output  "subtraction and addition mixed" \
+	"@0x10000000 = 100 + 5 - 40;" "A"
+test_output  "compound -=" \
+	"fn main() { x := 70; x -= 5; @0x10000000 = x; } main();" "A"
+
+# Halfword (#) thorough coverage
+test_output  "halfword store/load round-trip" \
+	"fn main() { p = 0x80200000; #p = 0x1041; @0x10000000 = #p & 0xFF; } main();" "A"
+test_output  "halfword array fill and sum" \
+	"fn main() { #arr[4]; for i in 0..4 { #arr[i] = (i + 1) * 10; }; @0x10000000 = #arr[0] + #arr[1] + #arr[2] + #arr[3] == 100 ? 'A' : 'N'; } main();" "A"
+test_output  "halfword compound #p +=" \
+	"fn main() { p = 0x80200000; #p = 60; #p += 5; @0x10000000 = #p; } main();" "A"
+
+# Empty string literal
+test_output  "empty string literal" \
+	"fn main() { s = \"\"; @0x10000000 = @s == 0 ? 'Y' : 'N'; } main();" "Y"
+
+# String with many escapes
+test_output  "string with multiple escapes" \
+	"fn main() { s = \"A\\nB\\tC\"; @0x10000000 = @s; @0x10000000 = @(s+2); @0x10000000 = @(s+4); } main();" "ABC"
+
+# Deeply nested ternary
+test_output  "4-level nested ternary" \
+	"@0x10000000 = 1 ? 1 ? 1 ? 1 ? 65 : 0 : 0 : 0 : 0;" "A"
+test_output  "4-level nested ternary all false" \
+	"@0x10000000 = 0 ? 0 : 0 ? 0 : 0 ? 0 : 65;" "A"
+
+# Deeply nested blocks
+test_output  "5-level nested blocks" \
+	"@0x10000000 = { { { { { 65 } } } } };" "A"
+
+# Large number edge cases
+test_output  "hex literal FFFFFFFF" \
+	"fn main() { x = 0xFFFFFFFF; @0x10000000 = x == 0 - 1 ? 'Y' : 'N'; } main();" "Y"
+test_output  "decimal literal 2147483647 (INT_MAX)" \
+	"fn main() { x = 2147483647; @0x10000000 = x > 0 ? 'Y' : 'N'; } main();" "Y"
+test_output  "zero literal" \
+	"@0x10000000 = 0 + 65;" "A"
+
+# Mixed loops — for inside loop
+test_output  "for inside loop" \
+	"fn main() { s := 0; loop { for i in 1..=5 s += i; break; }; @0x10000000 = s == 15 ? 'Y' : 'N'; } main();" "Y"
+
+# Loop that actually iterates with continue
+test_output  "loop with both break and continue" \
+	"fn main() { s := 0; i := 0; loop { i += 1; i > 10 ? break; i % 2 == 0 ? continue; s += i; }; @0x10000000 = s == 25 ? 'Y' : 'N'; } main();" "Y"
+
+# Recursive function that bottoms out
+test_output  "mutual-style recursion depth" \
+	"fn f(n) { n < 1 ? return 65; f(n - 1) } @0x10000000 = f(50);" "A"
+
+# Many functions defined
+test_output  "10 functions chained" \
+	"fn f0(x) { x+1 } fn f1(x) { f0(x)+1 } fn f2(x) { f1(x)+1 } fn f3(x) { f2(x)+1 } fn f4(x) { f3(x)+1 } fn f5(x) { f4(x)+1 } fn f6(x) { f5(x)+1 } fn f7(x) { f6(x)+1 } fn f8(x) { f7(x)+1 } fn f9(x) { f8(x)+1 } @0x10000000 = f9(55);" "A"
+
+# Struct with many fields (boundary)
+test_output  "struct with 8 fields" \
+	"struct S { a,b,c,d,e,f,g,h } fn main() { s = S{1,2,3,4,5,6,7,8}; @0x10000000 = S@s.a + S@s.b + S@s.c + S@s.d + S@s.e + S@s.f + S@s.g + S@s.h + 29; } main();" "A"
+
+# Struct array with writes in a loop
+test_output  "struct array with loop init" \
+	"struct P { x, y } fn main() { P@pts[5]; for i in 0..5 { P@pts[i].x = i; P@pts[i].y = i * 2; }; @0x10000000 = P@pts[4].x + P@pts[4].y == 12 ? 'A' : 'N'; } main();" "A"
+
+# Macro with asm body and labels
+test_output  "macro containing asm with label" \
+	"macro EMIT(c) { asm { li t0, \\c lui t1, 0x10000 sb t0, 0(t1) } } EMIT(65); EMIT(66);" "AB"
+
+# Rept with body that uses fn calls
+test_output  "rept calling function" \
+	"fn emit(c) { @0x10000000 = c; } rept i in 0..3 { emit('A' + \\i); }" "ABC"
+
+# Const with all supported operators (no / or %)
+test_output  "const with arithmetic and bitwise" \
+	"const A = 10 + 5; const B = A * 3; const C = B - 10; const D = C & 0xFF; const E = D | 0x40; @0x10000000 = E;" "c"
+test_output  "const with shift and xor" \
+	"const A = 1 << 6; const B = A ^ 1; @0x10000000 = B;" "A"
+
+# For loop with complex body
+test_output  "for loop with block body and ternary" \
+	"fn main() { s := 0; for i in 0..10 { i % 2 == 0 ? s += i : s += 0; }; @0x10000000 = s == 20 ? 'Y' : 'N'; } main();" "Y"
+
+# Multiple return paths in function
+test_output  "function with multiple early returns" \
+	"fn classify(x) { x < 0 ? return 'N'; x == 0 ? return 'Z'; x < 10 ? return 'S'; 'B' } @0x10000000 = classify(0 - 1); @0x10000000 = classify(0); @0x10000000 = classify(5); @0x10000000 = classify(100);" "NZSB"
+
+# Asm fn with 8 args
+test_output  "asm fn with 8 args (max)" \
+	"asm sum8 { add a0, a0, a1 add a0, a0, a2 add a0, a0, a3 add a0, a0, a4 add a0, a0, a5 add a0, a0, a6 add a0, a0, a7 } fn main() { @0x10000000 = sum8(1,2,3,4,5,6,7,37); } main();" "A"
+
+# Whitespace edge cases
+test_output  "tabs in source" \
+	"$(printf 'fn\tmain()\t{\t@0x10000000\t=\t65;\t}\tmain();')" "A"
+test_output  "multiple newlines between statements" \
+	"$(printf '@0x10000000 = 65;\n\n\n\n@0x10000000 = 66;')" "AB"
+
+# Block comment edge cases
+test_output  "block comment with stars" \
+	"/** fancy comment **/ @0x10000000 = 65;" "A"
+test_output  "empty block comment" \
+	"/**/ @0x10000000 = 65;" "A"
+
+# Expression as full program (no fn)
+test_output  "bare arithmetic expression stores to UART" \
+	"@0x10000000 = 13 * 5;" "A"
+
+# Chained struct field writes
+test_output  "struct multiple field writes" \
+	"struct P { a, b, c, d } fn main() { p := P{0,0,0,0}; P@p.a = 10; P@p.b = 20; P@p.c = 30; P@p.d = 5; @0x10000000 = P@p.a + P@p.b + P@p.c + P@p.d; } main();" "A"
+
+# For loop as top-level statement
+test_output  "top-level for loop" \
+	"for i in 0..5 { @0x10000000 = '0' + i; };" "01234"
+
+# Nested for loops with continue
+test_output  "nested for with inner continue" \
+	"fn main() { s := 0; for i in 0..5 { for j in 0..5 { j == i ? continue; s += 1; }; }; @0x10000000 = s == 20 ? 'Y' : 'N'; } main();" "Y"
+
+# ============================================================================
 echo ""
 echo "=== Results ==="
 echo "  $PASS passed, $FAIL failed, $TOTAL total"

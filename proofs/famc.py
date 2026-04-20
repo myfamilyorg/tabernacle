@@ -1081,6 +1081,285 @@ def main():
                 break
 
     # ═══════════════════════════════════════════════════════════
+    # [6] Branch coverage test suite
+    # ═══════════════════════════════════════════════════════════
+    print("\n[6] Branch coverage test suite")
+
+    import subprocess
+
+    n_branches = sum(1 for w in code_words if rv_opcode(w) == 0x63)
+    print(f"  {n_branches} B-type branches in {n_code} code instructions")
+
+    CODE_BASE = 0x80000000
+
+    def simulate_famc(input_bytes, rx_delays=None, tx_delays=None):
+        """Execute famc binary instruction-by-instruction.
+        Returns (output_bytes, branch_log).
+        """
+        regs = [0] * 32
+        pc = CODE_BASE
+        mem = {}
+        for i, b in enumerate(binary):
+            mem[CODE_BASE + i] = b
+        output = bytearray()
+        branch_log = {}
+        input_pos = [0]
+        output_pos = [0]
+        uart_base = 0x10000000
+        max_steps = 50_000_000
+        rx_delays = rx_delays or set()
+        tx_delays = tx_delays or set()
+        poll_count = {}
+
+        def mem_rb(a):
+            return mem.get(a, 0)
+        def mem_rh(a):
+            return mem_rb(a) | (mem_rb(a+1) << 8)
+        def mem_rw(a):
+            return mem_rb(a)|(mem_rb(a+1)<<8)|(mem_rb(a+2)<<16)|(mem_rb(a+3)<<24)
+        def mem_wb(a, v):
+            mem[a] = v & 0xFF
+        def mem_wh(a, v):
+            mem[a] = v & 0xFF; mem[a+1] = (v>>8) & 0xFF
+        def mem_ww(a, v):
+            v &= 0xFFFFFFFF
+            for b in range(4):
+                mem[a+b] = (v>>(b*8)) & 0xFF
+
+        for _ in range(max_steps):
+            if pc < CODE_BASE or pc >= CODE_BASE + len(binary_padded) or pc & 3:
+                break
+            idx = (pc - CODE_BASE) >> 2
+            w = words[idx]
+            op = w & 0x7F
+            rd = (w >> 7) & 0x1F
+            f3 = (w >> 12) & 0x7
+            rs1i = (w >> 15) & 0x1F
+            rs2i = (w >> 20) & 0x1F
+            r1 = regs[rs1i]; r2 = regs[rs2i]
+            npc = pc + 4
+
+            if op == 0x37:
+                v = rv_imm_u(w) & 0xFFFFFFFF
+            elif op == 0x17:
+                v = (pc + rv_imm_u(w)) & 0xFFFFFFFF
+            elif op == 0x13:
+                imm = rv_imm_i(w)
+                if f3 == 0:   v = (r1 + imm) & 0xFFFFFFFF
+                elif f3 == 4: v = r1 ^ (imm & 0xFFFFFFFF)
+                elif f3 == 7: v = r1 & (imm & 0xFFFFFFFF)
+                elif f3 == 6: v = r1 | (imm & 0xFFFFFFFF)
+                elif f3 == 1: v = (r1 << rs2i) & 0xFFFFFFFF
+                elif f3 == 5:
+                    if (w >> 25) & 0x20:
+                        sv = r1 | (~0xFFFFFFFF if r1 & 0x80000000 else 0)
+                        v = (sv >> rs2i) & 0xFFFFFFFF
+                    else:
+                        v = r1 >> rs2i
+                elif f3 == 2:
+                    s1 = r1 - 0x100000000 if r1 >= 0x80000000 else r1
+                    v = 1 if s1 < imm else 0
+                elif f3 == 3:
+                    v = 1 if r1 < (imm & 0xFFFFFFFF) else 0
+                else: v = 0
+            elif op == 0x33:
+                f7 = (w >> 25) & 0x7F
+                if f3 == 0 and f7 == 0:    v = (r1 + r2) & 0xFFFFFFFF
+                elif f3 == 0 and f7 == 32: v = (r1 - r2) & 0xFFFFFFFF
+                elif f3 == 6 and f7 == 0:  v = r1 | r2
+                elif f3 == 7 and f7 == 0:  v = r1 & r2
+                elif f3 == 4 and f7 == 0:  v = r1 ^ r2
+                elif f3 == 1 and f7 == 0:  v = (r1 << (r2 & 0x1F)) & 0xFFFFFFFF
+                elif f3 == 5 and f7 == 0:  v = r1 >> (r2 & 0x1F)
+                elif f3 == 5 and f7 == 32:
+                    sv = r1 | (~0xFFFFFFFF if r1 & 0x80000000 else 0)
+                    v = (sv >> (r2 & 0x1F)) & 0xFFFFFFFF
+                elif f3 == 2 and f7 == 0:
+                    s1 = r1 - 0x100000000 if r1 >= 0x80000000 else r1
+                    s2 = r2 - 0x100000000 if r2 >= 0x80000000 else r2
+                    v = 1 if s1 < s2 else 0
+                elif f3 == 3 and f7 == 0:
+                    v = 1 if r1 < r2 else 0
+                else: v = 0
+            elif op == 0x03:
+                addr = (r1 + rv_imm_i(w)) & 0xFFFFFFFF
+                if addr == uart_base:
+                    if input_pos[0] < len(input_bytes):
+                        v = input_bytes[input_pos[0]]
+                        input_pos[0] += 1
+                    else:
+                        v = 4
+                elif addr == uart_base + 5:
+                    key = (pc, input_pos[0], output_pos[0])
+                    cnt = poll_count.get(key, 0)
+                    poll_count[key] = cnt + 1
+                    rx_not_ready = input_pos[0] in rx_delays and cnt == 0
+                    tx_not_ready = output_pos[0] in tx_delays and cnt == 0
+                    val = 0x21
+                    if rx_not_ready: val &= ~0x01
+                    if tx_not_ready: val &= ~0x20
+                    v = val
+                else:
+                    if f3 == 0:
+                        v = mem_rb(addr)
+                        if v >= 128: v |= 0xFFFFFF00
+                    elif f3 == 1:
+                        v = mem_rh(addr)
+                        if v >= 32768: v |= 0xFFFF0000
+                    elif f3 == 2: v = mem_rw(addr)
+                    elif f3 == 4: v = mem_rb(addr)
+                    elif f3 == 5: v = mem_rh(addr)
+                    else: v = 0
+            elif op == 0x23:
+                addr = (r1 + rv_imm_s(w)) & 0xFFFFFFFF
+                if addr == uart_base:
+                    output.append(r2 & 0xFF)
+                    output_pos[0] += 1
+                elif addr == 0x100000:
+                    break
+                else:
+                    if f3 == 0:   mem_wb(addr, r2)
+                    elif f3 == 1: mem_wh(addr, r2)
+                    elif f3 == 2: mem_ww(addr, r2)
+                v = None
+                rd = 0
+            elif op == 0x63:
+                imm = rv_imm_b(w)
+                s1 = r1 - 0x100000000 if r1 >= 0x80000000 else r1
+                s2 = r2 - 0x100000000 if r2 >= 0x80000000 else r2
+                taken = False
+                if f3 == 0:   taken = (r1 == r2)
+                elif f3 == 1: taken = (r1 != r2)
+                elif f3 == 4: taken = (s1 < s2)
+                elif f3 == 5: taken = (s1 >= s2)
+                elif f3 == 6: taken = (r1 < r2)
+                elif f3 == 7: taken = (r1 >= r2)
+                rel = pc - CODE_BASE
+                if rel not in branch_log:
+                    branch_log[rel] = set()
+                branch_log[rel].add('T' if taken else 'N')
+                if taken:
+                    npc = (pc + imm) & 0xFFFFFFFF
+                v = None
+                rd = 0
+            elif op == 0x6F:
+                v = (pc + 4) & 0xFFFFFFFF
+                npc = (pc + rv_imm_j(w)) & 0xFFFFFFFF
+            elif op == 0x73:
+                v = None
+                rd = 0
+            else:
+                v = None
+                rd = 0
+
+            if rd != 0 and v is not None:
+                regs[rd] = v & 0xFFFFFFFF
+            regs[0] = 0
+            pc = npc
+
+        return bytes(output), branch_log
+
+    # Extract test source strings from .ci/runfamctests via bash
+    def extract_test_sources():
+        script_path = os.path.join(BASE, '.ci', 'runfamctests')
+        with open(script_path) as f:
+            lines = f.readlines()
+
+        preamble = (
+            "#!/usr/bin/env bash\nset -u\n"
+            "PASS=0; FAIL=0; TOTAL=0; VERBOSE=0\n"
+            "echo() { :; }\n"
+            "test_output()          { printf '%s\\0' \"$2\"; }\n"
+            "test_compiles()        { printf '%s\\0' \"$2\"; }\n"
+            "test_runs()            { printf '%s\\0' \"$2\"; }\n"
+            "test_error()           { printf '%s\\0' \"$2\"; }\n"
+            "test_gp_matches_size() { printf '%s\\0' \"$2\"; }\n"
+        )
+        in_tests = False
+        test_section = []
+        for line in lines:
+            if '=== Literals ===' in line:
+                in_tests = True
+            if in_tests:
+                if '=== Results ===' in line:
+                    break
+                test_section.append(line)
+
+        script = preamble + ''.join(test_section)
+        result = subprocess.run(['bash'], input=script.encode(),
+                                capture_output=True, timeout=30)
+        return [s for s in result.stdout.split(b'\0') if s]
+
+    sources = extract_test_sources()
+    print(f"  Extracted {len(sources)} test sources from .ci/runfamctests")
+
+    # Run all tests through simulator, accumulating branch coverage
+    all_branches = {}
+
+    def merge_log(blog):
+        for pc, dirs in blog.items():
+            if pc not in all_branches:
+                all_branches[pc] = set()
+            all_branches[pc].update(dirs)
+
+    for i, src in enumerate(sources):
+        input_bytes = src + b'\x04'
+        _, blog = simulate_famc(input_bytes)
+        merge_log(blog)
+        if (i + 1) % 100 == 0:
+            print(f"    ... {i+1}/{len(sources)} tests simulated")
+
+    # UART delay tests for poll-loop branch coverage
+    if sources:
+        _, blog = simulate_famc(sources[0] + b'\x04', rx_delays={0})
+        merge_log(blog)
+        _, blog = simulate_famc(sources[0] + b'\x04', tx_delays={0})
+        merge_log(blog)
+
+    print(f"    ... {len(sources)}/{len(sources)} tests simulated")
+
+    covered_dirs = sum(len(d) for d in all_branches.values())
+    total_dirs = n_branches * 2
+    pct = covered_dirs / total_dirs * 100 if total_dirs else 0
+
+    print(f"\n  Branch coverage: {covered_dirs}/{total_dirs} directions "
+          f"({pct:.1f}%), {len(all_branches)}/{n_branches} branches touched")
+
+    # Categorize uncovered branches
+    uncovered = []
+    bnames = {0:'beq',1:'bne',4:'blt',5:'bge',6:'bltu',7:'bgeu'}
+    for w_idx in range(n_code):
+        w = code_words[w_idx]
+        if rv_opcode(w) == 0x63:
+            off = w_idx * 4
+            dirs = all_branches.get(off, set())
+            if len(dirs) < 2:
+                uncovered.append((off, {'T','N'} - dirs))
+
+    if uncovered:
+        print(f"  {len(uncovered)} branches with missing directions")
+        # Categorize by branch type and direction
+        missing_T = sum(1 for _, m in uncovered if 'T' in m)
+        missing_N = sum(1 for _, m in uncovered if 'N' in m)
+        missing_both = sum(1 for _, m in uncovered if len(m) == 2)
+        print(f"    missing T (never taken): {missing_T}")
+        print(f"    missing N (never not-taken): {missing_N}")
+        print(f"    never reached: {missing_both}")
+        # Show first 40 with surrounding context
+        for pc_off, missing in uncovered[:40]:
+            w = code_words[pc_off // 4]
+            f3_v = rv_funct3(w)
+            bn = bnames.get(f3_v, f'f3={f3_v}')
+            rs1i = rv_rs1(w)
+            rs2i = rv_rs2(w)
+            tgt = pc_off + rv_imm_b(w)
+            dirs = all_branches.get(pc_off, set())
+            print(f"    0x{pc_off:05x}: {bn:5s} x{rs1i},x{rs2i} -> 0x{tgt:05x}  "
+                  f"hit={dirs}  missing={missing}")
+
+    check(f"branch coverage >= 50% ({pct:.1f}%)", pct >= 50.0)
+
+    # ═══════════════════════════════════════════════════════════
     # Summary
     # ═══════════════════════════════════════════════════════════
     print("\n" + "=" * 60)
@@ -1099,6 +1378,8 @@ def main():
         print(f"    → Z3 encoder proofs: R/I/S/B/U/J all correct")
         print(f"    → B/J-type round-trip encoding proven")
         print(f"    → cross-check: fam3(famc.fam3) == bin/famc")
+        print(f"    → branch coverage: {covered_dirs}/{total_dirs} ({pct:.1f}%) "
+              f"from {len(sources)} test inputs")
     return 1 if failed > 0 else 0
 
 

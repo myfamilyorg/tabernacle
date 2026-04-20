@@ -681,6 +681,255 @@ def main():
               bytes(fp_output) == binary)
 
     # ═══════════════════════════════════════════════════════════
+    # [10] Branch coverage test suite
+    # ═══════════════════════════════════════════════════════════
+    print("\n[10] Branch coverage test suite")
+
+    def simulate_fam0(binary, input_bytes, rx_delays=None, tx_delays=None):
+        """Execute fam0 binary instruction-by-instruction.
+        Returns (output, branch_log) where branch_log is {pc: set('T','N')}.
+        rx_delays: set of input positions where first LSR poll returns not-ready.
+        tx_delays: set of output positions where first THR poll returns not-ready.
+        """
+        words_sim = [struct.unpack_from('<I', binary, i)[0]
+                     for i in range(0, len(binary), 4)]
+        regs = [0] * 32
+        pc = 0
+        mem = {}
+        output = bytearray()
+        branch_log = {}
+        input_pos = 0
+        output_pos = 0
+        uart_base = 0x10000000
+        max_steps = 50_000_000
+        rx_delays = rx_delays or set()
+        tx_delays = tx_delays or set()
+        rx_poll_count = {}
+        tx_poll_count = {}
+
+        for _ in range(max_steps):
+            if pc < 0 or pc >= len(binary) or pc % 4 != 0:
+                break
+            idx = pc // 4
+            w = words_sim[idx]
+            op = rv_opcode(w)
+            rd = rv_rd(w)
+            rs1_idx = rv_rs1(w)
+            rs2_idx = rv_rs2(w)
+            rs1_v = regs[rs1_idx]
+            rs2_v = regs[rs2_idx]
+            next_pc = pc + 4
+
+            def wr(val):
+                if rd != 0:
+                    regs[rd] = val & 0xFFFFFFFF
+
+            if op == 0x37:
+                wr(rv_imm_u(w) & 0xFFFFFFFF)
+            elif op == 0x13:
+                f3 = rv_funct3(w)
+                imm = rv_imm_i(w)
+                if f3 == 0:    wr(rs1_v + imm)
+                elif f3 == 4:  wr(rs1_v ^ (imm & 0xFFFFFFFF))
+                elif f3 == 7:  wr(rs1_v & (imm & 0xFFFFFFFF))
+                elif f3 == 6:  wr(rs1_v | (imm & 0xFFFFFFFF))
+                elif f3 == 1:  wr(rs1_v << rv_rs2(w))
+                elif f3 == 5:  wr(rs1_v >> rv_rs2(w))
+            elif op == 0x33:
+                f3 = rv_funct3(w)
+                f7 = rv_funct7(w)
+                if f3 == 0 and f7 == 0:    wr(rs1_v + rs2_v)
+                elif f3 == 0 and f7 == 32: wr(rs1_v - rs2_v)
+                elif f3 == 6:              wr(rs1_v | rs2_v)
+                elif f3 == 7:              wr(rs1_v & rs2_v)
+                elif f3 == 4:              wr(rs1_v ^ rs2_v)
+            elif op == 0x03:
+                f3 = rv_funct3(w)
+                addr = (rs1_v + rv_imm_i(w)) & 0xFFFFFFFF
+                if addr == uart_base:
+                    if input_pos < len(input_bytes):
+                        wr(input_bytes[input_pos])
+                        input_pos += 1
+                    else:
+                        wr(4)
+                elif addr == uart_base + 5:
+                    in_output = (pc >= 0x78)
+                    if in_output:
+                        cnt = tx_poll_count.get(output_pos, 0)
+                        tx_poll_count[output_pos] = cnt + 1
+                        if output_pos in tx_delays and cnt == 0:
+                            wr(0x00)
+                        else:
+                            wr(0x21)
+                    else:
+                        cnt = rx_poll_count.get(input_pos, 0)
+                        rx_poll_count[input_pos] = cnt + 1
+                        if input_pos in rx_delays and cnt == 0:
+                            wr(0x00)
+                        else:
+                            wr(0x21)
+                else:
+                    wr(mem.get(addr, 0))
+            elif op == 0x23:
+                f3 = rv_funct3(w)
+                addr = (regs[rs1_idx] + rv_imm_s(w)) & 0xFFFFFFFF
+                val = rs2_v
+                if addr == uart_base:
+                    output.append(val & 0xFF)
+                    output_pos += 1
+                elif addr == 0x100000:
+                    break
+                else:
+                    if f3 == 0:
+                        mem[addr] = val & 0xFF
+                    elif f3 == 2:
+                        for b in range(4):
+                            mem[addr + b] = (val >> (b * 8)) & 0xFF
+            elif op == 0x63:
+                f3 = rv_funct3(w)
+                imm = rv_imm_b(w)
+                taken = False
+                s_rs1 = rs1_v if rs1_v < 0x80000000 else rs1_v - 0x100000000
+                s_rs2 = rs2_v if rs2_v < 0x80000000 else rs2_v - 0x100000000
+                if f3 == 0:   taken = (rs1_v == rs2_v)
+                elif f3 == 1: taken = (rs1_v != rs2_v)
+                elif f3 == 4: taken = (s_rs1 < s_rs2)
+                elif f3 == 5: taken = (s_rs1 >= s_rs2)
+                elif f3 == 6: taken = (rs1_v < rs2_v)
+                elif f3 == 7: taken = (rs1_v >= rs2_v)
+                if pc not in branch_log:
+                    branch_log[pc] = set()
+                branch_log[pc].add('T' if taken else 'N')
+                if taken:
+                    next_pc = (pc + imm) & 0xFFFFFFFF
+            elif op == 0x6F:
+                wr(pc + 4)
+                next_pc = (pc + rv_imm_j(w)) & 0xFFFFFFFF
+
+            pc = next_pc
+
+        return bytes(output), branch_log
+
+    # Identify all branch instructions in the binary
+    branch_pcs = []
+    branch_labels = {}
+    for i, w in enumerate(words):
+        if rv_opcode(w) == 0x63:
+            pc_addr = i * 4
+            f3 = rv_funct3(w)
+            rs1, rs2 = rv_rs1(w), rv_rs2(w)
+            tgt = pc_addr + rv_imm_b(w)
+            bnames = {0:'beq',1:'bne',4:'blt',5:'bge',6:'bltu',7:'bgeu'}
+            label = f"0x{pc_addr:02x}: {bnames[f3]} {RNAMES[rs1]}, {RNAMES[rs2]} → 0x{tgt:02x}"
+            branch_pcs.append(pc_addr)
+            branch_labels[pc_addr] = label
+
+    print(f"  {len(branch_pcs)} branch instructions in binary\n")
+
+    # Test suite: each test targets specific branch directions
+    #
+    # Branches (from fam0.S):
+    #   0x18: beqz t5, loop        — RX poll (data not ready → loop)
+    #   0x20: bne  t1, s6, +8      — newline check (not \n → skip reset)
+    #   0x2c: bne  t1, t3, +8      — hash check (not # → skip comment-set)
+    #   0x38: beq  t1, t3, end     — EOT check (== 4 → exit input)
+    #   0x3c: bnez s4, loop        — comment skip (in comment → loop)
+    #   0x44: bltu t1, s6, store   — digit 0-9 (valid → store)
+    #   0x50: bltu t1, t3, store   — letter A-F (valid → store)
+    #   0x5c: beqz s3, store_low   — nibble toggle (low → emit byte)
+    #   0x78: beq  s1, s2, end_out — output done (empty → shutdown)
+    #   0x88: beqz t1, retry       — TX poll (not ready → retry)
+
+    tests = [
+        # (name, input_bytes, expected_output, rx_delays, tx_delays)
+        ("empty input (EOT only)",
+         b'\x04', b'', None, None),
+
+        ("single byte: digit pair 00",
+         b'00\x04', bytes([0x00]), None, None),
+
+        ("single byte: digit pair 99",
+         b'99\x04', bytes([0x99]), None, None),
+
+        ("single byte: letter pair AB",
+         b'AB\x04', bytes([0xAB]), None, None),
+
+        ("single byte: mixed CF",
+         b'CF\x04', bytes([0xCF]), None, None),
+
+        ("comment then hex",
+         b'#ignored\nAB\x04', bytes([0xAB]), None, None),
+
+        ("comment chars in comment",
+         b'#abc 99 FF\nDE\x04', bytes([0xDE]), None, None),
+
+        ("newline resets comment flag",
+         b'#x\n#y\nFF\x04', bytes([0xFF]), None, None),
+
+        ("whitespace/invalid chars rejected",
+         b' \t\r\nAB\x04', bytes([0xAB]), None, None),
+
+        ("invalid hex chars (G, Z, g) rejected",
+         b'gGZAB\x04', bytes([0xAB]), None, None),
+
+        ("multiple bytes",
+         b'DEADBEEF\x04', bytes([0xDE, 0xAD, 0xBE, 0xEF]), None, None),
+
+        ("RX poll delay on first byte",
+         b'FF\x04', bytes([0xFF]), {0}, None),
+
+        ("TX poll delay on first output byte",
+         b'AB\x04', bytes([0xAB]), None, {0}),
+
+        ("hash inside comment (stays in comment)",
+         b'##still comment\nAA\x04', bytes([0xAA]), None, None),
+
+        ("EOT inside comment still exits",
+         b'#comment\x04', b'', None, None),
+
+        ("newline outside comment (no-op)",
+         b'\nAB\x04', bytes([0xAB]), None, None),
+    ]
+
+    global_branches = {pc_addr: set() for pc_addr in branch_pcs}
+    all_pass = True
+
+    for name, inp, expected, rx_d, tx_d in tests:
+        out, blog = simulate_fam0(binary, inp, rx_d, tx_d)
+        ok = (out == expected)
+        check(f"{name}: output correct", ok)
+        if not ok:
+            all_pass = False
+            print(f"         expected {expected.hex()}, got {out.hex()}")
+        for pc_addr in blog:
+            if pc_addr in global_branches:
+                global_branches[pc_addr] |= blog[pc_addr]
+
+    # Branch coverage report
+    total_pairs = len(branch_pcs) * 2
+    covered_pairs = sum(len(dirs) for dirs in global_branches.values())
+    pct = covered_pairs / total_pairs * 100
+
+    print(f"\n  Branch coverage: {covered_pairs}/{total_pairs} directions ({pct:.1f}%)")
+    print()
+    for pc_addr in branch_pcs:
+        dirs = global_branches[pc_addr]
+        t_mark = 'T' if 'T' in dirs else '.'
+        n_mark = 'N' if 'N' in dirs else '.'
+        status = "full" if len(dirs) == 2 else "PARTIAL"
+        print(f"    {branch_labels[pc_addr]}  [{t_mark}{n_mark}] {status}")
+
+    missing = [(pc_addr, d) for pc_addr in branch_pcs
+               for d in ('T', 'N') if d not in global_branches[pc_addr]]
+    if missing:
+        print(f"\n  Missing directions ({len(missing)}):")
+        for pc_addr, d in missing:
+            direction = "taken" if d == 'T' else "not-taken"
+            print(f"    {branch_labels[pc_addr]} — {direction}")
+
+    check(f"branch coverage = 100% ({pct:.1f}%)", pct == 100.0)
+
+    # ═══════════════════════════════════════════════════════════
     # Summary
     # ═══════════════════════════════════════════════════════════
     print("\n" + "=" * 60)
@@ -700,6 +949,7 @@ def main():
         print(f"    → invariant induction over all 256 input bytes")
         print(f"    → concrete test: fam0(fam1.fam0) == bin/fam1")
         print(f"    → fixed point: fam0(fam0.fam0) == bin/fam0")
+        print(f"    → branch coverage: {covered_pairs}/{total_pairs} ({pct:.1f}%)")
     return 1 if failed > 0 else 0
 
 
