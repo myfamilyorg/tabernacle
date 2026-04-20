@@ -1,15 +1,7 @@
-# tabsimple.fam3 -- read a binary from virtio-blk, hash it with Gimli,
-# verify the hash against expected values, and print the result.
+# tabsimple.fam3 -- bootstrap loader. Tries disk first, then network.
 #
 # BIN_SIZE and BIN_HASH0..7 are defined in src/tabsimple_config.inc and
 # concatenated onto the front of this file by the build command.
-#
-# Build:
-#   Create a test payload and its config, then:
-#   ./tools/fam3 <(cat src/tabsimple_config.inc src/tabsimple.fam3) bin/tabsimple
-#   ./tools/q32 --disk=tmp/test.img bin/tabsimple
-#
-# Usage: run <assembler> <source...>
 
 .equ	UART_BASE,		0x10000000
 .equ	UART_LSR,		5
@@ -55,8 +47,48 @@
 .equ	DISK_CHUNK_SIZE,	65536
 .equ	STACK_SIZE,		0x100000
 .equ	MTIME_ADDR,		0x0200BFF8
-.equ	SEED_LIST_OFFSET,	20480
+.equ	SEED_LIST_OFFSET,	40960
 .equ	MAX_SEEDS,		16
+
+# ── Networking ─────────────────────────────────────────────────────────
+.equ	VIO_DEVICE_FEATURES,	0x010
+.equ	CHUNK_SIZE,		1400
+.equ	NET_BATCH_SIZE,		16
+.equ	NET_RETRY_MS,		100
+.equ	NET_TIMEOUT_MS,		5000
+.equ	MTIME_FREQ_KHZ,	10000
+
+# Net memory layout (offsets from s11, reuses disk queue region).
+# RX queue (16 entries):
+.equ	NET_RX_QUEUE,		0
+.equ	NET_RX_BUFFERS,		8192
+.equ	NET_RX_BUF_SIZE,	1536
+.equ	NET_RX_QUEUE_NUM,	16
+# TX queue (1 entry):
+.equ	NET_TX_QUEUE,		32768
+.equ	NET_TX_BUFFER,		33280
+
+# Guest MAC: 52:54:00:12:34:56
+.equ	GUEST_MAC_0,		0x52
+.equ	GUEST_MAC_1,		0x54
+.equ	GUEST_MAC_2,		0x00
+.equ	GUEST_MAC_3,		0x12
+.equ	GUEST_MAC_4,		0x34
+.equ	GUEST_MAC_5,		0x56
+# Gateway MAC: 52:55:0A:00:02:02
+.equ	GW_MAC_0,		0x52
+.equ	GW_MAC_1,		0x55
+.equ	GW_MAC_2,		0x0A
+.equ	GW_MAC_3,		0x00
+.equ	GW_MAC_4,		0x02
+.equ	GW_MAC_5,		0x02
+# Guest IP: 10.0.2.15
+.equ	GUEST_IP_0,		10
+.equ	GUEST_IP_1,		0
+.equ	GUEST_IP_2,		2
+.equ	GUEST_IP_3,		15
+# Client source port
+.equ	CLIENT_PORT,		1234
 
 # ══════════════════════════════════════════════════════════════════════════
 # _start
@@ -275,40 +307,32 @@ read_done:
 	mv	a2, sp
 	li	gp, 0
 	j	gimli_hash
-gh_ret:
-	# Verify hash.
+gh_ret_disk:
 	mv	a0, sp
 	li	gp, 0
 	j	check_hash
-ch_ret:
+ch_ret_disk:
 	addi	sp, sp, 32
-	bnez	a0, hash_fail
+	bnez	a0, disk_hash_fail
+	li	a1, 0
+	j	exec_binary
 
-	# -- Set up args and jump to loaded binary --
-	# a0 = seed list pointer
+disk_hash_fail:
+disk_error:
+no_disk:
+	j	scan_net
+
+# ── Execute verified binary ───────────────────────────────────────────
+exec_binary:
+	# a1 = boot source (set by caller: 0=disk, 1=net)
 	li	t0, SEED_LIST_OFFSET
 	add	a0, s11, t0
-	# a1 = boot source (0 = disk)
-	li	a1, 0
-	# a2 = BIN_SIZE
 	li	a2, BIN_SIZE
-	# a3 = image base (endmark)
 	lla	a3, endmark
-	# a4 = boot start mtime
 	li	t0, MTIME_ADDR
 	lw	a4, 0(t0)
-	# a5 = bind port (parsed from UART)
 	mv	a5, s4
 	j	endmark
-
-hash_fail:
-	li	a0, 69
-	j	emit_code
-disk_error:
-	li	a0, 68
-	j	emit_code
-no_disk:
-	li	a0, 78
 
 emit_code:
 	li	t0, UART_BASE
@@ -333,6 +357,953 @@ hang:
 	j	hang
 
 # ══════════════════════════════════════════════════════════════════════════
+# Network boot
+# ══════════════════════════════════════════════════════════════════════════
+
+scan_net:
+	# Scan for virtio-net (device_id=1).
+	li	s0, VIO_SCAN_START
+scan_net_loop:
+	li	t0, VIO_SCAN_END
+	blt	s0, t0, no_net
+	lw	t1, VIO_MAGIC(s0)
+	li	t2, VIRT_MAGIC
+	bne	t1, t2, scan_net_next
+	lw	t1, VIO_DEVICE_ID(s0)
+	li	t2, 1
+	bne	t1, t2, scan_net_next
+	j	found_net
+scan_net_next:
+	li	t0, NEG_PAGE_SIZE
+	add	s0, s0, t0
+	j	scan_net_loop
+
+no_net:
+	li	a0, 78
+	j	emit_code
+
+found_net:
+	# Legacy virtio-net handshake.
+	sw	zero, VIO_STATUS(s0)
+	li	t1, 1
+	sw	t1, VIO_STATUS(s0)
+	lw	t1, VIO_STATUS(s0)
+	ori	t1, t1, 2
+	sw	t1, VIO_STATUS(s0)
+	lw	t1, VIO_DEVICE_FEATURES(s0)
+	sw	t1, VIO_DRIVER_FEATURES(s0)
+	lw	t1, VIO_STATUS(s0)
+	ori	t1, t1, 8
+	sw	t1, VIO_STATUS(s0)
+	li	t1, PAGE_SIZE
+	sw	t1, VIO_GUEST_PAGE_SIZE(s0)
+
+	# Zero the net data region (RX queue + buffers + TX queue).
+	# 34 KiB = 8704 words.
+	mv	t0, s11
+	li	t1, 8704
+net_zero:
+	sw	zero, 0(t0)
+	addi	t0, t0, 4
+	addi	t1, t1, -1
+	bnez	t1, net_zero
+
+	# Setup RX queue (queue 0, 16 entries).
+	sw	zero, VIO_QUEUE_SEL(s0)
+	li	t1, NET_RX_QUEUE_NUM
+	sw	t1, VIO_QUEUE_NUM(s0)
+	li	t1, PAGE_SIZE
+	sw	t1, VIO_QUEUE_ALIGN(s0)
+	li	t0, NET_RX_QUEUE
+	add	t0, s11, t0
+	srli	t1, t0, 12
+	sw	t1, VIO_QUEUE_PFN(s0)
+
+	# Populate RX descriptors: 16 entries, each pointing to a 1536-byte buffer.
+	mv	t0, s11			# descriptor table base
+	li	t1, NET_RX_BUFFERS
+	add	t2, s11, t1		# first buffer address
+	li	t3, 0			# index
+rx_desc_loop:
+	li	t4, NET_RX_QUEUE_NUM
+	bge	t3, t4, rx_desc_done
+	sw	t2, 0(t0)		# addr lo
+	sw	zero, 4(t0)		# addr hi
+	li	t4, NET_RX_BUF_SIZE
+	sw	t4, 8(t0)		# len
+	li	t4, 2			# WRITE flag
+	sh	t4, 12(t0)		# flags
+	sh	zero, 14(t0)		# next
+	# Post to avail ring.
+	addi	t5, t0, 256		# avail ring base (hack: only works for first desc)
+	# Actually, avail ring is at desc_base + 256.
+	# avail.ring[i] = i
+	li	t4, NET_RX_QUEUE
+	add	t4, s11, t4
+	addi	t4, t4, 260		# avail.ring[0] = offset 256 + 4
+	slli	t5, t3, 1
+	add	t5, t4, t5
+	sh	t3, 0(t5)		# avail.ring[i] = i
+	addi	t0, t0, 16		# next descriptor
+	li	t4, NET_RX_BUF_SIZE
+	add	t2, t2, t4		# next buffer
+	addi	t3, t3, 1
+	j	rx_desc_loop
+rx_desc_done:
+	# Set avail.idx = 16 (all buffers available).
+	li	t0, NET_RX_QUEUE
+	add	t0, s11, t0
+	li	t1, NET_RX_QUEUE_NUM
+	sh	t1, 258(t0)		# avail.idx
+
+	# Setup TX queue (queue 1, 1 entry).
+	li	t1, 1
+	sw	t1, VIO_QUEUE_SEL(s0)
+	sw	t1, VIO_QUEUE_NUM(s0)
+	li	t1, PAGE_SIZE
+	sw	t1, VIO_QUEUE_ALIGN(s0)
+	li	t0, NET_TX_QUEUE
+	add	t0, s11, t0
+	srli	t1, t0, 12
+	sw	t1, VIO_QUEUE_PFN(s0)
+
+	# Mark driver ready.
+	.word	0x0110000F
+	lw	t1, VIO_STATUS(s0)
+	ori	t1, t1, 4
+	sw	t1, VIO_STATUS(s0)
+	# Notify RX queue that buffers are available.
+	.word	0x0110000F
+	sw	zero, VIO_QUEUE_NOTIFY(s0)
+
+	# ── Phase 1: Seed discovery ──────────────────────────────────────
+	# Send chunk 0..0 to all seeds starting at mtime % seed_count.
+	li	t0, SEED_LIST_OFFSET
+	add	s7, s11, t0		# s7 = seed list base
+	lbu	s8, 0(s7)		# s8 = seed count
+	beqz	s8, no_net		# no seeds configured
+	addi	s7, s7, 1		# skip count byte → first entry
+	# s9 = starting index = mtime % seed_count
+	li	t0, MTIME_ADDR
+	lw	t0, 0(t0)
+	# t0 % s8: repeated subtraction
+	mv	t1, t0
+mtime_mod:
+	blt	t1, s8, mtime_mod_done
+	sub	t1, t1, s8
+	j	mtime_mod
+mtime_mod_done:
+	mv	s9, t1			# s9 = start index
+
+	# Blast all seeds with request for chunk 0..0.
+	mv	s1, s9			# current index
+	mv	s2, s8			# remaining count
+probe_loop:
+	# Compute seed entry address: s7 + s1 * 6
+	slli	t0, s1, 1
+	add	t0, t0, s1
+	slli	t0, t0, 1		# t0 = s1 * 6
+	add	a2, s7, t0		# a2 = seed entry ptr
+	li	a3, 0			# start chunk
+	li	a4, 0			# end chunk
+	li	gp, 0
+	j	send_famc_req
+sfr_ret_probe:
+	# Advance to next seed (wrapping).
+	addi	s1, s1, 1
+	blt	s1, s8, probe_no_wrap
+	li	s1, 0
+probe_no_wrap:
+	addi	s2, s2, -1
+	bnez	s2, probe_loop
+
+	# Poll for first valid FAMC response.
+	# s5 = last mtime snapshot for timeout.
+	li	t0, MTIME_ADDR
+	lw	s5, 0(t0)
+probe_poll:
+	li	gp, 0
+	j	rx_poll
+rx_ret_probe:
+	# a0 = 0 if no packet, 1 if ARP handled, 2 if FAMC response.
+	# If FAMC: a1 = seq, a2 = RX buffer ptr, a3 = source IP offset in buf
+	li	t0, 2
+	beq	a0, t0, probe_got_response
+
+	# Check timeout (5 seconds).
+	li	t0, MTIME_ADDR
+	lw	t0, 0(t0)
+	sub	t1, t0, s5
+	li	t2, NET_TIMEOUT_MS
+	li	t3, MTIME_FREQ_KHZ
+	# t2 = timeout in ticks = NET_TIMEOUT_MS * MTIME_FREQ_KHZ
+	# But that's 5000 * 10000 = 50,000,000 = 0x02FAF080
+	li	t2, 0x02FAF080
+	blt	t1, t2, probe_poll
+	# Timeout — no seeds responded. Try again.
+	j	scan_net
+
+probe_got_response:
+	# Lock onto responding seed. Identify source by matching IP.
+	# a2 = RX buffer ptr. Source IP is at offset 38..41 (IPv4 src in eth frame,
+	# after 12-byte virtio hdr + 14-byte eth + 12-byte IP offset).
+	# Actually: virtio_hdr(12) + eth_dst(6) + eth_src(6) + ethertype(2) +
+	# ip_hdr: ver(1)+tos(1)+len(2)+id(2)+frag(2)+ttl(1)+proto(1)+cksum(2)+src_ip(4)
+	# src_ip offset = 12 + 14 + 12 = 38
+	lbu	t0, 38(a2)
+	lbu	t1, 39(a2)
+	lbu	t2, 40(a2)
+	lbu	t3, 41(a2)
+	# Find which seed matches.
+	li	s1, 0
+	mv	s2, s7			# seed entry ptr
+find_seed:
+	bge	s1, s8, scan_net	# no match, restart
+	lbu	t4, 0(s2)
+	bne	t4, t0, find_next_seed
+	lbu	t4, 1(s2)
+	bne	t4, t1, find_next_seed
+	lbu	t4, 2(s2)
+	bne	t4, t2, find_next_seed
+	lbu	t4, 3(s2)
+	bne	t4, t3, find_next_seed
+	j	seed_locked
+find_next_seed:
+	addi	s2, s2, 6
+	addi	s1, s1, 1
+	j	find_seed
+
+seed_locked:
+	# s1 = locked seed index, s2 = locked seed entry ptr.
+	# We already received chunk 0 from the probe response.
+	# Copy chunk 0 data to endmark.
+	# a2 still = RX buffer ptr. Data starts at offset 61
+	# (12 virtio + 14 eth + 20 ip + 8 udp + 7 FAMC hdr).
+	# UDP length is at offset 50..51 (BE). data_len = udp_len - 15.
+	lbu	t0, 50(a2)
+	slli	t0, t0, 8
+	lbu	t1, 51(a2)
+	or	t0, t0, t1		# UDP length (BE)
+	addi	t0, t0, -15		# data_len = udp_len - 8(udp) - 7(FAMC hdr)
+	# Clamp to BIN_SIZE.
+	li	t1, BIN_SIZE
+	blt	t0, t1, copy_probe_ok
+	mv	t0, t1
+copy_probe_ok:
+	lla	t1, endmark		# dest
+	addi	t2, a2, 61		# src (FAMC data)
+	mv	t3, t0			# count
+copy_probe_loop:
+	beqz	t3, copy_probe_done
+	lbu	t4, 0(t2)
+	sb	t4, 0(t1)
+	addi	t1, t1, 1
+	addi	t2, t2, 1
+	addi	t3, t3, -1
+	j	copy_probe_loop
+copy_probe_done:
+	# Repost the RX descriptor.
+	li	gp, 1
+	j	repost_rx
+repost_ret_probe:
+
+	# ── Phase 2: Batched download ────────────────────────────────────
+	# Compute total chunks: NUM_CHUNKS = ceil(BIN_SIZE / CHUNK_SIZE).
+	li	t0, BIN_SIZE
+	li	t1, CHUNK_SIZE
+	addi	t0, t0, -1
+	add	t0, t0, t1
+	# t0 = BIN_SIZE + CHUNK_SIZE - 1. Now divide by CHUNK_SIZE.
+	# CHUNK_SIZE = 1400. Division by repeated subtraction.
+	li	t1, 0
+num_chunks_div:
+	li	t2, CHUNK_SIZE
+	blt	t0, t2, num_chunks_done
+	sub	t0, t0, t2
+	addi	t1, t1, 1
+	j	num_chunks_div
+num_chunks_done:
+	mv	s10, t1		# s10 = NUM_CHUNKS
+
+	# s3 = current batch start (chunk 0 already received).
+	li	s3, 0
+	# s6 = global chunk bitmap word (for current batch).
+	# Chunk 0 already received — set bit 0.
+	li	s6, 1
+
+batch_loop:
+	# Check if we're past the last chunk.
+	bge	s3, s10, download_complete
+
+	# Compute batch end = min(s3 + NET_BATCH_SIZE - 1, s10 - 1).
+	addi	t0, s3, NET_BATCH_SIZE
+	addi	t0, t0, -1
+	addi	t1, s10, -1
+	blt	t0, t1, batch_end_ok
+	mv	t0, t1
+batch_end_ok:
+	mv	s9, t0			# s9 = batch end chunk index
+
+	# If this is the first batch and chunk 0 is set, check if batch is done.
+	bnez	s3, batch_send
+	# First batch: s6 already has bit 0 set from probe.
+	j	batch_check_complete
+
+batch_send:
+	li	s6, 0			# reset bitmap for new batch
+batch_request:
+	# Send request for s3..s9 to locked seed (s2).
+	mv	a2, s2
+	mv	a3, s3
+	mv	a4, s9
+	li	gp, 1
+	j	send_famc_req
+sfr_ret_batch:
+
+	# Record retry timestamp.
+	li	t0, MTIME_ADDR
+	lw	s5, 0(t0)		# s5 = last new packet time
+
+batch_recv:
+	li	gp, 1
+	j	rx_poll
+rx_ret_batch:
+	li	t0, 2
+	bne	a0, t0, batch_no_famc
+
+	# Got FAMC response. Check seq is in current batch range.
+	# a1 = seq (chunk index)
+	blt	a1, s3, batch_ignore
+	bgt	a1, s9, batch_ignore
+
+	# Check bitmap — is this a new chunk?
+	sub	t0, a1, s3		# bit index within batch
+	li	t1, 1
+	sll	t1, t1, t0		# bit mask
+	and	t2, s6, t1
+	bnez	t2, batch_ignore	# already have it — don't update timeout
+
+	# New chunk! Set bitmap bit.
+	or	s6, s6, t1
+
+	# Copy data to endmark + seq * CHUNK_SIZE.
+	# Compute dest = endmark + a1 * 1400.
+	# a1 * 1400 = a1 * 1024 + a1 * 256 + a1 * 128 - a1 * 8
+	slli	t0, a1, 10
+	slli	t1, a1, 8
+	add	t0, t0, t1
+	slli	t1, a1, 7
+	add	t0, t0, t1
+	slli	t1, a1, 3
+	sub	t0, t0, t1		# t0 = a1 * 1400
+	lla	t1, endmark
+	add	t1, t1, t0		# dest
+
+	# Data length from UDP header.
+	lbu	t0, 50(a2)
+	slli	t0, t0, 8
+	lbu	t3, 51(a2)
+	or	t0, t0, t3
+	addi	t0, t0, -15		# data_len
+
+	# Clamp: don't copy past BIN_SIZE.
+	li	t3, BIN_SIZE
+	lla	t4, endmark
+	sub	t3, t3, t0		# max offset for dest start... no.
+	# Actually: remaining = BIN_SIZE - (seq * CHUNK_SIZE)
+	slli	t3, a1, 10
+	slli	t4, a1, 8
+	add	t3, t3, t4
+	slli	t4, a1, 7
+	add	t3, t3, t4
+	slli	t4, a1, 3
+	sub	t3, t3, t4		# t3 = seq * CHUNK_SIZE
+	li	t4, BIN_SIZE
+	sub	t3, t4, t3		# remaining = BIN_SIZE - offset
+	blt	t0, t3, copy_no_clamp
+	mv	t0, t3
+copy_no_clamp:
+	addi	t2, a2, 61		# src
+	mv	t3, t0
+copy_chunk_loop:
+	beqz	t3, copy_chunk_done
+	lbu	t4, 0(t2)
+	sb	t4, 0(t1)
+	addi	t1, t1, 1
+	addi	t2, t2, 1
+	addi	t3, t3, -1
+	j	copy_chunk_loop
+copy_chunk_done:
+	# Repost RX descriptor.
+	li	gp, 2
+	j	repost_rx
+repost_ret_chunk:
+	# Update last-new-packet time.
+	li	t0, MTIME_ADDR
+	lw	s5, 0(t0)
+
+batch_check_complete:
+	# Check if all bits in batch are set.
+	# Expected mask = (1 << (batch_end - batch_start + 1)) - 1
+	sub	t0, s9, s3
+	addi	t0, t0, 1		# batch size
+	li	t1, 1
+	sll	t1, t1, t0
+	addi	t1, t1, -1		# expected mask
+	and	t2, s6, t1
+	bne	t2, t1, batch_recv	# not complete yet — keep polling
+
+	# Batch complete! Advance to next batch.
+	addi	s3, s9, 1
+	j	batch_loop
+
+batch_ignore:
+	# Repost RX descriptor but don't update timeout.
+	li	gp, 3
+	j	repost_rx
+repost_ret_ignore:
+
+batch_no_famc:
+	# Not a FAMC packet (maybe ARP was handled, or no packet).
+	# Check retry timer.
+	li	t0, MTIME_ADDR
+	lw	t0, 0(t0)
+	sub	t1, t0, s5
+
+	# Check seed timeout (5 seconds).
+	li	t2, 0x02FAF080		# NET_TIMEOUT_MS * MTIME_FREQ_KHZ
+	bge	t1, t2, seed_timeout
+
+	# Check retry interval (100ms = 1,000,000 ticks).
+	li	t2, 1000000
+	blt	t1, t2, batch_recv	# not yet — keep polling
+	# Retry: re-request missing chunks.
+	j	batch_request
+
+seed_timeout:
+	# This seed is dead. Advance to next seed, start over.
+	addi	s1, s1, 1
+	blt	s1, s8, next_seed_ok
+	li	s1, 0
+next_seed_ok:
+	# Compute new seed entry ptr.
+	slli	t0, s1, 1
+	add	t0, t0, s1
+	slli	t0, t0, 1
+	add	s2, s7, t0
+	# Reset download — start from chunk 0.
+	li	s3, 0
+	li	s6, 0
+	j	batch_send
+
+download_complete:
+	# Hash the downloaded binary.
+	addi	sp, sp, -32
+	lla	a0, endmark
+	li	a1, BIN_SIZE
+	mv	a2, sp
+	li	gp, 1
+	j	gimli_hash
+gh_ret_net:
+	mv	a0, sp
+	li	gp, 1
+	j	check_hash
+ch_ret_net:
+	addi	sp, sp, 32
+	bnez	a0, net_hash_fail
+	li	a1, 1
+	j	exec_binary
+
+net_hash_fail:
+	# This seed sent bad data. Try next seed.
+	j	seed_timeout
+
+# ══════════════════════════════════════════════════════════════════════════
+# rx_poll -- check for a received packet, handle ARP, detect FAMC.
+#   Returns: a0=0 no packet, a0=1 ARP handled, a0=2 FAMC response
+#   On FAMC: a1=seq, a2=RX buffer ptr
+#   Dispatch: gp=0→rx_ret_probe, gp=1→rx_ret_batch
+# ══════════════════════════════════════════════════════════════════════════
+rx_poll:
+	addi	sp, sp, -4
+	sw	gp, 0(sp)
+	# Check used ring for new packets.
+	li	t0, NET_RX_QUEUE
+	add	t0, s11, t0
+	li	t1, 4096
+	add	t1, t0, t1		# used ring base
+	lhu	t2, 2(t1)		# used.idx
+	lhu	t3, 0(t1)		# our last processed idx (stored in used.flags)
+	beq	t2, t3, rx_none
+
+	# Process: get used entry at (last_idx % 16) * 8 + 4.
+	andi	t4, t3, 15
+	slli	t4, t4, 3
+	addi	t4, t4, 4
+	add	t4, t1, t4		# used.ring[last_idx]
+	lw	t5, 0(t4)		# descriptor index
+	# Advance our tracker.
+	addi	t3, t3, 1
+	sh	t3, 0(t1)		# update last processed idx
+
+	# Get buffer address from descriptor.
+	li	t0, NET_RX_QUEUE
+	add	t0, s11, t0		# descriptor table base
+	slli	t4, t5, 4		# desc index * 16
+	add	t4, t0, t4
+	lw	a2, 0(t4)		# buffer address
+	# Save desc index for repost.
+	addi	sp, sp, -4
+	sw	t5, 0(sp)
+
+	# Check EtherType at offset 24..25 (after 12-byte virtio hdr + 12-byte eth).
+	lbu	t0, 24(a2)
+	lbu	t1, 25(a2)
+	# ARP? 0x0806
+	li	t2, 0x08
+	bne	t0, t2, rx_not_arp
+	li	t2, 0x06
+	beq	t1, t2, rx_is_arp
+rx_not_arp:
+	# IPv4? 0x0800
+	li	t2, 0x08
+	bne	t0, t2, rx_unknown
+	bnez	t1, rx_unknown
+	# Check IP protocol = 17 (UDP) at offset 35.
+	lbu	t0, 35(a2)
+	li	t1, 17
+	bne	t0, t1, rx_unknown
+	# Check FAMC magic at offset 54..57 and command 0x82 at offset 58.
+	lbu	t0, 54(a2)
+	li	t1, 0x46		# 'F'
+	bne	t0, t1, rx_unknown
+	lbu	t0, 55(a2)
+	li	t1, 0x41		# 'A'
+	bne	t0, t1, rx_unknown
+	lbu	t0, 56(a2)
+	li	t1, 0x4D		# 'M'
+	bne	t0, t1, rx_unknown
+	lbu	t0, 57(a2)
+	li	t1, 0x43		# 'C'
+	bne	t0, t1, rx_unknown
+	lbu	t0, 58(a2)
+	li	t1, 0x82
+	bne	t0, t1, rx_unknown
+
+	# FAMC RSP_CHUNK! Extract seq (BE u16 at offset 59..60).
+	lbu	t0, 59(a2)
+	slli	t0, t0, 8
+	lbu	t1, 60(a2)
+	or	a1, t0, t1		# a1 = seq
+
+	lw	t5, 0(sp)
+	addi	sp, sp, 4
+	# Save desc index in a3 for repost.
+	mv	a3, t5
+	li	a0, 2
+	j	rx_poll_ret
+
+rx_is_arp:
+	# Handle ARP request — build and send reply.
+	# Check opcode at offset 32..33 = 0x0001 (request).
+	lbu	t0, 32(a2)
+	bnez	t0, rx_unknown
+	lbu	t0, 33(a2)
+	li	t1, 1
+	bne	t0, t1, rx_unknown
+	li	gp, 0
+	j	send_arp_reply
+sar_ret:
+	lw	t5, 0(sp)
+	addi	sp, sp, 4
+	mv	a3, t5
+	li	a0, 1
+	# Repost this RX buffer immediately.
+	li	gp, 4
+	j	repost_rx
+repost_ret_arp:
+	j	rx_poll_ret
+
+rx_unknown:
+	# Unknown packet — repost and return 0.
+	lw	t5, 0(sp)
+	addi	sp, sp, 4
+	mv	a3, t5
+	li	a0, 0
+	li	gp, 5
+	j	repost_rx
+repost_ret_unknown:
+	j	rx_poll_ret
+
+rx_none:
+	li	a0, 0
+rx_poll_ret:
+	lw	gp, 0(sp)
+	addi	sp, sp, 4
+	bnez	gp, rxd_1
+	j	rx_ret_probe
+rxd_1:
+	li	t0, 1
+	bne	gp, t0, dispatch_error
+	j	rx_ret_batch
+
+# ══════════════════════════════════════════════════════════════════════════
+# repost_rx -- repost an RX descriptor to the avail ring.
+#   a3 = descriptor index to repost
+#   Dispatch: gp=1→repost_ret_probe, gp=2→repost_ret_chunk,
+#             gp=3→repost_ret_ignore, gp=4→repost_ret_arp,
+#             gp=5→repost_ret_unknown
+# ══════════════════════════════════════════════════════════════════════════
+repost_rx:
+	li	t0, NET_RX_QUEUE
+	add	t0, s11, t0		# queue base
+	# avail.idx is at offset 258.
+	lhu	t1, 258(t0)		# current avail.idx
+	# avail.ring[avail.idx % 16] = a3
+	andi	t2, t1, 15
+	slli	t2, t2, 1
+	addi	t2, t2, 260		# avail.ring[0] is at offset 260
+	add	t2, t0, t2
+	sh	a3, 0(t2)
+	# Increment avail.idx.
+	addi	t1, t1, 1
+	sh	t1, 258(t0)
+	# Notify device.
+	.word	0x0110000F
+	sw	zero, VIO_QUEUE_NOTIFY(s0)
+repost_rx_disp:
+	li	t0, 1
+	beq	gp, t0, repost_ret_probe
+	li	t0, 2
+	beq	gp, t0, repost_ret_chunk
+	li	t0, 3
+	beq	gp, t0, repost_ret_ignore
+	li	t0, 4
+	beq	gp, t0, repost_ret_arp
+	li	t0, 5
+	beq	gp, t0, repost_ret_unknown
+	j	dispatch_error
+
+# ══════════════════════════════════════════════════════════════════════════
+# send_famc_req -- send FAMC REQ_RANGE packet.
+#   a2 = seed entry ptr (4-byte IP + 2-byte port)
+#   a3 = start chunk, a4 = end chunk
+#   Dispatch: gp=0→sfr_ret_probe, gp=1→sfr_ret_batch
+# ══════════════════════════════════════════════════════════════════════════
+send_famc_req:
+	addi	sp, sp, -16
+	sw	gp, 0(sp)
+	sw	a2, 4(sp)
+	sw	a3, 8(sp)
+	sw	a4, 12(sp)
+
+	# Build packet in TX buffer.
+	li	t0, NET_TX_BUFFER
+	add	t0, s11, t0		# t0 = TX buffer
+
+	# virtio_net_hdr (12 bytes zero).
+	sw	zero, 0(t0)
+	sw	zero, 4(t0)
+	sw	zero, 8(t0)
+
+	# Ethernet dst = gateway MAC.
+	li	t1, GW_MAC_0
+	sb	t1, 12(t0)
+	li	t1, GW_MAC_1
+	sb	t1, 13(t0)
+	li	t1, GW_MAC_2
+	sb	t1, 14(t0)
+	li	t1, GW_MAC_3
+	sb	t1, 15(t0)
+	li	t1, GW_MAC_4
+	sb	t1, 16(t0)
+	li	t1, GW_MAC_5
+	sb	t1, 17(t0)
+	# Ethernet src = guest MAC.
+	li	t1, GUEST_MAC_0
+	sb	t1, 18(t0)
+	li	t1, GUEST_MAC_1
+	sb	t1, 19(t0)
+	li	t1, GUEST_MAC_2
+	sb	t1, 20(t0)
+	li	t1, GUEST_MAC_3
+	sb	t1, 21(t0)
+	li	t1, GUEST_MAC_4
+	sb	t1, 22(t0)
+	li	t1, GUEST_MAC_5
+	sb	t1, 23(t0)
+	# EtherType = 0x0800 (IPv4).
+	li	t1, 0x08
+	sb	t1, 24(t0)
+	sb	zero, 25(t0)
+
+	# IPv4 header (20 bytes) at offset 26.
+	li	t1, 0x45		# version + IHL
+	sb	t1, 26(t0)
+	sb	zero, 27(t0)		# DSCP/ECN
+	# Total length = 20(IP) + 8(UDP) + 9(FAMC) = 37 = 0x0025
+	sb	zero, 28(t0)
+	li	t1, 37
+	sb	t1, 29(t0)
+	sw	zero, 30(t0)		# ID + flags/frag (zero)
+	li	t1, 64			# TTL
+	sb	t1, 34(t0)
+	li	t1, 17			# protocol = UDP
+	sb	t1, 35(t0)
+	# Checksum placeholder (compute after filling IPs).
+	sh	zero, 36(t0)
+	# Source IP.
+	li	t1, GUEST_IP_0
+	sb	t1, 38(t0)
+	li	t1, GUEST_IP_1
+	sb	t1, 39(t0)
+	li	t1, GUEST_IP_2
+	sb	t1, 40(t0)
+	li	t1, GUEST_IP_3
+	sb	t1, 41(t0)
+	# Dest IP from seed entry.
+	lw	a2, 4(sp)		# reload seed entry ptr
+	lbu	t1, 0(a2)
+	sb	t1, 42(t0)
+	lbu	t1, 1(a2)
+	sb	t1, 43(t0)
+	lbu	t1, 2(a2)
+	sb	t1, 44(t0)
+	lbu	t1, 3(a2)
+	sb	t1, 45(t0)
+
+	# IP checksum: sum all 16-bit words of IP header, fold, complement.
+	li	t3, 0			# sum
+	li	t4, 26			# IP header start offset
+	li	t5, 10			# 10 halfwords
+ip_cksum_loop:
+	add	t1, t0, t4
+	lbu	t2, 0(t1)
+	slli	t2, t2, 8
+	lbu	t1, 1(t1)
+	or	t2, t2, t1
+	add	t3, t3, t2
+	addi	t4, t4, 2
+	addi	t5, t5, -1
+	bnez	t5, ip_cksum_loop
+	# Fold carries.
+	srli	t1, t3, 16
+	slli	t3, t3, 16
+	srli	t3, t3, 16
+	add	t3, t3, t1
+	srli	t1, t3, 16
+	add	t3, t3, t1
+	# One's complement, masked to 16 bits.
+	xori	t3, t3, -1
+	slli	t3, t3, 16
+	srli	t3, t3, 16
+	# Store checksum (BE) at offset 36..37.
+	srli	t1, t3, 8
+	sb	t1, 36(t0)
+	andi	t1, t3, 0xFF
+	sb	t1, 37(t0)
+
+	# UDP header (8 bytes) at offset 46.
+	# Source port = CLIENT_PORT (1234 = 0x04D2) BE.
+	li	t1, 0x04
+	sb	t1, 46(t0)
+	li	t1, 0xD2
+	sb	t1, 47(t0)
+	# Dest port from seed entry (stored LE, need BE on wire).
+	lhu	t1, 4(a2)		# LE u16
+	srli	t2, t1, 8		# t2 = high byte
+	andi	t1, t1, 0xFF		# t1 = low byte
+	sb	t2, 48(t0)		# high byte first (BE)
+	sb	t1, 49(t0)		# low byte second
+	# UDP length = 8 + 9 = 17 = 0x0011 BE.
+	sb	zero, 50(t0)
+	li	t1, 17
+	sb	t1, 51(t0)
+	# UDP checksum = 0 (optional for IPv4).
+	sh	zero, 52(t0)
+
+	# FAMC payload (9 bytes) at offset 54.
+	li	t1, 0x46		# 'F'
+	sb	t1, 54(t0)
+	li	t1, 0x41		# 'A'
+	sb	t1, 55(t0)
+	li	t1, 0x4D		# 'M'
+	sb	t1, 56(t0)
+	li	t1, 0x43		# 'C'
+	sb	t1, 57(t0)
+	li	t1, 0x02		# REQ_RANGE
+	sb	t1, 58(t0)
+	# Start chunk (BE u16).
+	lw	a3, 8(sp)
+	srli	t1, a3, 8
+	sb	t1, 59(t0)
+	andi	t1, a3, 0xFF
+	sb	t1, 60(t0)
+	# End chunk (BE u16).
+	lw	a4, 12(sp)
+	srli	t1, a4, 8
+	sb	t1, 61(t0)
+	andi	t1, a4, 0xFF
+	sb	t1, 62(t0)
+
+	# TX kick: post descriptor and notify.
+	li	t1, NET_TX_QUEUE
+	add	t1, s11, t1		# TX queue base
+	# Descriptor 0: addr = TX buffer, len = 63, flags = 0.
+	li	t2, NET_TX_BUFFER
+	add	t2, s11, t2
+	sw	t2, 0(t1)		# addr lo
+	sw	zero, 4(t1)		# addr hi
+	li	t2, 63			# total frame size
+	sw	t2, 8(t1)
+	sh	zero, 12(t1)		# flags = 0
+	sh	zero, 14(t1)		# next = 0
+	# avail.ring[0] = 0, avail.idx++.
+	sh	zero, 20(t1)		# avail.ring[0] = desc 0
+	lhu	t2, 18(t1)		# avail.idx
+	addi	t2, t2, 1
+	sh	t2, 18(t1)
+	.word	0x0110000F		# fence w,w
+	li	t2, 1
+	sw	t2, VIO_QUEUE_NOTIFY(s0)	# notify queue 1
+
+	lw	gp, 0(sp)
+	addi	sp, sp, 16
+	bnez	gp, sfrd_1
+	j	sfr_ret_probe
+sfrd_1:
+	li	t0, 1
+	bne	gp, t0, dispatch_error
+	j	sfr_ret_batch
+
+# ══════════════════════════════════════════════════════════════════════════
+# send_arp_reply -- respond to an ARP request.
+#   a2 = RX buffer with ARP request
+#   s0 = virtio-net MMIO base
+# ══════════════════════════════════════════════════════════════════════════
+send_arp_reply:
+	li	t0, NET_TX_BUFFER
+	add	t0, s11, t0
+
+	# virtio_net_hdr (12 bytes zero).
+	sw	zero, 0(t0)
+	sw	zero, 4(t0)
+	sw	zero, 8(t0)
+
+	# Ethernet dst = sender's MAC (from ARP request, offset 34..39).
+	lbu	t1, 34(a2)
+	sb	t1, 12(t0)
+	lbu	t1, 35(a2)
+	sb	t1, 13(t0)
+	lbu	t1, 36(a2)
+	sb	t1, 14(t0)
+	lbu	t1, 37(a2)
+	sb	t1, 15(t0)
+	lbu	t1, 38(a2)
+	sb	t1, 16(t0)
+	lbu	t1, 39(a2)
+	sb	t1, 17(t0)
+	# Ethernet src = guest MAC.
+	li	t1, GUEST_MAC_0
+	sb	t1, 18(t0)
+	li	t1, GUEST_MAC_1
+	sb	t1, 19(t0)
+	li	t1, GUEST_MAC_2
+	sb	t1, 20(t0)
+	li	t1, GUEST_MAC_3
+	sb	t1, 21(t0)
+	li	t1, GUEST_MAC_4
+	sb	t1, 22(t0)
+	li	t1, GUEST_MAC_5
+	sb	t1, 23(t0)
+	# EtherType = 0x0806.
+	li	t1, 0x08
+	sb	t1, 24(t0)
+	li	t1, 0x06
+	sb	t1, 25(t0)
+
+	# ARP reply: hw=0x0001, proto=0x0800, hwsz=6, protosz=4, opcode=0x0002.
+	sb	zero, 26(t0)
+	li	t1, 1
+	sb	t1, 27(t0)
+	li	t1, 0x08
+	sb	t1, 28(t0)
+	sb	zero, 29(t0)
+	li	t1, 6
+	sb	t1, 30(t0)
+	li	t1, 4
+	sb	t1, 31(t0)
+	sb	zero, 32(t0)
+	li	t1, 2
+	sb	t1, 33(t0)
+
+	# Sender MAC = guest MAC.
+	li	t1, GUEST_MAC_0
+	sb	t1, 34(t0)
+	li	t1, GUEST_MAC_1
+	sb	t1, 35(t0)
+	li	t1, GUEST_MAC_2
+	sb	t1, 36(t0)
+	li	t1, GUEST_MAC_3
+	sb	t1, 37(t0)
+	li	t1, GUEST_MAC_4
+	sb	t1, 38(t0)
+	li	t1, GUEST_MAC_5
+	sb	t1, 39(t0)
+	# Sender IP = guest IP.
+	li	t1, GUEST_IP_0
+	sb	t1, 40(t0)
+	li	t1, GUEST_IP_1
+	sb	t1, 41(t0)
+	li	t1, GUEST_IP_2
+	sb	t1, 42(t0)
+	li	t1, GUEST_IP_3
+	sb	t1, 43(t0)
+	# Target MAC = requester's MAC (from ARP request sender, offset 34..39).
+	lbu	t1, 34(a2)
+	sb	t1, 44(t0)
+	lbu	t1, 35(a2)
+	sb	t1, 45(t0)
+	lbu	t1, 36(a2)
+	sb	t1, 46(t0)
+	lbu	t1, 37(a2)
+	sb	t1, 47(t0)
+	lbu	t1, 38(a2)
+	sb	t1, 48(t0)
+	lbu	t1, 39(a2)
+	sb	t1, 49(t0)
+	# Target IP = requester's IP (from ARP request sender IP, offset 40..43).
+	lbu	t1, 40(a2)
+	sb	t1, 50(t0)
+	lbu	t1, 41(a2)
+	sb	t1, 51(t0)
+	lbu	t1, 42(a2)
+	sb	t1, 52(t0)
+	lbu	t1, 43(a2)
+	sb	t1, 53(t0)
+
+	# TX kick (54 byte frame).
+	li	t1, NET_TX_QUEUE
+	add	t1, s11, t1
+	li	t2, NET_TX_BUFFER
+	add	t2, s11, t2
+	sw	t2, 0(t1)
+	sw	zero, 4(t1)
+	li	t2, 54
+	sw	t2, 8(t1)
+	sh	zero, 12(t1)
+	sh	zero, 14(t1)
+	sh	zero, 20(t1)
+	lhu	t2, 18(t1)
+	addi	t2, t2, 1
+	sh	t2, 18(t1)
+	.word	0x0110000F
+	li	t2, 1
+	sw	t2, VIO_QUEUE_NOTIFY(s0)
+
+	j	sar_ret
+
+# ══════════════════════════════════════════════════════════════════════════
 # check_hash -- compare 32 bytes at a0 against expected hash words.
 # Returns a0=0 on match, a0=1 on mismatch.
 # Dispatch: gp=0 → ch_ret.
@@ -353,8 +1324,12 @@ ch_loop:
 ch_fail:
 	li	a0, 1
 check_hash_disp:
-	bnez	gp, dispatch_error
-	j	ch_ret
+	bnez	gp, chd_1
+	j	ch_ret_disk
+chd_1:
+	li	t0, 1
+	bne	gp, t0, dispatch_error
+	j	ch_ret_net
 
 # ══════════════════════════════════════════════════════════════════════════
 # disk_read -- read sectors via virtio-blk.
@@ -537,8 +1512,12 @@ gh_epilogue:
 	lw	s4, 20(sp)
 	addi	sp, sp, 24
 gimli_hash_disp:
-	bnez	gp, dispatch_error
-	j	gh_ret
+	bnez	gp, ghd_1
+	j	gh_ret_disk
+ghd_1:
+	li	t0, 1
+	bne	gp, t0, dispatch_error
+	j	gh_ret_net
 
 # ══════════════════════════════════════════════════════════════════════════
 # gimli_permute -- 24-round Gimli-384 permutation (memory-based, looped).
