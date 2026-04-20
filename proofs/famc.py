@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Binary-level formal verification of famc (61249 bytes: 14431 code instructions
+Binary-level formal verification of famc (61205 bytes: 14420 code instructions
 + embedded data tables including error strings and register names).
 
 famc is the fifth and final stage of the bootstrap chain (fam0→fam1→fam2→fam3→famc).

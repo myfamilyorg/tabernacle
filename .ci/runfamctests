@@ -185,7 +185,7 @@ test_error() {
 	local actual
 	# Error output is terminated by poweroff; strip any trailing whitespace
 	# and extract the first line (the formatted error).
-	actual=$(head -c 256 "$bin" 2>/dev/null | head -n1 | tr -d '\r')
+	actual=$(head -c 256 "$bin" 2>/dev/null | tr -d '\0' | head -n1 | tr -d '\r')
 	if [[ "$actual" == "$expected" ]]; then
 		PASS=$((PASS + 1))
 		[[ $VERBOSE -eq 1 ]] && echo "  PASS  $name"

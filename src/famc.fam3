@@ -6465,9 +6465,6 @@ ct_bad_sa_ptr:
 ct_bad_sa_dot:
 	addi	a0, zero, 52		# err 52: expected '.'
 	j	report_err
-ct_bad_sa_lit:
-	addi	a0, zero, 46		# err 46: array size must be a literal
-	j	report_err
 ct_bad_sa_rbrack:
 	addi	a0, zero, 44		# err 44: expected ']'
 	j	report_err
@@ -8312,9 +8309,6 @@ cs_bad_mc_semi:
 cs_bad_mc_nested:
 	addi	a0, zero, 81		# err 81: nested macro expansion
 	j	report_err
-cs_bad_mc_subst:
-	addi	a0, zero, 82		# err 82: bad macro substitution
-	j	report_err
 cs_bad_mc_scratch:
 	addi	a0, zero, 83		# err 83: macro scratch buffer overflow
 	j	report_err
@@ -8722,9 +8716,6 @@ cs_bad_rept_count:
 	j	report_err
 cs_bad_rept_nested:
 	addi	a0, zero, 81		# err 81: nested macro/rept expansion
-	j	report_err
-cs_bad_rept_subst:
-	addi	a0, zero, 85		# err 85: bad rept substitution
 	j	report_err
 cs_bad_rept_scratch:
 	addi	a0, zero, 83		# err 83: scratch buffer overflow
@@ -16584,12 +16575,6 @@ cs_exprstmt_check_brace:
 cs_halt:
 	addi	a0, zero, 1		# err 1: expected ';'
 	j	report_err
-cs_bad_immut_reassign:
-	lla	t0, ident_start
-	lw	s2, 0(t0)
-	addi	a0, zero, 55		# err 55: cannot reassign immutable
-	j	report_err
-
 cs_done:
 	addi	sp, sp, 4		# pop compile_stmt's entry frame
 	j	cs_after
