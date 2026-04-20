@@ -21,7 +21,7 @@
 # SOFTWARE.
 
 # ──────────────────────────────────────────────────────────────────────────────
-# file: fam0.S - first stage bootstrap tool (168 bytes compiled - GNU as src)
+# file: fam0.fam0 - first stage bootstrap tool (168 bytes compiled - GNU as src)
 # RISC-V 32-bit Hex-to-Binary Converter (Bootstrapping Seed)
 #
 # Runs only in a known environment (QEMU virt bare-metal, -bios none). Takes
